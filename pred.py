@@ -1,62 +1,26 @@
-import os, csv, json
 import argparse
-from datetime import datetime
-from tqdm import tqdm
-from datasets import load_dataset
+import json
 import re
-import importlib.util
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch.multiprocessing as mp
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
-maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
+from pred_misc import (
+    build_output_path,
+    load_json,
+    load_longbench_v2,
+    load_processed_ids,
+    load_prompt_templates,
+    parse_domain_filter,
+    select_unprocessed,
+)
 
-template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
-template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
-template_0shot = open('prompts/0shot.txt', encoding='utf-8').read()
-template_0shot_cot = open('prompts/0shot_cot.txt', encoding='utf-8').read()
-template_0shot_cot_ans = open('prompts/0shot_cot_ans.txt', encoding='utf-8').read()
+model_map = load_json("config/model2path.json")
+maxlen_map = load_json("config/model2maxlen.json")
+prompt_templates = load_prompt_templates()
 
-def parse_domain_filter(domain_args):
-    if not domain_args:
-        return None
-    domains = []
-    for domain_arg in domain_args:
-        for domain in domain_arg.split(','):
-            domain = domain.strip()
-            if domain and domain not in domains:
-                domains.append(domain)
-    return domains or None
-
-def normalize_domain(domain):
-    return domain.strip().lower()
-
-def get_domain_suffix(domains):
-    if not domains:
-        return ''
-    safe_domains = []
-    for domain in domains:
-        safe_domain = re.sub(r'[^A-Za-z0-9._-]+', '_', domain).strip('_')
-        if safe_domain:
-            safe_domains.append(safe_domain)
-    return '_domain_' + '_'.join(safe_domains) if safe_domains else ''
-
-def filter_by_domain(data, domains):
-    if not domains:
-        return data
-    domain_set = {normalize_domain(domain) for domain in domains}
-    available_domains = sorted({item['domain'].strip() for item in data})
-    available_domain_set = {normalize_domain(domain) for domain in available_domains}
-    missing_domains = [domain for domain in domains if normalize_domain(domain) not in available_domain_set]
-    if missing_domains:
-        raise ValueError(
-            f"Domain(s) not found: {', '.join(missing_domains)}. "
-            f"Available domains: {', '.join(available_domains)}"
-        )
-    filtered_data = [item for item in data if normalize_domain(item['domain']) in domain_set]
-    print(f"Selected {len(filtered_data)} / {len(data)} examples for domain(s): {', '.join(domains)}")
-    return filtered_data
 
 def get_model_path(model_name):
     return model_map.get(model_name, model_name)
@@ -166,23 +130,36 @@ def extract_answer(response):
         else:
             return None
 
+def build_prompt(template, context, item, cot=None):
+    prompt = (
+        template.replace('$DOC$', context.strip())
+        .replace('$Q$', item['question'].strip())
+        .replace('$C_A$', item['choice_A'].strip())
+        .replace('$C_B$', item['choice_B'].strip())
+        .replace('$C_C$', item['choice_C'].strip())
+        .replace('$C_D$', item['choice_D'].strip())
+    )
+    if cot is not None:
+        prompt = prompt.replace('$COT$', cot)
+    return prompt
+
 def get_pred(data, args, fout):
     model_name = args.model
     model, tokenizer = load_model_and_tokenizer(model_name)
     for item in tqdm(data):
         context = item['context']
         if args.rag > 0:
-            template = template_rag
+            template = prompt_templates["rag"]
             retrieved = item["retrieved_context"][:args.rag]
             retrieved = sorted(retrieved, key=lambda x: x['c_idx'])
             context = '\n\n'.join([f"Retrieved chunk {idx+1}: {x['content']}" for idx, x in enumerate(retrieved)])
         elif args.no_context:
-            template = template_no_context
+            template = prompt_templates["no_context"]
         elif args.cot:
-            template = template_0shot_cot
+            template = prompt_templates["cot"]
         else:
-            template = template_0shot
-        prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
+            template = prompt_templates["zero_shot"]
+        prompt = build_prompt(template, context, item)
         if args.cot:
             output = query_llm(prompt, model_name, model, tokenizer, temperature=0.1, max_new_tokens=1024, enable_thinking=args.cot)
         else:
@@ -192,7 +169,7 @@ def get_pred(data, args, fout):
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
-            prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
+            prompt = build_prompt(prompt_templates["cot_answer"], context, item, cot=response)
             output = query_llm(prompt, model_name, model, tokenizer, temperature=0.1, max_new_tokens=128, enable_thinking=args.cot)
             if output == '':
                 continue
@@ -204,53 +181,33 @@ def get_pred(data, args, fout):
         fout.write(json.dumps(item, ensure_ascii=False) + '\n')
         fout.flush()
 
-def main():
-    os.makedirs(args.save_dir, exist_ok=True)
+def main(args):
     print(args)
     domains = parse_domain_filter(args.domain)
-    output_prefix = args.model.split("/")[-1] + get_domain_suffix(domains)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.rag > 0:
-        out_file = os.path.join(args.save_dir, output_prefix + f"_rag_{str(args.rag)}_{timestamp}.jsonl")
-    elif args.no_context:
-        out_file = os.path.join(args.save_dir, output_prefix + f"_no_context_{timestamp}.jsonl")
-    elif args.cot:
-        out_file = os.path.join(args.save_dir, output_prefix + f"_cot_{timestamp}.jsonl")
-    else:
-        out_file = os.path.join(args.save_dir, output_prefix + f"_{timestamp}.jsonl")
+    out_file = build_output_path(args, domains)
     print(f"Writing results to {out_file}")
 
-    dataset = load_dataset('THUDM/LongBench-v2', split='train') # dataset = json.load(open('data.json', 'r', encoding='utf-8'))
-    data_all = [{"_id": item["_id"], "domain": item["domain"], "sub_domain": item["sub_domain"], "difficulty": item["difficulty"], "length": item["length"], "question": item["question"], "choice_A": item["choice_A"], "choice_B": item["choice_B"], "choice_C": item["choice_C"], "choice_D": item["choice_D"], "answer": item["answer"], "context": item["context"]} for item in dataset]
-    data_all = filter_by_domain(data_all, domains)
+    data_all = load_longbench_v2(domains)
+    processed_ids = load_processed_ids(out_file)
+    data = select_unprocessed(data_all, processed_ids)
 
-    # cache
-    has_data = {}
-    if os.path.exists(out_file):
-        with open(out_file, encoding='utf-8') as f:
-            has_data = {json.loads(line)["_id"]: 0 for line in f}
-    fout = open(out_file, 'a', encoding='utf-8')
-    data = []
-    for item in data_all:
-        if item["_id"] not in has_data:
-            data.append(item)
     if len(data) == 0:
         print("No new examples to process.")
-        fout.close()
         return
 
-    if args.n_proc == 1:
-        get_pred(data, args, fout)
-    else:
-        print("Warning: each process will load its own transformers model copy.")
-        data_subsets = [data[i::args.n_proc] for i in range(args.n_proc)]
-        processes = []
-        for rank in range(args.n_proc):
-            p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout))
-            p.start()
-            processes.append(p)
-        for p in processes:
-            p.join()
+    with open(out_file, 'a', encoding='utf-8') as fout:
+        if args.n_proc == 1:
+            get_pred(data, args, fout)
+        else:
+            print("Warning: each process will load its own transformers model copy.")
+            data_subsets = [data[i::args.n_proc] for i in range(args.n_proc)]
+            processes = []
+            for rank in range(args.n_proc):
+                p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout))
+                p.start()
+                processes.append(p)
+            for p in processes:
+                p.join()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -262,4 +219,4 @@ if __name__ == "__main__":
     parser.add_argument("--domain", "-d", action='append', default=None, help="Only run examples from the given domain. Repeat this option or use comma-separated names for multiple domains.")
     parser.add_argument("--n_proc", "-n", type=int, default=1)
     args = parser.parse_args()
-    main()
+    main(args)
