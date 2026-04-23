@@ -52,7 +52,12 @@ def load_model_and_tokenizer(model_name):
     else:
         model_kwargs["torch_dtype"] = torch.float32
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+    if "qwen3.5" in model_name.lower():
+        from models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
+        from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, device_map="auto", **model_kwargs)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
     model.eval()
     return model, tokenizer
 
