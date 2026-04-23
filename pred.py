@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 
 import torch
@@ -7,6 +8,11 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from attn_heatmap import (
+    AttentionHeatmapRunWriter,
+    get_full_attention_layer_indices,
+    is_qwen_attn_heatmap_model,
+)
 from pred_misc import (
     build_output_path,
     load_json,
@@ -31,8 +37,9 @@ def get_max_input_len(model_name, tokenizer, max_new_tokens):
         max_len = 120000
     return max(1, max_len - max_new_tokens)
 
-def truncate_prompt(prompt, model_name, tokenizer, max_new_tokens):
-    max_input_len = get_max_input_len(model_name, tokenizer, max_new_tokens)
+def truncate_prompt(prompt, model_name, tokenizer, max_new_tokens, max_input_len=None):
+    if max_input_len is None:
+        max_input_len = get_max_input_len(model_name, tokenizer, max_new_tokens)
     input_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if len(input_ids) > max_input_len:
         half = max_input_len // 2
@@ -40,7 +47,7 @@ def truncate_prompt(prompt, model_name, tokenizer, max_new_tokens):
         prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
     return prompt
 
-def load_model_and_tokenizer(model_name):
+def load_model_and_tokenizer(model_name, attn_heatmap_mode=False):
     model_path = get_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -51,13 +58,18 @@ def load_model_and_tokenizer(model_name):
         model_kwargs["torch_dtype"] = torch.bfloat16
     else:
         model_kwargs["torch_dtype"] = torch.float32
+    if attn_heatmap_mode:
+        model_kwargs["attn_implementation"] = "eager"
 
     if "qwen3.5" in model_name.lower():
-        from models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-        from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
+        from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
         model = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, device_map="auto", **model_kwargs)
     else:
         model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+    if attn_heatmap_mode:
+        text_config = getattr(model.config, "text_config", model.config)
+        setattr(text_config, "_attn_implementation", "eager")
+        setattr(model.config, "_attn_implementation", "eager")
     model.eval()
     return model, tokenizer
 
@@ -101,11 +113,33 @@ def build_inputs(prompt, tokenizer, device, enable_thinking=False):
         inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
     return {k: v.to(device) for k, v in inputs.items()}
 
-def query_llm(prompt, model_name, model, tokenizer, temperature=0.5, max_new_tokens=128, stop=None, enable_thinking=False):
-    prompt = truncate_prompt(prompt, model_name, tokenizer, max_new_tokens)
+def query_llm(
+    prompt,
+    model_name,
+    model,
+    tokenizer,
+    temperature=0.5,
+    max_new_tokens=128,
+    stop=None,
+    enable_thinking=False,
+    attn_sample_writer=None,
+    prefill_label="response",
+):
+    max_input_len = get_max_input_len(model_name, tokenizer, max_new_tokens)
+    prompt = truncate_prompt(prompt, model_name, tokenizer, max_new_tokens, max_input_len=max_input_len)
     device = get_input_device(model)
     inputs = build_inputs(prompt, tokenizer, device, enable_thinking=enable_thinking)
     input_len = inputs["input_ids"].shape[-1]
+    capture_record = None
+
+    if attn_sample_writer is not None:
+        capture_record = attn_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        ).record
 
     generation_kwargs = {
         **inputs,
@@ -121,7 +155,7 @@ def query_llm(prompt, model_name, model, tokenizer, temperature=0.5, max_new_tok
 
     with torch.inference_mode():
         output_ids = model.generate(**generation_kwargs)[0]
-    return tokenizer.decode(output_ids[input_len:], skip_special_tokens=True)
+    return tokenizer.decode(output_ids[input_len:], skip_special_tokens=True), capture_record
 
 def extract_answer(response):
     response = response.replace('*', '')
@@ -148,10 +182,36 @@ def build_prompt(template, context, item, cot=None):
         prompt = prompt.replace('$COT$', cot)
     return prompt
 
-def get_pred(data, args, fout):
+def build_attn_run_writer(args, out_file, model):
+    if not args.attn_heatmap_mode:
+        return None
+    full_attention_layers = get_full_attention_layer_indices(model)
+    return AttentionHeatmapRunWriter(
+        root_dir=args.attn_heatmap_dir,
+        model_name=args.model,
+        out_file=out_file,
+        full_attention_layers=full_attention_layers,
+        max_prefill_tokens=args.attn_max_prefill_tokens,
+    )
+
+
+def validate_args(args):
+    if args.num_samples is not None and args.num_samples < 1:
+        raise ValueError("--num_samples must be at least 1 when provided.")
+    if not args.attn_heatmap_mode:
+        return
+    if not is_qwen_attn_heatmap_model(args.model):
+        raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
+    if args.n_proc != 1:
+        raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
+
+def get_pred(data, args, fout, out_file):
     model_name = args.model
-    model, tokenizer = load_model_and_tokenizer(model_name)
+    model, tokenizer = load_model_and_tokenizer(model_name, attn_heatmap_mode=args.attn_heatmap_mode)
+    attn_run_writer = build_attn_run_writer(args, out_file, model)
     for item in tqdm(data):
+        item = dict(item)
+        attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
         context = item['context']
         if args.rag > 0:
             template = prompt_templates["rag"]
@@ -166,16 +226,46 @@ def get_pred(data, args, fout):
             template = prompt_templates["zero_shot"]
         prompt = build_prompt(template, context, item)
         if args.cot:
-            output = query_llm(prompt, model_name, model, tokenizer, temperature=0.1, max_new_tokens=1024, enable_thinking=args.cot)
+            output, _ = query_llm(
+                prompt,
+                model_name,
+                model,
+                tokenizer,
+                temperature=0.1,
+                max_new_tokens=1024,
+                enable_thinking=args.cot,
+                attn_sample_writer=attn_sample_writer,
+                prefill_label="cot_reasoning",
+            )
         else:
-            output = query_llm(prompt, model_name, model, tokenizer, temperature=0.1, max_new_tokens=128, enable_thinking=args.cot)
+            output, _ = query_llm(
+                prompt,
+                model_name,
+                model,
+                tokenizer,
+                temperature=0.1,
+                max_new_tokens=128,
+                enable_thinking=args.cot,
+                attn_sample_writer=attn_sample_writer,
+                prefill_label="response",
+            )
         if output == '':
             continue
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
             prompt = build_prompt(prompt_templates["cot_answer"], context, item, cot=response)
-            output = query_llm(prompt, model_name, model, tokenizer, temperature=0.1, max_new_tokens=128, enable_thinking=args.cot)
+            output, _ = query_llm(
+                prompt,
+                model_name,
+                model,
+                tokenizer,
+                temperature=0.1,
+                max_new_tokens=128,
+                enable_thinking=args.cot,
+                attn_sample_writer=attn_sample_writer,
+                prefill_label="cot_answer_extraction",
+            )
             if output == '':
                 continue
         response = output.strip()
@@ -183,11 +273,16 @@ def get_pred(data, args, fout):
         item['pred'] = extract_answer(response)
         item['judge'] = item['pred'] == item['answer']
         item['context'] = context[:1000]
+        if attn_sample_writer is not None:
+            item["attn_capture_status"] = attn_sample_writer.build_capture_status()
+            item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
+            attn_sample_writer.finalize(item)
         fout.write(json.dumps(item, ensure_ascii=False) + '\n')
         fout.flush()
 
 def main(args):
     print(args)
+    validate_args(args)
     domains = parse_domain_filter(args.domain)
     out_file = build_output_path(args, domains)
     print(f"Writing results to {out_file}")
@@ -195,6 +290,9 @@ def main(args):
     data_all = load_longbench_v2(domains)
     processed_ids = load_processed_ids(out_file)
     data = select_unprocessed(data_all, processed_ids)
+    if args.num_samples is not None:
+        data = data[:args.num_samples]
+        print(f"Limited this run to {len(data)} example(s).")
 
     if len(data) == 0:
         print("No new examples to process.")
@@ -202,13 +300,13 @@ def main(args):
 
     with open(out_file, 'a', encoding='utf-8') as fout:
         if args.n_proc == 1:
-            get_pred(data, args, fout)
+            get_pred(data, args, fout, out_file)
         else:
             print("Warning: each process will load its own transformers model copy.")
             data_subsets = [data[i::args.n_proc] for i in range(args.n_proc)]
             processes = []
             for rank in range(args.n_proc):
-                p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout))
+                p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout, out_file))
                 p.start()
                 processes.append(p)
             for p in processes:
@@ -222,6 +320,10 @@ if __name__ == "__main__":
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
     parser.add_argument("--domain", "-d", action='append', default=None, help="Only run examples from the given domain. Repeat this option or use comma-separated names for multiple domains.")
+    parser.add_argument("--num_samples", "--max_samples", type=int, default=None, help="Only run the first N unprocessed examples.")
     parser.add_argument("--n_proc", "-n", type=int, default=1)
+    parser.add_argument("--attn_heatmap_mode", action="store_true")
+    parser.add_argument("--attn_heatmap_dir", type=str, default="results/attn_heatmaps")
+    parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
     args = parser.parse_args()
     main(args)

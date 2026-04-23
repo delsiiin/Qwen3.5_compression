@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attention Heatmap Viewer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-block">
+        <h1>Attention Viewer</h1>
+        <p class="subtitle">Inspect prefill attention by run, sample, layer, and head.</p>
+      </div>
+
+      <div class="sidebar-block controls">
+        <label>
+          <span>Run</span>
+          <select id="runSelect"></select>
+        </label>
+        <label>
+          <span>Sample</span>
+          <select id="sampleSelect"></select>
+        </label>
+        <label>
+          <span>Prefill</span>
+          <select id="prefillSelect"></select>
+        </label>
+        <label>
+          <span>Layer</span>
+          <select id="layerSelect"></select>
+        </label>
+        <label>
+          <span>Head</span>
+          <select id="headSelect"></select>
+        </label>
+        <div class="range-row">
+          <label>
+            <span>Min</span>
+            <input id="minInput" type="number" step="0.001" value="0">
+          </label>
+          <label>
+            <span>Max</span>
+            <input id="maxInput" type="number" step="0.001" value="1">
+          </label>
+        </div>
+        <div class="query-token-control">
+          <span>Query Token</span>
+          <div id="queryTokenDisplay" class="query-token-display">Click a token in the prompt.</div>
+        </div>
+        <div class="range-actions">
+          <button id="fitRangeButton" type="button">Fit Range</button>
+          <button id="fitP99RangeButton" type="button">Fit P99</button>
+        </div>
+      </div>
+
+      <div class="sidebar-block meta" id="metaPanel"></div>
+      <div class="sidebar-block status" id="statusPanel">Loading runs...</div>
+    </aside>
+
+    <main class="main-panel">
+      <section class="viewer-band">
+        <div class="section-head">
+          <h2>Heatmap</h2>
+          <div class="section-note" id="shapeLabel"></div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="heatmapCanvas" width="640" height="640"></canvas>
+        </div>
+      </section>
+
+      <section class="viewer-band">
+        <div class="section-head">
+          <h2>Prompt</h2>
+          <div class="section-note" id="queryLabel"></div>
+        </div>
+        <pre id="promptText" class="prompt-text"></pre>
+      </section>
+
+      <section class="viewer-band">
+        <div class="section-head">
+          <h2>Token Attention</h2>
+          <div class="section-note">Click a token in the prompt or token list to change the active query token.</div>
+        </div>
+        <div id="tokenList" class="token-list"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -609,6 +609,9 @@ def eager_attention_forward(
         attn_weights = attn_weights + attention_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_recorder = kwargs.get("attn_recorder")
+    if attn_recorder is not None and hasattr(module, "layer_idx") and query.shape[2] > 1:
+        attn_recorder.record_attention(module.layer_idx, attn_weights)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
