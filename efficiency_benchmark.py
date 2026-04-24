@@ -1,10 +1,11 @@
 import fire
 import logging
+import time
 from tqdm import tqdm
 
 import torch
 import transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 # from utils.qwen2_norepeat import qwen2_flashattention2_norepeat_forward
 
@@ -48,6 +49,57 @@ def average_excluding_min_max(numbers):
 
     return sum(numbers_excluding_min_max) / len(numbers_excluding_min_max)
 
+
+def synchronize_all_cuda_devices() -> None:
+    if torch.cuda.is_available():
+        for device_idx in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(device_idx)
+
+
+class FirstTokenTimingCriteria(StoppingCriteria):
+    def __init__(self):
+        self.first_token_time = None
+
+    def __call__(self, input_ids, scores, **kwargs):
+        if self.first_token_time is None:
+            synchronize_all_cuda_devices()
+            self.first_token_time = time.perf_counter()
+        return False
+
+
+def run_generation_with_timing(model, input_ids, attention_mask, tokenizer, max_new_tokens):
+    first_token_timer = FirstTokenTimingCriteria()
+    stopping_criteria = StoppingCriteriaList([first_token_timer])
+
+    synchronize_all_cuda_devices()
+    start_time = time.perf_counter()
+    generated_ids = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=None,  # Disable EOS token to prevent early termination
+        use_cache=True,
+        stopping_criteria=stopping_criteria,
+    )
+    synchronize_all_cuda_devices()
+    total_time = time.perf_counter() - start_time
+
+    generated_tokens = generated_ids.shape[-1] - input_ids.shape[-1]
+    if first_token_timer.first_token_time is None:
+        ttft = total_time
+    else:
+        ttft = first_token_timer.first_token_time - start_time
+
+    if generated_tokens <= 1:
+        avg_tpot = 0.0
+    else:
+        avg_tpot = (total_time - ttft) / (generated_tokens - 1)
+
+    return generated_ids, total_time, ttft, avg_tpot, generated_tokens
+
 def measure_throughput(
     model_path: str = "Qwen/QwQ-32B",
     # experiment arguments
@@ -65,7 +117,7 @@ def measure_throughput(
     # Generate output file name if not provided
     if output_file is None:
         model_name = model_path.split("/")[-1] if "/" in model_path else model_path
-        output_file = f"/home/yangx/Qwen3.5_compression/results/efficiency/throughput_results_{model_name}_{batch_size}_{output_len}.txt"
+        output_file = f"/home/yangx/Qwen3.5_compression/results/efficiency/throughput_results_{model_name}_{batch_size}_{input_len}.txt"
 
     # Check if output file already exists
     if os.path.exists(output_file):
@@ -96,31 +148,20 @@ def measure_throughput(
     # Input Sequence      
     input_id = torch.ones((batch_size, input_len), dtype=torch.int64).to(model.device)
     attn_mask = torch.ones((batch_size, input_len), dtype=torch.int64).to(model.device)
-    context_length = input_id.shape[-1]
 
     if num_warmups > 0:
         for i in range(num_warmups):
             print(f"Warm Up Run #{i}")
 
             with torch.no_grad():
-                # Use model.generate() instead of manual token-by-token generation
-                start_time = torch.cuda.Event(enable_timing=True)
-                end_time = torch.cuda.Event(enable_timing=True)
-                
-                start_time.record()
-                generated_ids = model.generate(
+                generated_ids, _, _, _, _ = run_generation_with_timing(
+                    model=model,
                     input_ids=input_id,
                     attention_mask=attn_mask,
+                    tokenizer=tokenizer,
                     max_new_tokens=output_len,
-                    min_new_tokens=output_len,
-                    do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=None,  # Disable EOS token to prevent early termination
-                    use_cache=True
                 )
-                end_time.record()
-                torch.cuda.synchronize()
-                
+
         del generated_ids
         cleanup_memory()
     
@@ -130,35 +171,26 @@ def measure_throughput(
 
     results_list = []
     time_list = []  # Store time for each run in seconds
+    ttft_list = []  # Store TTFT for each run in seconds
+    tpot_list = []  # Store average TPOT for each run in seconds/token
 
     for i in range(num_runs):
         print(f"Test Run #{i}")
 
         with torch.no_grad():
-            # Use model.generate() instead of manual token-by-token generation
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            
-            start_time.record()
-            generated_ids = model.generate(
+            generated_ids, total_time, ttft, avg_tpot, generated_tokens = run_generation_with_timing(
+                model=model,
                 input_ids=input_id,
                 attention_mask=attn_mask,
+                tokenizer=tokenizer,
                 max_new_tokens=output_len,
-                min_new_tokens=output_len,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=None,  # Disable EOS token to prevent early termination
-                use_cache=True
             )
-            end_time.record()
-            torch.cuda.synchronize()
-            
-            # Calculate time in milliseconds
-            total_time = start_time.elapsed_time(end_time)
-            
-        throughput = batch_size * output_len / (total_time / 1000)
+
+        throughput = batch_size * generated_tokens / total_time
         results_list.append(throughput)
-        time_list.append(total_time / 1000)  # Convert to seconds
+        time_list.append(total_time)
+        ttft_list.append(ttft)
+        tpot_list.append(avg_tpot)
 
         print(f"Generated IDs length: {generated_ids.shape}")
 
@@ -167,6 +199,8 @@ def measure_throughput(
 
     avg_throughput = average_excluding_min_max(results_list)
     avg_time = average_excluding_min_max(time_list)  # Average time in seconds
+    avg_ttft = average_excluding_min_max(ttft_list)  # Average TTFT in seconds
+    avg_tpot = average_excluding_min_max(tpot_list)  # Average TPOT in seconds/token
 
     total_max_memory = 0
     for i in range(num_gpus):
@@ -189,11 +223,16 @@ def measure_throughput(
     results_text.append(f"  Number of Test Runs: {num_runs}")
     results_text.append(f"")
     results_text.append(f"Individual Run Results:")
-    for i, (throughput, run_time) in enumerate(zip(results_list, time_list)):
-        results_text.append(f"  Run {i+1}: {throughput:.2f} tokens/sec, {run_time:.2f} seconds")
+    for i, (throughput, run_time, ttft, tpot) in enumerate(zip(results_list, time_list, ttft_list, tpot_list)):
+        results_text.append(
+            f"  Run {i+1}: {throughput:.2f} tokens/sec, {run_time:.2f} seconds, "
+            f"TTFT={ttft * 1000:.2f} ms, Avg TPOT={tpot * 1000:.2f} ms/token"
+        )
     results_text.append(f"")
     results_text.append(f"Average Throughput (tokens/sec): {avg_throughput:.2f}")
     results_text.append(f"Average Time per Run (seconds): {avg_time:.2f}")
+    results_text.append(f"Average TTFT (ms): {avg_ttft * 1000:.2f}")
+    results_text.append(f"Average TPOT (ms/token): {avg_tpot * 1000:.2f}")
     results_text.append(f"Peak GPU Memory: {total_max_memory / 1000**2 / 1000:.2f} GB")
     results_text.append("=" * 60)
 
@@ -219,6 +258,8 @@ def measure_throughput(
     print(f"Number of Warm Up Runs={num_warmups}, Number of Test Runs={num_runs}")
     print(f"Average Throughput (tokens/sec)={avg_throughput:.2f}")
     print(f"Average Time per Run (seconds)={avg_time:.2f}")
+    print(f"Average TTFT (ms)={avg_ttft * 1000:.2f}")
+    print(f"Average TPOT (ms/token)={avg_tpot * 1000:.2f}")
     print(f"Peak GPU Memory: {total_max_memory / 1000**2 / 1000:.2f} GB\n")
 
 
