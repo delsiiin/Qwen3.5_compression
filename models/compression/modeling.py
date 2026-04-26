@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple, Union, Callable
 from transformers.utils import logging
 from transformers.processing_utils import Unpack
 
-from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5CausalLMOutputWithPast,
     Qwen3_5RMSNorm,
@@ -53,7 +53,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def Qwen3_5Attention_init(
-    self, config: Qwen3_5TextConfig, layer_idx: int, compression_config: dict
+    self, config: Qwen3_5Config, layer_idx: int, compression_config: dict
 ):
     nn.Module.__init__(self)
     self.config = config
@@ -131,33 +131,33 @@ def Qwen3_5Attention_forward(
 
     if past_key_values is not None:
         # =============== Enable Query Cache ============
-        if not hasattr(past_key_values, "query_cache"):
-            past_key_values.query_cache = {}
+        if not hasattr(past_key_values.layers[self.layer_idx], "query_cache"):
+            past_key_values.layers[self.layer_idx].query_cache = None
 
-        if self.layer_idx not in past_key_values.query_cache:
+        if past_key_values.layers[self.layer_idx].query_cache is None:
             bsz, n_heads, _, head_dim = query_states.shape
-            past_key_values.query_cache[self.layer_idx] = torch.empty(
+            past_key_values.layers[self.layer_idx].query_cache = torch.empty(
                 bsz, n_heads, 0, head_dim
             )
-            past_key_values.query_cache[self.layer_idx] = query_states[
+            past_key_values.layers[self.layer_idx].query_cache = query_states[
                 :, :, -self.config.method_config["window_size"] :, :
             ]
         else:
-            past_key_values.query_cache[self.layer_idx] = torch.cat(
-                (past_key_values.query_cache[self.layer_idx], query_states),
+            past_key_values.layers[self.layer_idx].query_cache = torch.cat(
+                (past_key_values.layers[self.layer_idx].query_cache, query_states),
                 dim=2,
             )
 
             window_size = self.config.method_config["window_size"]
-            if past_key_values.query_cache[self.layer_idx].shape[-2] > window_size:
-                past_key_values.query_cache[self.layer_idx] = past_key_values.query_cache[
-                    self.layer_idx
-                ][:, :, -window_size:, :]
+            if past_key_values.layers[self.layer_idx].query_cache.shape[-2] > window_size:
+                past_key_values.layers[self.layer_idx].query_cache = past_key_values.layers[self.layer_idx].query_cache[
+                    :, :, -window_size:, :
+                ]
         # =============== Enable Query Cache end =========
 
         # =============== decoding-time compression start ===============
-        cached_queries = past_key_values.query_cache[self.layer_idx]
-        if self.config.compression is None:
+        cached_queries = past_key_values.layers[self.layer_idx].query_cache
+        if self.config.compression is None or query_states.shape[-2] > 1:
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
                 key_states,
                 cached_queries,
@@ -191,8 +191,8 @@ def Qwen3_5Attention_forward(
             )
 
             if self.config.update_kv is True:
-                past_key_values.key_cache[self.layer_idx] = key_states_compress
-                past_key_values.value_cache[self.layer_idx] = value_states_compress
+                past_key_values.layers[self.layer_idx].keys = key_states_compress
+                past_key_values.layers[self.layer_idx].values = value_states_compress
         else:
             key_states, value_states = past_key_values.update(
                 key_states,
@@ -222,45 +222,6 @@ def Qwen3_5Attention_forward(
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
 
-def _run_step_level_compression(
-    model,
-    decoder_layers,
-    input_ids: Optional[torch.LongTensor],
-    past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]],
-    logits: torch.Tensor,
-):
-    if input_ids is None or past_key_values is None:
-        return
-
-    if len(past_key_values) == 0 and model.config.compression_content == "think":
-        model.after_think = False
-
-    if not hasattr(model, "length"):
-        model.length = input_ids.shape[1]
-    else:
-        model.length += input_ids.shape[1]
-
-    predicted_token_ids = logits[:, -1, :].argmax(dim=-1)
-
-    if model.config.compression_content == "think" and model.after_think is False:
-        model.after_think = (
-            predicted_token_ids[0].cpu().item() in model.after_think_token_ids
-        )
-
-    if model.config.divide_method == "newline":
-        is_newline = predicted_token_ids[0].cpu().item() in model.newline_token_ids
-    elif model.config.divide_method == "step_length":
-        is_newline = model.length % model.config.divide_length == 0
-    else:
-        raise ValueError(f"Invalid divide_method: {model.config.divide_method}")
-
-    if model.config.compression_content == "think" and model.after_think is True:
-        is_newline = False
-
-    for layer in decoder_layers:
-        if hasattr(layer, "self_attn"):
-            layer.self_attn.config.compression = is_newline
-
 def Qwen3_5ForCausalLM_forward(
     self,
     input_ids: torch.LongTensor = None,
@@ -273,6 +234,17 @@ def Qwen3_5ForCausalLM_forward(
     logits_to_keep: Union[int, torch.Tensor] = 0,
     **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
+    
+    # sample-level statistics
+    if past_key_values.get_seq_length() == 0:
+        if self.config.compression_content == "think":
+            self.after_think = False
+
+    if not hasattr(self, "length"):
+        self.length = input_ids.shape[1]
+    else:
+        self.length += input_ids.shape[1]
+
     outputs: BaseModelOutputWithPast = self.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -291,13 +263,30 @@ def Qwen3_5ForCausalLM_forward(
     )
     logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    _run_step_level_compression(
-        self,
-        self.model.layers,
-        input_ids,
-        past_key_values,
-        logits,
-    )
+    # =============== Step-level Compression logic start ===============
+    # assume non-batch input, shape: [1, logits_to_keep, vocab_size]
+    predicted_token_ids = logits[:, -1, :].argmax(dim=-1)
+
+    if self.config.compression_content == "think" and self.after_think == False:
+        self.after_think = (
+            predicted_token_ids[0].cpu().item() in self.after_think_token_ids
+        )
+
+    if self.config.divide_method == "newline":
+        is_newline = predicted_token_ids[0].cpu().item() in self.newline_token_ids
+    elif self.config.divide_method == "step_length":
+        is_newline = self.length % self.config.divide_length == 0
+    else:
+        raise ValueError(f"Invalid divide_method: {self.config.divide_method}")
+
+    if self.config.compression_content == "think" and self.after_think == True:
+        is_newline = False
+
+    # Set compression flag for all layers at once
+    for layer in self.model.layers:
+        if layer.layer_type == "full_attention":
+            layer.self_attn.config.compression = is_newline
+    # =============== Step-level Compression logic end =================
 
     loss = None
     if labels is not None:
@@ -332,6 +321,17 @@ def Qwen3_5ForConditionalGeneration_forward(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs,
 ) -> Union[Tuple, Qwen3_5CausalLMOutputWithPast]:
+    
+    # sample-level statistics
+    if past_key_values.get_seq_length() == 0:
+        if self.config.compression_content == "think":
+            self.after_think = False
+
+    if not hasattr(self, "length"):
+        self.length = input_ids.shape[1]
+    else:
+        self.length += input_ids.shape[1]
+
     outputs = self.model(
         input_ids=input_ids,
         pixel_values=pixel_values,
@@ -354,13 +354,30 @@ def Qwen3_5ForConditionalGeneration_forward(
     )
     logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-    _run_step_level_compression(
-        self,
-        self.model.language_model.layers,
-        input_ids,
-        past_key_values,
-        logits,
-    )
+    # =============== Step-level Compression logic start ===============
+    # assume non-batch input, shape: [1, logits_to_keep, vocab_size]
+    predicted_token_ids = logits[:, -1, :].argmax(dim=-1)
+
+    if self.config.compression_content == "think" and self.after_think == False:
+        self.after_think = (
+            predicted_token_ids[0].cpu().item() in self.after_think_token_ids
+        )
+
+    if self.config.divide_method == "newline":
+        is_newline = predicted_token_ids[0].cpu().item() in self.newline_token_ids
+    elif self.config.divide_method == "step_length":
+        is_newline = self.length % self.config.divide_length == 0
+    else:
+        raise ValueError(f"Invalid divide_method: {self.config.divide_method}")
+
+    if self.config.compression_content == "think" and self.after_think == True:
+        is_newline = False
+
+    # Set compression flag for all layers at once
+    for layer in self.model.layers:
+        if layer.layer_type == "full_attention":
+            layer.self_attn.config.compression = is_newline
+    # =============== Step-level Compression logic end =================
 
     loss = None
     if labels is not None:
