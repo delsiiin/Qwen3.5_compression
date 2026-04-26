@@ -71,6 +71,13 @@ def filter_by_domain(data, domains):
 def build_output_path(args, domains):
     os.makedirs(args.save_dir, exist_ok=True)
     output_prefix = args.model.split("/")[-1] + get_domain_suffix(domains)
+    if getattr(args, "compression", False):
+        compression_mode = getattr(args, "compression_mode", None) or "compressed"
+        compression_budget = getattr(args, "compression_budget", None)
+        if compression_budget is not None:
+            output_prefix = f"{output_prefix}_{compression_mode}_budget_{compression_budget}"
+        else:
+            output_prefix = f"{output_prefix}_{compression_mode}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.rag > 0:

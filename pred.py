@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import traceback
 
 import torch
 import torch.multiprocessing as mp
@@ -22,6 +23,7 @@ from pred_misc import (
     parse_domain_filter,
     select_unprocessed,
 )
+from models.compression.monkeypatch import replace_qwen3_5
 
 model_map = load_json("config/model2path.json")
 maxlen_map = load_json("config/model2maxlen.json")
@@ -47,25 +49,90 @@ def truncate_prompt(prompt, model_name, tokenizer, max_new_tokens, max_input_len
         prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
     return prompt
 
-def load_model_and_tokenizer(model_name, attn_heatmap_mode=False):
+def build_compression_config(compression_mode, compression_budget):
+    return {
+        "method": compression_mode,
+        "method_config": {
+            "budget": compression_budget,
+            "window_size": 8,
+            "mix_lambda": 0.07,
+            "retain_ratio": 0.2,
+            "retain_direction": "last",
+            "first_tokens": 4,
+        },
+        "compression": None,
+        "update_kv": True,
+    }
+
+
+def apply_qwen3_5_compression_setup(model, tokenizer, compression_mode):
+    model.config.update(
+        {
+            "divide_method": "step_length",
+            "divide_length": 128,
+            "compression_content": "think",
+            "method": compression_mode,
+        }
+    )
+    model.newline_token_ids = [
+        tokenizer.encode(text, add_special_tokens=False)[-1]
+        for text in ["\n", ".\n", ")\n", "\n\n", ".\n\n", ")\n\n"]
+    ]
+    model.after_think_token_ids = [tokenizer.encode("</think>", add_special_tokens=False)[-1]]
+
+
+def load_model_and_tokenizer(
+    model_name,
+    attn_heatmap_mode=False,
+    compression=False,
+    compression_mode=None,
+    compression_budget=4096,
+):
     model_path = get_model_path(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=True,
+        padding_side="left",
+        trust_remote_code=True,
+    )
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_kwargs = {"trust_remote_code": True}
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "device_map": "auto",
+    }
     if torch.cuda.is_available():
         model_kwargs["torch_dtype"] = torch.bfloat16
     else:
         model_kwargs["torch_dtype"] = torch.float32
-    if attn_heatmap_mode:
+    if attn_heatmap_mode or compression:
         model_kwargs["attn_implementation"] = "eager"
 
-    if "qwen3.5" in model_name.lower():
+    if compression:
+        if not compression_mode:
+            raise ValueError("Please provide --compression_mode when --compression is enabled.")
+        if "qwen3.5" not in model_path.lower():
+            raise ValueError(
+                f"Compression currently supports only qwen3.5 models, got: {model_name}"
+            )
+
+        replace_qwen3_5(build_compression_config(compression_mode, compression_budget))
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        apply_qwen3_5_compression_setup(model, tokenizer, compression_mode)
+    elif "qwen3.5" in model_path.lower():
+        from models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
         from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(model_path, device_map="auto", **model_kwargs)
+
+        config = Qwen3_5Config.from_pretrained(model_path)
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+            model_path,
+            config=config,
+            **model_kwargs,
+        )
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", **model_kwargs)
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     if attn_heatmap_mode:
         text_config = getattr(model.config, "text_config", model.config)
         setattr(text_config, "_attn_implementation", "eager")
@@ -198,6 +265,10 @@ def build_attn_run_writer(args, out_file, model):
 def validate_args(args):
     if args.num_samples is not None and args.num_samples < 1:
         raise ValueError("--num_samples must be at least 1 when provided.")
+    if args.compression and not args.compression_mode:
+        raise ValueError("--compression requires --compression_mode.")
+    if args.compression and args.compression_budget < 1:
+        raise ValueError("--compression_budget must be at least 1 when compression is enabled.")
     if not args.attn_heatmap_mode:
         return
     if not is_qwen_attn_heatmap_model(args.model):
@@ -207,78 +278,95 @@ def validate_args(args):
 
 def get_pred(data, args, fout, out_file):
     model_name = args.model
-    model, tokenizer = load_model_and_tokenizer(model_name, attn_heatmap_mode=args.attn_heatmap_mode)
+    model, tokenizer = load_model_and_tokenizer(
+        model_name,
+        attn_heatmap_mode=args.attn_heatmap_mode,
+        compression=args.compression,
+        compression_mode=args.compression_mode,
+        compression_budget=args.compression_budget,
+    )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
     for item in tqdm(data):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
-        context = item['context']
-        if args.rag > 0:
-            template = prompt_templates["rag"]
-            retrieved = item["retrieved_context"][:args.rag]
-            retrieved = sorted(retrieved, key=lambda x: x['c_idx'])
-            context = '\n\n'.join([f"Retrieved chunk {idx+1}: {x['content']}" for idx, x in enumerate(retrieved)])
-        elif args.no_context:
-            template = prompt_templates["no_context"]
-        elif args.cot:
-            template = prompt_templates["cot"]
-        else:
-            template = prompt_templates["zero_shot"]
-        prompt = build_prompt(template, context, item)
-        if args.cot:
-            output, _ = query_llm(
-                prompt,
-                model_name,
-                model,
-                tokenizer,
-                temperature=0.1,
-                max_new_tokens=1024,
-                enable_thinking=args.cot,
-                attn_sample_writer=attn_sample_writer,
-                prefill_label="cot_reasoning",
-            )
-        else:
-            output, _ = query_llm(
-                prompt,
-                model_name,
-                model,
-                tokenizer,
-                temperature=0.1,
-                max_new_tokens=128,
-                enable_thinking=args.cot,
-                attn_sample_writer=attn_sample_writer,
-                prefill_label="response",
-            )
-        if output == '':
-            continue
-        if args.cot: # extract answer
-            response = output.strip()
-            item['response_cot'] = response
-            prompt = build_prompt(prompt_templates["cot_answer"], context, item, cot=response)
-            output, _ = query_llm(
-                prompt,
-                model_name,
-                model,
-                tokenizer,
-                temperature=0.1,
-                max_new_tokens=128,
-                enable_thinking=args.cot,
-                attn_sample_writer=attn_sample_writer,
-                prefill_label="cot_answer_extraction",
-            )
+        try:
+            context = item['context']
+            if args.rag > 0:
+                template = prompt_templates["rag"]
+                retrieved = item["retrieved_context"][:args.rag]
+                retrieved = sorted(retrieved, key=lambda x: x['c_idx'])
+                context = '\n\n'.join([f"Retrieved chunk {idx+1}: {x['content']}" for idx, x in enumerate(retrieved)])
+            elif args.no_context:
+                template = prompt_templates["no_context"]
+            elif args.cot:
+                template = prompt_templates["cot"]
+            else:
+                template = prompt_templates["zero_shot"]
+            prompt = build_prompt(template, context, item)
+            if args.cot:
+                output, _ = query_llm(
+                    prompt,
+                    model_name,
+                    model,
+                    tokenizer,
+                    temperature=0.1,
+                    max_new_tokens=1024,
+                    enable_thinking=args.cot,
+                    attn_sample_writer=attn_sample_writer,
+                    prefill_label="cot_reasoning",
+                )
+            else:
+                output, _ = query_llm(
+                    prompt,
+                    model_name,
+                    model,
+                    tokenizer,
+                    temperature=0.1,
+                    max_new_tokens=128,
+                    enable_thinking=args.cot,
+                    attn_sample_writer=attn_sample_writer,
+                    prefill_label="response",
+                )
             if output == '':
                 continue
-        response = output.strip()
-        item['response'] = response
-        item['pred'] = extract_answer(response)
-        item['judge'] = item['pred'] == item['answer']
-        item['context'] = context[:1000]
-        if attn_sample_writer is not None:
-            item["attn_capture_status"] = attn_sample_writer.build_capture_status()
-            item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
-            attn_sample_writer.finalize(item)
-        fout.write(json.dumps(item, ensure_ascii=False) + '\n')
-        fout.flush()
+            if args.cot: # extract answer
+                response = output.strip()
+                item['response_cot'] = response
+                prompt = build_prompt(prompt_templates["cot_answer"], context, item, cot=response)
+                output, _ = query_llm(
+                    prompt,
+                    model_name,
+                    model,
+                    tokenizer,
+                    temperature=0.1,
+                    max_new_tokens=128,
+                    enable_thinking=args.cot,
+                    attn_sample_writer=attn_sample_writer,
+                    prefill_label="cot_answer_extraction",
+                )
+                if output == '':
+                    continue
+            response = output.strip()
+            item['response'] = response
+            item['pred'] = extract_answer(response)
+            item['judge'] = item['pred'] == item['answer']
+            item['context'] = context[:1000]
+            if attn_sample_writer is not None:
+                item["attn_capture_status"] = attn_sample_writer.build_capture_status()
+                item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
+                attn_sample_writer.finalize(item)
+            fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+            fout.flush()
+        except Exception as exc:
+            sample_id = item.get("_id", "unknown")
+            print(f"Skipping sample {sample_id} due to error: {exc}")
+            traceback.print_exc()
+            if attn_sample_writer is not None:
+                item["error"] = str(exc)
+                item["attn_capture_status"] = attn_sample_writer.build_capture_status()
+                item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
+                attn_sample_writer.finalize(item)
+            continue
 
 def main(args):
     print(args)
@@ -322,6 +410,9 @@ if __name__ == "__main__":
     parser.add_argument("--domain", "-d", action='append', default=None, help="Only run examples from the given domain. Repeat this option or use comma-separated names for multiple domains.")
     parser.add_argument("--num_samples", "--max_samples", type=int, default=None, help="Only run the first N unprocessed examples.")
     parser.add_argument("--n_proc", "-n", type=int, default=1)
+    parser.add_argument("--compression", action="store_true")
+    parser.add_argument("--compression_mode", type=str, default=None)
+    parser.add_argument("--compression_budget", type=int, default=4096)
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="results/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
