@@ -107,8 +107,10 @@ def load_model_and_tokenizer(
         model_kwargs["torch_dtype"] = torch.bfloat16
     else:
         model_kwargs["torch_dtype"] = torch.float32
-    if attn_heatmap_mode or compression:
+    if attn_heatmap_mode:
         model_kwargs["attn_implementation"] = "eager"
+    else:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
 
     if compression:
         if not compression_mode:
