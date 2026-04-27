@@ -6,6 +6,7 @@ from tqdm import tqdm
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from models.compression.monkeypatch import replace_qwen3_5
 
 # from utils.qwen2_norepeat import qwen2_flashattention2_norepeat_forward
 
@@ -67,6 +68,82 @@ class FirstTokenTimingCriteria(StoppingCriteria):
         return False
 
 
+def build_compression_config(compression_mode, compression_budget):
+    return {
+        "method": compression_mode,
+        "method_config": {
+            "budget": compression_budget,
+            "window_size": 8,
+            "mix_lambda": 0.07,
+            "retain_ratio": 0.2,
+            "retain_direction": "last",
+            "first_tokens": 4,
+        },
+        "compression": None,
+        "update_kv": True,
+    }
+
+
+def apply_qwen3_5_compression_setup(model, tokenizer, compression_mode):
+    model.config.update(
+        {
+            "divide_method": "step_length",
+            "divide_length": 128,
+            "compression_content": "think",
+            "method": compression_mode,
+        }
+    )
+    model.newline_token_ids = [
+        tokenizer.encode(text, add_special_tokens=False)[-1]
+        for text in ["\n", ".\n", ")\n", "\n\n", ".\n\n", ")\n\n"]
+    ]
+    model.after_think_token_ids = [tokenizer.encode("</think>", add_special_tokens=False)[-1]]
+
+
+def load_model_and_tokenizer(
+    model_path,
+    compression=False,
+    compression_mode=None,
+    compression_budget=4096,
+):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=True,
+        padding_side="left",
+        trust_remote_code=True,
+    )
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "device_map": "auto",
+        "attn_implementation": "flash_attention_2",
+    }
+    if torch.cuda.is_available():
+        model_kwargs["torch_dtype"] = torch.bfloat16
+    else:
+        model_kwargs["torch_dtype"] = torch.float32
+
+    if compression:
+        if not compression_mode:
+            raise ValueError("Please provide compression_mode when compression=True.")
+        if "qwen3.5" not in model_path.lower():
+            raise ValueError(
+                f"Compression currently supports only qwen3.5 models, got: {model_path}"
+            )
+
+        replace_qwen3_5(build_compression_config(compression_mode, compression_budget))
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        apply_qwen3_5_compression_setup(model, tokenizer, compression_mode)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+
+    model.eval()
+    return model, tokenizer
+
+
 def run_generation_with_timing(model, input_ids, attention_mask, tokenizer, max_new_tokens):
     first_token_timer = FirstTokenTimingCriteria()
     stopping_criteria = StoppingCriteriaList([first_token_timer])
@@ -102,6 +179,9 @@ def run_generation_with_timing(model, input_ids, attention_mask, tokenizer, max_
 
 def measure_throughput(
     model_path: str = "Qwen/QwQ-32B",
+    compression: bool = False,
+    compression_mode: str = None,
+    compression_budget: int = 4096,
     # experiment arguments
     batch_size: int = 16,
     input_len: int = 128,
@@ -117,7 +197,15 @@ def measure_throughput(
     # Generate output file name if not provided
     if output_file is None:
         model_name = model_path.split("/")[-1] if "/" in model_path else model_path
-        output_file = f"/home/yangx/Qwen3.5_compression/results/efficiency/throughput_results_{model_name}_{batch_size}_{input_len}.txt"
+        mode_name = compression_mode if compression and compression_mode else "fullkv"
+        budget_suffix = f"_budget_{compression_budget}" if compression else ""
+        output_file = (
+            f"/home/yangx/Qwen3.5_compression/results/efficiency/"
+            f"throughput_results_{model_name}_{mode_name}{budget_suffix}_{batch_size}_{input_len}.txt"
+        )
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     # Check if output file already exists
     if os.path.exists(output_file):
@@ -127,23 +215,12 @@ def measure_throughput(
 
     num_gpus = torch.cuda.device_count()
 
-    attn_implementation = 'flash_attention_2'
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        low_cpu_mem_usage=True,
-        attn_implementation=attn_implementation,
+    model, tokenizer = load_model_and_tokenizer(
+        model_path=model_path,
+        compression=compression,
+        compression_mode=compression_mode,
+        compression_budget=compression_budget,
     )
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    tokenizer.padding_side = 'left'
-    
-    # Ensure pad_token is set for generation
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     # Input Sequence      
     input_id = torch.ones((batch_size, input_len), dtype=torch.int64).to(model.device)
@@ -214,6 +291,9 @@ def measure_throughput(
     results_text.append("=" * 60)
     results_text.append(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     results_text.append(f"Model: {model_path}")
+    results_text.append(f"Mode: {compression_mode if compression else 'fullkv'}")
+    if compression:
+        results_text.append(f"Compression Budget: {compression_budget}")
     
     results_text.append(f"Experiment Parameters:")
     results_text.append(f"  Batch Size: {batch_size}")
@@ -251,7 +331,7 @@ def measure_throughput(
 
     # Also print the old format for backward compatibility
     print(f"\nModel: {model_path}")
-    # print(f"Mode: {mode}")
+    print(f"Mode: {compression_mode if compression else 'fullkv'}")
 
     print(f"Batch Size={batch_size}")
     print(f"Input Length={input_len}, Output Length={output_len}")
