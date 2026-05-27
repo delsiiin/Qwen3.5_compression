@@ -23,7 +23,11 @@ from misc import (
     parse_domain_filter,
     select_unprocessed,
 )
-from query_window_similarity import QueryWindowSimilarityRunWriter
+from query_window_similarity import (
+    QueryWindowSimilarityRunWriter,
+    SUPPORTED_SIMILARITY_STATES,
+    SIMILARITY_STATE_HIDDEN,
+)
 from snapkv_observation_longbench import (
     add_snapkv_observation_args,
     build_snapkv_observation_run_writer,
@@ -389,6 +393,7 @@ def build_query_window_similarity_run_writer(args, out_file):
         out_file=out_file,
         window_size=args.query_window_size,
         max_prefill_tokens=args.query_window_max_prefill_tokens,
+        similarity_state=args.query_window_similarity_submode,
     )
 
 
@@ -405,6 +410,11 @@ def validate_args(args):
         raise ValueError("--query_window_size must be at least 1.")
     if args.query_window_max_prefill_tokens is not None and args.query_window_max_prefill_tokens < 1:
         raise ValueError("--query_window_max_prefill_tokens must be at least 1 when provided.")
+    if args.query_window_similarity_submode not in SUPPORTED_SIMILARITY_STATES:
+        raise ValueError(
+            "--query_window_similarity_submode must be one of "
+            f"{sorted(SUPPORTED_SIMILARITY_STATES)}."
+        )
     if args.attn_heatmap_mode:
         if not is_qwen_attn_heatmap_model(args.model):
             raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
@@ -612,7 +622,16 @@ if __name__ == "__main__":
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
     parser.add_argument("--query_window_similarity_mode", action="store_true")
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
-    parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise hidden-state cosine similarity.")
+    parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise cosine similarity.")
+    parser.add_argument(
+        "--query_window_similarity_submode",
+        "--query_window_similarity_state",
+        dest="query_window_similarity_submode",
+        type=str,
+        choices=sorted(SUPPORTED_SIMILARITY_STATES),
+        default=SIMILARITY_STATE_HIDDEN,
+        help="Representation used for query-window layer similarity: hidden_states keeps the old behavior; query_states compares attention query states.",
+    )
     parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
     add_snapkv_observation_args(parser)
     args = parser.parse_args()
