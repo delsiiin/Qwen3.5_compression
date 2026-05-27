@@ -24,6 +24,11 @@ from misc import (
     select_unprocessed,
 )
 from query_window_similarity import QueryWindowSimilarityRunWriter
+from snapkv_observation_longbench import (
+    add_snapkv_observation_args,
+    build_snapkv_observation_run_writer,
+    validate_snapkv_observation_args,
+)
 
 model_map = load_json("config/model2path.json")
 prompt_templates = load_prompt_templates()
@@ -286,6 +291,7 @@ def query_llm(
     enable_thinking=False,
     attn_sample_writer=None,
     query_window_sample_writer=None,
+    snapkv_observation_sample_writer=None,
     prefill_label="response",
 ):
     max_input_len = get_max_input_len(model_maxlen, max_new_tokens)
@@ -305,6 +311,14 @@ def query_llm(
         ).record
     if query_window_sample_writer is not None:
         query_window_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
+    if snapkv_observation_sample_writer is not None:
+        snapkv_observation_sample_writer.capture_prefill(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt,
@@ -398,6 +412,7 @@ def validate_args(args):
             raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
     if args.query_window_similarity_mode and args.n_proc != 1:
         raise ValueError("--query_window_similarity_mode currently requires --n_proc 1.")
+    validate_snapkv_observation_args(args)
 
 def get_pred(data, args, fout, out_file):
     model_name = args.model
@@ -410,12 +425,18 @@ def get_pred(data, args, fout, out_file):
     )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
     query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
+    snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
         query_window_sample_writer = (
             query_window_run_writer.new_sample(item)
             if query_window_run_writer is not None
+            else None
+        )
+        snapkv_observation_sample_writer = (
+            snapkv_observation_run_writer.new_sample(item)
+            if snapkv_observation_run_writer is not None
             else None
         )
         try:
@@ -444,6 +465,7 @@ def get_pred(data, args, fout, out_file):
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
+                    snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="cot_reasoning",
                 )
             else:
@@ -458,6 +480,7 @@ def get_pred(data, args, fout, out_file):
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
+                    snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="response",
                 )
             if output == '':
@@ -477,6 +500,7 @@ def get_pred(data, args, fout, out_file):
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
+                    snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="cot_answer_extraction",
                 )
                 if output == '':
@@ -495,10 +519,18 @@ def get_pred(data, args, fout, out_file):
                     query_window_sample_writer.sample_dir,
                     start=args.query_window_similarity_dir,
                 )
+            if snapkv_observation_sample_writer is not None:
+                item["snapkv_observation_status"] = snapkv_observation_sample_writer.build_capture_status()
+                item["snapkv_observation_artifact"] = os.path.relpath(
+                    snapkv_observation_sample_writer.sample_dir,
+                    start=args.snapkv_observation_dir,
+                )
             if attn_sample_writer is not None:
                 attn_sample_writer.finalize(item)
             if query_window_sample_writer is not None:
                 query_window_sample_writer.finalize(item)
+            if snapkv_observation_sample_writer is not None:
+                snapkv_observation_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
             fout.flush()
         except Exception as exc:
@@ -518,6 +550,14 @@ def get_pred(data, args, fout, out_file):
                     start=args.query_window_similarity_dir,
                 )
                 query_window_sample_writer.finalize(item)
+            if snapkv_observation_sample_writer is not None:
+                item["error"] = str(exc)
+                item["snapkv_observation_status"] = snapkv_observation_sample_writer.build_capture_status()
+                item["snapkv_observation_artifact"] = os.path.relpath(
+                    snapkv_observation_sample_writer.sample_dir,
+                    start=args.snapkv_observation_dir,
+                )
+                snapkv_observation_sample_writer.finalize(item)
             continue
 
 
@@ -574,5 +614,6 @@ if __name__ == "__main__":
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
     parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise hidden-state cosine similarity.")
     parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
+    add_snapkv_observation_args(parser)
     args = parser.parse_args()
     main(args)
