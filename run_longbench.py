@@ -23,6 +23,7 @@ from misc import (
     parse_domain_filter,
     select_unprocessed,
 )
+from query_window_similarity import QueryWindowSimilarityRunWriter
 
 model_map = load_json("config/model2path.json")
 prompt_templates = load_prompt_templates()
@@ -238,6 +239,7 @@ def get_input_device(model):
     except StopIteration:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def build_inputs(prompt, tokenizer, device, enable_thinking=False):
     messages = [{"role": "user", "content": prompt}]
     if getattr(tokenizer, "chat_template", None):
@@ -283,6 +285,7 @@ def query_llm(
     stop=None,
     enable_thinking=False,
     attn_sample_writer=None,
+    query_window_sample_writer=None,
     prefill_label="response",
 ):
     max_input_len = get_max_input_len(model_maxlen, max_new_tokens)
@@ -300,6 +303,14 @@ def query_llm(
             inputs=inputs,
             label=prefill_label,
         ).record
+    if query_window_sample_writer is not None:
+        query_window_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
 
     generation_kwargs = {
         **inputs,
@@ -355,6 +366,18 @@ def build_attn_run_writer(args, out_file, model):
     )
 
 
+def build_query_window_similarity_run_writer(args, out_file):
+    if not args.query_window_similarity_mode:
+        return None
+    return QueryWindowSimilarityRunWriter(
+        root_dir=args.query_window_similarity_dir,
+        model_name=args.model,
+        out_file=out_file,
+        window_size=args.query_window_size,
+        max_prefill_tokens=args.query_window_max_prefill_tokens,
+    )
+
+
 def validate_args(args):
     if args.model_maxlen < 1:
         raise ValueError("--model_maxlen must be at least 1.")
@@ -364,12 +387,17 @@ def validate_args(args):
         raise ValueError("--compression requires --compression_mode.")
     if args.compression and args.compression_budget < 1:
         raise ValueError("--compression_budget must be at least 1 when compression is enabled.")
-    if not args.attn_heatmap_mode:
-        return
-    if not is_qwen_attn_heatmap_model(args.model):
-        raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
-    if args.n_proc != 1:
-        raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
+    if args.query_window_size < 1:
+        raise ValueError("--query_window_size must be at least 1.")
+    if args.query_window_max_prefill_tokens is not None and args.query_window_max_prefill_tokens < 1:
+        raise ValueError("--query_window_max_prefill_tokens must be at least 1 when provided.")
+    if args.attn_heatmap_mode:
+        if not is_qwen_attn_heatmap_model(args.model):
+            raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
+        if args.n_proc != 1:
+            raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
+    if args.query_window_similarity_mode and args.n_proc != 1:
+        raise ValueError("--query_window_similarity_mode currently requires --n_proc 1.")
 
 def get_pred(data, args, fout, out_file):
     model_name = args.model
@@ -381,9 +409,15 @@ def get_pred(data, args, fout, out_file):
         compression_budget=args.compression_budget,
     )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
+    query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
+        query_window_sample_writer = (
+            query_window_run_writer.new_sample(item)
+            if query_window_run_writer is not None
+            else None
+        )
         try:
             context = item['context']
             if args.rag > 0:
@@ -409,6 +443,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=1024,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    query_window_sample_writer=query_window_sample_writer,
                     prefill_label="cot_reasoning",
                 )
             else:
@@ -422,6 +457,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    query_window_sample_writer=query_window_sample_writer,
                     prefill_label="response",
                 )
             if output == '':
@@ -440,6 +476,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    query_window_sample_writer=query_window_sample_writer,
                     prefill_label="cot_answer_extraction",
                 )
                 if output == '':
@@ -452,8 +489,16 @@ def get_pred(data, args, fout, out_file):
             if attn_sample_writer is not None:
                 item["attn_capture_status"] = attn_sample_writer.build_capture_status()
                 item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
+            if query_window_sample_writer is not None:
+                item["query_window_similarity_status"] = query_window_sample_writer.build_capture_status()
+                item["query_window_similarity_artifact"] = os.path.relpath(
+                    query_window_sample_writer.sample_dir,
+                    start=args.query_window_similarity_dir,
+                )
             if attn_sample_writer is not None:
                 attn_sample_writer.finalize(item)
+            if query_window_sample_writer is not None:
+                query_window_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
             fout.flush()
         except Exception as exc:
@@ -465,7 +510,17 @@ def get_pred(data, args, fout, out_file):
                 item["attn_capture_status"] = attn_sample_writer.build_capture_status()
                 item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
                 attn_sample_writer.finalize(item)
+            if query_window_sample_writer is not None:
+                item["error"] = str(exc)
+                item["query_window_similarity_status"] = query_window_sample_writer.build_capture_status()
+                item["query_window_similarity_artifact"] = os.path.relpath(
+                    query_window_sample_writer.sample_dir,
+                    start=args.query_window_similarity_dir,
+                )
+                query_window_sample_writer.finalize(item)
             continue
+
+
 def main(args):
     print(args)
     validate_args(args)
@@ -515,5 +570,9 @@ if __name__ == "__main__":
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="output_dir/results_longbench/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--query_window_similarity_mode", action="store_true")
+    parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
+    parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise hidden-state cosine similarity.")
+    parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
     args = parser.parse_args()
     main(args)
