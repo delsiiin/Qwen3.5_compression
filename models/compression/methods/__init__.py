@@ -1,7 +1,8 @@
 from ..utils import cal_similarity, compute_attention_scores
 
 from .snapkv import SnapKV
+from .snapkv_neighbor_shared import SnapKVNeighborShared
 from .streamingllm import StreamingLLM
 from .h2o import H2O
 
-__all__ = ["SnapKV", "StreamingLLM", "H2O"]
+__all__ = ["SnapKV", "SnapKVNeighborShared", "StreamingLLM", "H2O"]

@@ -41,15 +41,18 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from .methods import (
     SnapKV,
+    SnapKVNeighborShared,
     StreamingLLM,
     H2O,
 )
+from .methods.snapkv_neighbor_shared import masked_eager_attention_forward
 
 import math
 import torch.nn.functional as F
 
 KV_COMPRESSION_MAP = {
     "snapkv": SnapKV,
+    "snapkv_neighbor_shared": SnapKVNeighborShared,
     "streamingllm": StreamingLLM,
     "h2o": H2O,
 }
@@ -67,6 +70,20 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _get_kv_valid_mask(attention, past_key_values, key_states, query_states):
+    if past_key_values is None:
+        return None
+    layer_cache = past_key_values.layers[attention.layer_idx]
+    if query_states.shape[-2] == 1:
+        attention_kv_valid_mask = getattr(layer_cache, "attention_kv_valid_mask", None)
+        if attention_kv_valid_mask is not None and attention_kv_valid_mask.shape[-1] == key_states.shape[-2]:
+            return attention_kv_valid_mask.to(device=key_states.device)
+    kv_valid_mask = getattr(layer_cache, "kv_valid_mask", None)
+    if kv_valid_mask is None or kv_valid_mask.shape[-1] != key_states.shape[-2]:
+        return None
+    return kv_valid_mask.to(device=key_states.device)
 
 def Llama_Attention_init(self, config: LlamaConfig, layer_idx: int, compression_config: dict):
     nn.Module.__init__(self)
@@ -264,70 +281,96 @@ def Llama_Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        # =============== decoding-time compression start ===============
-        cached_queries = layer_cache.query_cache
-        if self.config.compression is None or query_states.shape[-2] > 1:
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+            key_states, value_states = self.kv_cluster.update_kv_cache(
+                self,
+                hidden_states,
+                position_embeddings,
                 key_states,
-                cached_queries,
+                query_states,
                 value_states,
-                **update_kwargs,
+                past_key_values,
+                layer_cache,
             )
-
-            if self.config.update_kv is True:
-                past_key_values.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
+        else:
+            # =============== decoding-time compression start ===============
+            cached_queries = layer_cache.query_cache
+            if self.config.compression is None or query_states.shape[-2] > 1:
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
                 )
-            else:
-                past_key_values.update(
+
+                if self.config.update_kv is True:
+                    past_key_values.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                    )
+                else:
+                    past_key_values.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                    )
+
+            elif self.config.compression is True:
+                key_states, value_states = past_key_values.update(
                     key_states,
                     value_states,
                     self.layer_idx,
                 )
 
-        elif self.config.compression is True:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
+                )
 
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,
-                value_states,
-                **update_kwargs,
-            )
-
-            if self.config.update_kv is True:
-                layer_cache.keys = key_states_compress
-                layer_cache.values = value_states_compress
-        else:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
-        # =============== decoding-time compression end ===============
+                if self.config.update_kv is True:
+                    layer_cache.keys = key_states_compress
+                    layer_cache.values = value_states_compress
+            else:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+            # =============== decoding-time compression end ===============
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, llama_eager_attention_forward
     )
 
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        **kwargs,
-    )
+    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
+    if kv_valid_mask is not None:
+        attn_output, attn_weights = masked_eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            kv_valid_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+    else:
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -378,71 +421,98 @@ def Qwen3_Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        # =============== decoding-time compression start ===============
-        cached_queries = layer_cache.query_cache
-        if self.config.compression is None or query_states.shape[-2] > 1:
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+            key_states, value_states = self.kv_cluster.update_kv_cache(
+                self,
+                hidden_states,
+                position_embeddings,
                 key_states,
-                cached_queries,
+                query_states,
                 value_states,
-                **update_kwargs,
+                past_key_values,
+                layer_cache,
             )
-
-            if self.config.update_kv is True:
-                past_key_values.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
+        else:
+            # =============== decoding-time compression start ===============
+            cached_queries = layer_cache.query_cache
+            if self.config.compression is None or query_states.shape[-2] > 1:
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
                 )
-            else:
-                past_key_values.update(
+
+                if self.config.update_kv is True:
+                    past_key_values.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                    )
+                else:
+                    past_key_values.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                    )
+
+            elif self.config.compression is True:
+                key_states, value_states = past_key_values.update(
                     key_states,
                     value_states,
                     self.layer_idx,
                 )
 
-        elif self.config.compression is True:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
+                )
 
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,
-                value_states,
-                **update_kwargs,
-            )
-
-            if self.config.update_kv is True:
-                layer_cache.keys = key_states_compress
-                layer_cache.values = value_states_compress
-        else:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
-        # =============== decoding-time compression end ===============
+                if self.config.update_kv is True:
+                    layer_cache.keys = key_states_compress
+                    layer_cache.values = value_states_compress
+            else:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+            # =============== decoding-time compression end ===============
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, qwen3_eager_attention_forward
     )
 
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        sliding_window=self.sliding_window,  # diff with Llama
-        **kwargs,
-    )
+    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
+    if kv_valid_mask is not None:
+        attn_output, attn_weights = masked_eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            kv_valid_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
+            **kwargs,
+        )
+    else:
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
+            **kwargs,
+        )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -493,70 +563,97 @@ def Qwen3Moe_Attention_forward(
                     ]
             # =============== Enable Query Cache end =========
 
-            # =============== decoding-time compression start ===============
-            cached_queries = layer_cache.query_cache
-            if self.config.compression is None or query_states.shape[-2] > 1:
-                update_kwargs = {}
-                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+            if getattr(self.kv_cluster, "requires_layer_coordination", False):
+                key_states, value_states = self.kv_cluster.update_kv_cache(
+                    self,
+                    hidden_states,
+                    position_embeddings,
                     key_states,
-                    cached_queries,
+                    query_states,
                     value_states,
-                    **update_kwargs,
+                    past_key_values,
+                    layer_cache,
                 )
-
-                if self.config.update_kv is True:
-                    past_key_values.update(
-                        key_states_compress,
-                        value_states_compress,
-                        self.layer_idx,
+            else:
+                # =============== decoding-time compression start ===============
+                cached_queries = layer_cache.query_cache
+                if self.config.compression is None or query_states.shape[-2] > 1:
+                    update_kwargs = {}
+                    key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                        key_states,
+                        cached_queries,
+                        value_states,
+                        **update_kwargs,
                     )
-                else:
-                    past_key_values.update(
+
+                    if self.config.update_kv is True:
+                        past_key_values.update(
+                            key_states_compress,
+                            value_states_compress,
+                            self.layer_idx,
+                        )
+                    else:
+                        past_key_values.update(
+                            key_states,
+                            value_states,
+                            self.layer_idx,
+                        )
+
+                elif self.config.compression is True:
+                    key_states, value_states = past_key_values.update(
                         key_states,
                         value_states,
                         self.layer_idx,
                     )
 
-            elif self.config.compression is True:
-                key_states, value_states = past_key_values.update(
-                    key_states,
-                    value_states,
-                    self.layer_idx,
-                )
+                    update_kwargs = {}
+                    key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                        key_states,
+                        cached_queries,
+                        value_states,
+                        **update_kwargs,
+                    )
 
-                update_kwargs = {}
-                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                    key_states,
-                    cached_queries,
-                    value_states,
-                    **update_kwargs,
-                )
-
-                if self.config.update_kv is True:
-                    layer_cache.keys = key_states_compress
-                    layer_cache.values = value_states_compress
-            else:
-                key_states, value_states = past_key_values.update(
-                    key_states,
-                    value_states,
-                    self.layer_idx,
-                )
-            # =============== decoding-time compression end ===============
+                    if self.config.update_kv is True:
+                        layer_cache.keys = key_states_compress
+                        layer_cache.values = value_states_compress
+                else:
+                    key_states, value_states = past_key_values.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                    )
+                # =============== decoding-time compression end ===============
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, qwen3_moe_eager_attention_forward
         )
 
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+        kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
+        if kv_valid_mask is not None:
+            attn_output, attn_weights = masked_eager_attention_forward(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                kv_valid_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,  # diff with Llama
+                **kwargs,
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -619,55 +716,67 @@ def Qwen3_5Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        # =============== decoding-time compression start ===============
-        cached_queries = layer_cache.query_cache
-        if self.config.compression is None or query_states.shape[-2] > 1:
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+            key_states, value_states = self.kv_cluster.update_kv_cache(
+                self,
+                hidden_states,
+                position_embeddings,
                 key_states,
-                cached_queries,
+                query_states,
                 value_states,
-                **update_kwargs,
+                past_key_values,
+                layer_cache,
             )
-
-            if self.config.update_kv is True:
-                past_key_values.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
+        else:
+            # =============== decoding-time compression start ===============
+            cached_queries = layer_cache.query_cache
+            if self.config.compression is None or query_states.shape[-2] > 1:
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
                 )
-            else:
-                past_key_values.update(
+
+                if self.config.update_kv is True:
+                    past_key_values.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                    )
+                else:
+                    past_key_values.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                    )
+
+            elif self.config.compression is True:
+                key_states, value_states = past_key_values.update(
                     key_states,
                     value_states,
                     self.layer_idx,
                 )
 
-        elif self.config.compression is True:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
+                )
 
-            update_kwargs = {}
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,
-                value_states,
-                **update_kwargs,
-            )
-
-            if self.config.update_kv is True:
-                layer_cache.keys = key_states_compress
-                layer_cache.values = value_states_compress
-        else:
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-            )
-        # =============== decoding-time compression end ===============
+                if self.config.update_kv is True:
+                    layer_cache.keys = key_states_compress
+                    layer_cache.values = value_states_compress
+            else:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+            # =============== decoding-time compression end ===============
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation,
@@ -677,16 +786,30 @@ def Qwen3_5Attention_forward(
     if attention_mask is not None and attention_mask.device != query_states.device:
         attention_mask = attention_mask.to(query_states.device)
 
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        **kwargs,
-    )
+    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
+    if kv_valid_mask is not None:
+        attn_output, attn_weights = masked_eager_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            kv_valid_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+    else:
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
@@ -1012,7 +1135,7 @@ def Qwen3_5ForConditionalGeneration_forward(
     logits_to_keep: int | torch.Tensor = 0,
     **kwargs,
 ) -> Union[Tuple, Qwen3_5CausalLMOutputWithPast]:
-    
+
     # sample-level statistics
     if past_key_values.get_seq_length() == 0:
         if self.config.compression_content == "think":

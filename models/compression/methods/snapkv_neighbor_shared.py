@@ -1,0 +1,464 @@
+import torch
+import torch.nn.functional as F
+
+from . import compute_attention_scores
+from .snapkv import SnapKV
+
+
+class SnapKVNeighborShared:
+    requires_layer_coordination = True
+
+    def __init__(
+        self,
+        budget=128,
+        window_size=8,
+        kernel_size=7,
+        record_kept_token_indices=False,
+        layer_idx=None,
+        model_config=None,
+        model_type=None,
+        mode=None,
+        **kwargs,
+    ):
+        assert budget - window_size > 0, "budget must be greater than window_size"
+        self.budget = budget
+        self.window_size = window_size
+        self.kernel_size = kernel_size
+        self.layer_idx = layer_idx
+        self.model_config = model_config
+        self.model_type = model_type
+        self.mode = mode
+        self.record_kept_token_indices = record_kept_token_indices
+        self.fallback = SnapKV(
+            budget=budget,
+            window_size=window_size,
+            kernel_size=kernel_size,
+            record_kept_token_indices=record_kept_token_indices,
+            layer_idx=layer_idx,
+            model_config=model_config,
+            model_type=model_type,
+            mode=mode,
+            **kwargs,
+        )
+        if model_config is not None and not hasattr(model_config, "_snapkv_neighbor_shared_state"):
+            model_config._snapkv_neighbor_shared_state = {"groups": {}}
+
+    def update_kv(self, key_states, query_states, value_states):
+        return self.fallback.update_kv(key_states, query_states, value_states)
+
+    def update_kv_cache(
+        self,
+        attention,
+        hidden_states,
+        position_embeddings,
+        key_states,
+        query_states,
+        value_states,
+        past_key_values,
+        layer_cache,
+    ):
+        if self._should_append_to_cache(query_states, layer_cache):
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+            )
+            self._append_valid_mask(layer_cache, key_states)
+        else:
+            self._clear_padding_metadata(layer_cache)
+            if self.model_config.update_kv is not True or key_states.shape[-2] < self.budget:
+                self._set_layer_cache(layer_cache, key_states, value_states)
+            if self.model_config.update_kv is not True:
+                return key_states, value_states
+
+        if self.model_config.update_kv is not True:
+            return key_states, value_states
+
+        hidden_window = self._update_hidden_window(layer_cache, hidden_states)
+        position_window = self._update_position_window(layer_cache, position_embeddings, hidden_states.shape[-2])
+        should_compress = (
+            self.model_config.compression is None
+            or query_states.shape[-2] > 1
+            or self.model_config.compression is True
+        )
+        self._set_attention_mask_for_current_step(layer_cache, key_states, query_states)
+        if not should_compress:
+            return key_states, value_states
+
+        if self._is_incomplete_tail_layer():
+            compressed_k, compressed_v = self.fallback.update_kv(
+                key_states,
+                layer_cache.query_cache,
+                value_states,
+            )
+            self._clear_padding_metadata(layer_cache)
+            self._set_layer_cache(layer_cache, compressed_k, compressed_v)
+            return key_states, value_states
+
+        if self._valid_token_count(layer_cache, key_states) < self.budget:
+            return key_states, value_states
+
+        self._set_attention_mask_for_current_step(layer_cache, key_states, query_states)
+        self._store_group_entry(
+            attention=attention,
+            hidden_window=hidden_window,
+            position_window=position_window,
+            key_states=key_states,
+            value_states=value_states,
+            layer_cache=layer_cache,
+        )
+        return key_states, value_states
+
+    def _should_append_to_cache(self, query_states, layer_cache):
+        has_existing_cache = (
+            getattr(layer_cache, "keys", None) is not None
+            and torch.is_tensor(layer_cache.keys)
+            and layer_cache.keys.numel() > 0
+        )
+        if has_existing_cache:
+            return True
+        return not (self.model_config.compression is None or query_states.shape[-2] > 1)
+
+    def _is_incomplete_tail_layer(self):
+        num_layers = getattr(self.model_config, "num_hidden_layers", None)
+        if num_layers is None:
+            return False
+        return self._group_start(self.layer_idx) + 2 >= int(num_layers)
+
+    def _group_start(self, layer_idx):
+        return (int(layer_idx) // 3) * 3
+
+    def _state(self):
+        if not hasattr(self.model_config, "_snapkv_neighbor_shared_state"):
+            self.model_config._snapkv_neighbor_shared_state = {"groups": {}}
+        return self.model_config._snapkv_neighbor_shared_state
+
+    def _store_group_entry(
+        self,
+        attention,
+        hidden_window,
+        position_window,
+        key_states,
+        value_states,
+        layer_cache,
+    ):
+        group_start = self._group_start(self.layer_idx)
+        state = self._state()
+        if self.layer_idx == group_start:
+            state["groups"][group_start] = {}
+        group = state["groups"].setdefault(group_start, {})
+        group[self.layer_idx] = {
+            "attention": attention,
+            "hidden_window": hidden_window,
+            "position_window": position_window,
+            "key_states": key_states,
+            "value_states": value_states,
+            "valid_mask": self._current_valid_mask(layer_cache, key_states),
+            "layer_cache": layer_cache,
+        }
+        expected_layers = (group_start, group_start + 1, group_start + 2)
+        if all(layer_idx in group for layer_idx in expected_layers):
+            entries = [group[layer_idx] for layer_idx in expected_layers]
+            try:
+                self._compress_group(entries)
+            finally:
+                for entry in entries:
+                    entry.clear()
+                state["groups"].pop(group_start, None)
+
+    def _compress_group(self, entries):
+        if any(self._valid_token_count(entry["layer_cache"], entry["key_states"]) < self.budget for entry in entries):
+            return
+
+        hidden_len = min(entry["hidden_window"].shape[-2] for entry in entries)
+        avg_device = entries[-1]["hidden_window"].device
+        avg_dtype = entries[-1]["hidden_window"].dtype
+        avg_hidden = sum(
+            entry["hidden_window"][:, -hidden_len:, :].to(device=avg_device, dtype=avg_dtype)
+            for entry in entries
+        ) / len(entries)
+        score_tensors = []
+        valid_tensors = []
+        hist_lengths = []
+        for entry in entries:
+            key_states = entry["key_states"]
+            valid_mask = entry["valid_mask"]
+            hist_len = key_states.shape[-2] - self.window_size
+            if hist_len < 1:
+                return
+            query_states = self._project_query_window(
+                entry["attention"],
+                avg_hidden,
+                self._slice_position_window(entry["position_window"], hidden_len),
+            )
+            attn_scores = compute_attention_scores(query_states, key_states)
+            hist_valid = valid_mask[:, :, :hist_len]
+            query_scores = attn_scores[:, :, -min(self.window_size, attn_scores.shape[-2]) :, :hist_len]
+            query_scores = query_scores.masked_fill(~hist_valid[:, :, None, :], torch.finfo(query_scores.dtype).min)
+            attn_probs = F.softmax(query_scores, dim=-1, dtype=torch.float32)
+            attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
+            attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            pooled_scores = F.max_pool1d(
+                attn_probs.mean(dim=-2).to(query_states.dtype),
+                kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2,
+                stride=1,
+            )
+            pooled_scores = pooled_scores.masked_fill(~hist_valid, torch.finfo(pooled_scores.dtype).min)
+            score_tensors.append(pooled_scores)
+            valid_tensors.append(hist_valid)
+            hist_lengths.append(hist_len)
+
+        batch_size = entries[0]["key_states"].shape[0]
+        num_kv_heads = entries[0]["key_states"].shape[1]
+        total_budget = 3 * num_kv_heads * (self.budget - self.window_size)
+        rank_device = score_tensors[-1].device
+        rank_dtype = score_tensors[-1].dtype
+        flat_scores = torch.cat(
+            [scores.reshape(batch_size, -1).to(device=rank_device, dtype=rank_dtype) for scores in score_tensors],
+            dim=-1,
+        )
+        flat_valid = torch.cat(
+            [valid.reshape(batch_size, -1).to(device=rank_device) for valid in valid_tensors],
+            dim=-1,
+        )
+        valid_count = flat_valid.sum(dim=-1)
+        topk = min(int(total_budget), int(valid_count.min().item()))
+        if topk < 1:
+            return
+
+        flat_scores = flat_scores.masked_fill(~flat_valid, torch.finfo(flat_scores.dtype).min)
+        selected_flat = torch.zeros_like(flat_valid, dtype=torch.bool)
+        topk_indices = flat_scores.topk(topk, dim=-1).indices
+        selected_flat.scatter_(dim=-1, index=topk_indices, value=True)
+
+        offset = 0
+        for entry, hist_len in zip(entries, hist_lengths):
+            width = num_kv_heads * hist_len
+            selected = selected_flat[:, offset : offset + width].view(batch_size, num_kv_heads, hist_len)
+            selected = selected.to(device=entry["key_states"].device)
+            self._pack_layer(entry, selected, hist_len)
+            offset += width
+
+    def _pack_layer(self, entry, selected_hist_mask, hist_len):
+        key_states = entry["key_states"]
+        value_states = entry["value_states"]
+        valid_mask = entry["valid_mask"]
+        batch_size, num_heads, _, head_dim = key_states.shape
+        keep_indices = []
+        lengths = torch.zeros(batch_size, num_heads, dtype=torch.long, device=key_states.device)
+        for batch_idx in range(batch_size):
+            per_batch = []
+            for head_idx in range(num_heads):
+                hist_idx = torch.where(selected_hist_mask[batch_idx, head_idx])[0]
+                hist_idx = hist_idx.sort().values
+                recent_valid = valid_mask[batch_idx, head_idx, hist_len:]
+                recent_idx = torch.where(recent_valid)[0] + hist_len
+                cur_indices = torch.cat([hist_idx, recent_idx], dim=0)
+                per_batch.append(cur_indices)
+                lengths[batch_idx, head_idx] = cur_indices.numel()
+            keep_indices.append(per_batch)
+
+        max_len = max(int(lengths.max().item()), 1)
+        packed_keys = key_states.new_zeros(batch_size, num_heads, max_len, head_dim)
+        packed_values = value_states.new_zeros(batch_size, num_heads, max_len, head_dim)
+        packed_mask = torch.zeros(batch_size, num_heads, max_len, dtype=torch.bool, device=key_states.device)
+        for batch_idx in range(batch_size):
+            for head_idx in range(num_heads):
+                cur_indices = keep_indices[batch_idx][head_idx]
+                cur_len = int(cur_indices.numel())
+                if cur_len == 0:
+                    continue
+                packed_keys[batch_idx, head_idx, :cur_len] = key_states[batch_idx, head_idx].index_select(0, cur_indices)
+                packed_values[batch_idx, head_idx, :cur_len] = value_states[batch_idx, head_idx].index_select(0, cur_indices)
+                packed_mask[batch_idx, head_idx, :cur_len] = True
+
+        layer_cache = entry["layer_cache"]
+        self._set_layer_cache(layer_cache, packed_keys, packed_values)
+        layer_cache.kv_valid_mask = packed_mask
+        layer_cache.kv_lengths = lengths
+
+    def _set_layer_cache(self, layer_cache, key_states, value_states):
+        layer_cache.keys = key_states
+        layer_cache.values = value_states
+        layer_cache.dtype = key_states.dtype
+        layer_cache.device = key_states.device
+        layer_cache.is_initialized = True
+
+    def _set_attention_mask_for_current_step(self, layer_cache, key_states, query_states):
+        if query_states.shape[-2] == 1:
+            layer_cache.attention_kv_valid_mask = self._current_valid_mask(layer_cache, key_states)
+        elif hasattr(layer_cache, "attention_kv_valid_mask"):
+            delattr(layer_cache, "attention_kv_valid_mask")
+
+    def _valid_token_count(self, layer_cache, key_states):
+        valid_mask = getattr(layer_cache, "kv_valid_mask", None)
+        if valid_mask is None or valid_mask.shape[-1] != key_states.shape[-2]:
+            return key_states.shape[-2]
+        return int(valid_mask.sum(dim=-1).min().item())
+
+    def _current_valid_mask(self, layer_cache, key_states):
+        valid_mask = getattr(layer_cache, "kv_valid_mask", None)
+        if valid_mask is None or valid_mask.shape[-1] != key_states.shape[-2]:
+            return torch.ones(
+                key_states.shape[:3],
+                dtype=torch.bool,
+                device=key_states.device,
+            )
+        return valid_mask
+
+    def _append_valid_mask(self, layer_cache, key_states):
+        valid_mask = getattr(layer_cache, "kv_valid_mask", None)
+        if valid_mask is None:
+            return
+        old_len = valid_mask.shape[-1]
+        new_len = key_states.shape[-2]
+        if new_len <= old_len:
+            layer_cache.kv_valid_mask = valid_mask[:, :, :new_len]
+            layer_cache.kv_lengths = layer_cache.kv_valid_mask.sum(dim=-1)
+            return
+        appended = torch.ones(
+            *valid_mask.shape[:2],
+            new_len - old_len,
+            dtype=torch.bool,
+            device=key_states.device,
+        )
+        layer_cache.kv_valid_mask = torch.cat([valid_mask.to(key_states.device), appended], dim=-1)
+        layer_cache.kv_lengths = layer_cache.kv_valid_mask.sum(dim=-1)
+
+    def _clear_padding_metadata(self, layer_cache):
+        if hasattr(layer_cache, "kv_valid_mask"):
+            delattr(layer_cache, "kv_valid_mask")
+        if hasattr(layer_cache, "kv_lengths"):
+            delattr(layer_cache, "kv_lengths")
+        if hasattr(layer_cache, "attention_kv_valid_mask"):
+            delattr(layer_cache, "attention_kv_valid_mask")
+
+    def _update_hidden_window(self, layer_cache, hidden_states):
+        if hidden_states.shape[-2] >= self.window_size or not hasattr(layer_cache, "neighbor_hidden_window"):
+            hidden_window = hidden_states[:, -self.window_size :, :].detach().clone()
+        else:
+            hidden_window = torch.cat([layer_cache.neighbor_hidden_window.to(hidden_states.device), hidden_states.detach()], dim=1)
+            hidden_window = hidden_window[:, -self.window_size :, :].clone()
+        layer_cache.neighbor_hidden_window = hidden_window
+        return hidden_window
+
+    def _update_position_window(self, layer_cache, position_embeddings, seq_len):
+        if position_embeddings is None:
+            return None
+        cos, sin = position_embeddings
+        cos = self._slice_last_positions(cos.detach(), seq_len).clone()
+        sin = self._slice_last_positions(sin.detach(), seq_len).clone()
+        if cos.shape[-2] >= self.window_size or not hasattr(layer_cache, "neighbor_position_window"):
+            cos_window = self._slice_last_positions(cos, self.window_size).clone()
+            sin_window = self._slice_last_positions(sin, self.window_size).clone()
+        else:
+            prev_cos, prev_sin = layer_cache.neighbor_position_window
+            cos_window = torch.cat([prev_cos.to(cos.device), cos], dim=-2)
+            sin_window = torch.cat([prev_sin.to(sin.device), sin], dim=-2)
+            cos_window = self._slice_last_positions(cos_window, self.window_size).clone()
+            sin_window = self._slice_last_positions(sin_window, self.window_size).clone()
+        layer_cache.neighbor_position_window = (cos_window, sin_window)
+        return layer_cache.neighbor_position_window
+
+    def _project_query_window(self, attention, hidden_window, position_embeddings):
+        device = next(attention.parameters()).device
+        dtype = next(attention.parameters()).dtype
+        hidden_window = hidden_window.to(device=device, dtype=dtype)
+        input_shape = hidden_window.shape[:-1]
+        head_dim = attention.head_dim
+        num_attention_heads = attention.config.num_attention_heads
+        q_proj = attention.q_proj(hidden_window)
+        if q_proj.shape[-1] == num_attention_heads * head_dim * 2:
+            query_states, _ = torch.chunk(
+                q_proj.view(*input_shape, num_attention_heads, head_dim * 2),
+                2,
+                dim=-1,
+            )
+        else:
+            query_states = q_proj.view(*input_shape, num_attention_heads, head_dim)
+        q_norm = getattr(attention, "q_norm", None)
+        if q_norm is not None:
+            query_states = q_norm(query_states)
+        query_states = query_states.transpose(1, 2)
+        if position_embeddings is None:
+            return query_states
+        cos, sin = position_embeddings
+        cos = self._slice_last_positions(cos.to(device=device, dtype=dtype), query_states.shape[-2])
+        sin = self._slice_last_positions(sin.to(device=device, dtype=dtype), query_states.shape[-2])
+        return self._apply_rotary(query_states, cos, sin)
+
+    def _slice_position_window(self, position_window, seq_len):
+        if position_window is None:
+            return None
+        cos, sin = position_window
+        return self._slice_last_positions(cos, seq_len), self._slice_last_positions(sin, seq_len)
+
+    def _slice_last_positions(self, tensor, seq_len):
+        if tensor.ndim == 2:
+            return tensor[-seq_len:, :]
+        return tensor[..., -seq_len:, :]
+
+    def _apply_rotary(self, states, cos, sin):
+        cos = self._unsqueeze_position_embedding(cos, states)
+        sin = self._unsqueeze_position_embedding(sin, states)
+        return (states * cos) + (self._rotate_half(states) * sin)
+
+    def _rotate_half(self, x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _unsqueeze_position_embedding(self, position_embedding, states):
+        if position_embedding.ndim == 2:
+            position_embedding = position_embedding.unsqueeze(0)
+        while position_embedding.ndim < states.ndim:
+            position_embedding = position_embedding.unsqueeze(1)
+        return position_embedding
+
+
+def masked_eager_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    kv_valid_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    scaling = module.head_dim**-0.5 if scaling is None else scaling
+    num_key_value_groups = query.shape[1] // key.shape[1]
+    if num_key_value_groups != 1:
+        key = _repeat_kv(key, num_key_value_groups)
+        value = _repeat_kv(value, num_key_value_groups)
+        kv_valid_mask = kv_valid_mask[:, :, None, :].expand(
+            kv_valid_mask.shape[0],
+            kv_valid_mask.shape[1],
+            num_key_value_groups,
+            kv_valid_mask.shape[-1],
+        )
+        kv_valid_mask = kv_valid_mask.reshape(kv_valid_mask.shape[0], query.shape[1], kv_valid_mask.shape[-1])
+
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=attn_weights.device)
+        causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+        if causal_mask.shape[-1] < key.shape[-2]:
+            causal_mask = F.pad(causal_mask, (0, key.shape[-2] - causal_mask.shape[-1]), value=0.0)
+        attn_weights = attn_weights + causal_mask
+    attn_weights = attn_weights.masked_fill(~kv_valid_mask[:, :, None, :], torch.finfo(attn_weights.dtype).min)
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights if kwargs.get("output_attentions", False) else None
+
+
+def _repeat_kv(hidden_states, n_rep):
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
