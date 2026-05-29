@@ -132,6 +132,7 @@ def compute_snapkv_neighbor_observation(
     orig_indices = []
     neighbor_avg_indices = []
     valid_layer_indices = []
+    selections_by_layer = {}
 
     for layer_idx in range(1, len(layers) - 1):
         layer_summary = {"layer_idx": layer_idx, "status": "pending"}
@@ -189,19 +190,16 @@ def compute_snapkv_neighbor_observation(
                 window_size=config.window_size,
                 kernel_size=config.kernel_size,
             )
+            selections_by_layer[layer_idx] = {
+                "orig": orig_selection,
+                "neighbor": neighbor_selection,
+            }
         except Exception as exc:
             layer_summary["status"] = "error"
             layer_summary["error"] = str(exc)
             summary["layers"].append(layer_summary)
             continue
 
-        layer_summary.update(
-            _build_layer_metrics(
-                layer_idx=layer_idx,
-                orig_selection=orig_selection,
-                neighbor_selection=neighbor_selection,
-            )
-        )
         summary["layers"].append(layer_summary)
 
         valid_layer_indices.append(layer_idx)
@@ -211,6 +209,23 @@ def compute_snapkv_neighbor_observation(
         )
         orig_indices.append(_to_numpy(orig_selection.indices.squeeze(0), dtype=np.int64))
         neighbor_avg_indices.append(_to_numpy(neighbor_selection.indices.squeeze(0), dtype=np.int64))
+
+    for layer_summary in summary["layers"]:
+        layer_idx = layer_summary["layer_idx"]
+        layer_pair = selections_by_layer.get(layer_idx)
+        if layer_summary.get("status") != "pending" or layer_pair is None:
+            continue
+        prev_pair = selections_by_layer.get(layer_idx - 1)
+        next_pair = selections_by_layer.get(layer_idx + 1)
+        layer_summary.update(
+            _build_layer_metrics(
+                layer_idx=layer_idx,
+                prev_pair=prev_pair,
+                orig_selection=layer_pair["orig"],
+                next_pair=next_pair,
+                neighbor_selection=layer_pair["neighbor"],
+            )
+        )
 
     summary["valid_layer_indices"] = valid_layer_indices
     summary["status"] = "saved" if valid_layer_indices else "no_valid_layers"
@@ -365,34 +380,50 @@ def _plot_retained_indices(result, output_path, plt):
 
 
 def _plot_indices_overlap(result, output_path, plt):
-    overlap = _compute_overlap_matrix(result.orig_indices, result.neighbor_avg_indices)
+    import matplotlib
+
+    overlap_panels = [
+        ("Current layer vs merged query", _overlap_matrix_from_summary(result, "overlap")),
+        ("Previous layer vs merged query", _overlap_matrix_from_summary(result, "prev_layer_overlap")),
+        ("Next layer vs merged query", _overlap_matrix_from_summary(result, "next_layer_overlap")),
+    ]
+    first_overlap = overlap_panels[0][1]
     layer_labels = [str(int(layer_idx)) for layer_idx in result.layer_indices.tolist()]
-    head_labels = [str(head_idx) for head_idx in range(overlap.shape[1])]
-    fig_width = max(5.0, min(12.0, 0.38 * overlap.shape[1] + 3.0))
-    fig_height = max(4.0, min(12.0, 0.32 * overlap.shape[0] + 2.5))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=160)
-    image = ax.imshow(overlap, aspect="auto", interpolation="nearest", cmap="magma", vmin=0.0, vmax=1.0)
-    ax.set_title("Retained-index overlap: original vs neighbor-average query")
-    ax.set_xlabel("KV head")
-    ax.set_ylabel("Layer")
-    _set_sparse_ticks(ax, axis="x", labels=head_labels)
-    _set_sparse_ticks(ax, axis="y", labels=layer_labels)
-    if overlap.shape[0] * overlap.shape[1] <= 160:
-        for layer_pos in range(overlap.shape[0]):
-            for head_pos in range(overlap.shape[1]):
-                value = overlap[layer_pos, head_pos]
-                ax.text(
-                    head_pos,
-                    layer_pos,
-                    f"{value:.2f}",
-                    ha="center",
-                    va="center",
-                    color="white" if value < 0.65 else "black",
-                    fontsize=7,
-                )
-    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    head_labels = [str(head_idx) for head_idx in range(first_overlap.shape[1])]
+    fig_width = max(9.0, min(24.0, 0.42 * first_overlap.shape[1] * len(overlap_panels) + 5.0))
+    fig_height = max(4.0, min(12.0, 0.32 * first_overlap.shape[0] + 2.8))
+    fig, axes = plt.subplots(1, 3, figsize=(fig_width, fig_height), dpi=160, sharey=True)
+    cmap = matplotlib.colormaps["magma"].copy()
+    cmap.set_bad(color="#f2f2f2")
+    image = None
+    for panel_idx, (title, overlap) in enumerate(overlap_panels):
+        ax = axes[panel_idx]
+        image = ax.imshow(overlap, aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=1.0)
+        ax.set_title(title)
+        ax.set_xlabel("KV head")
+        if panel_idx == 0:
+            ax.set_ylabel("Layer")
+            _set_sparse_ticks(ax, axis="y", labels=layer_labels)
+        _set_sparse_ticks(ax, axis="x", labels=head_labels)
+        if overlap.shape[0] * overlap.shape[1] <= 160:
+            for layer_pos in range(overlap.shape[0]):
+                for head_pos in range(overlap.shape[1]):
+                    value = overlap[layer_pos, head_pos]
+                    if np.isnan(value):
+                        continue
+                    ax.text(
+                        head_pos,
+                        layer_pos,
+                        f"{value:.2f}",
+                        ha="center",
+                        va="center",
+                        color="white" if value < 0.65 else "black",
+                        fontsize=7,
+                    )
+    fig.suptitle("Retained-index overlap with merged neighbor query")
+    colorbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02)
     colorbar.set_label("Intersection / top-k")
-    fig.tight_layout()
+    fig.subplots_adjust(top=0.86, wspace=0.12)
     fig.savefig(output_path)
     plt.close(fig)
 
@@ -455,6 +486,17 @@ def _compute_overlap_matrix(orig_indices, neighbor_indices):
             neighbor_set = set(neighbor[layer_pos, head_pos].tolist())
             overlap[layer_pos, head_pos] = len(orig_set & neighbor_set) / topk
     return overlap
+
+
+def _overlap_matrix_from_summary(result, summary_key):
+    saved_layers = [layer for layer in result.summary.get("layers", []) if layer.get("status") == "saved"]
+    head_count = result.orig_indices.shape[1]
+    matrix = np.full((len(saved_layers), head_count), np.nan, dtype=np.float32)
+    for layer_pos, layer in enumerate(saved_layers):
+        values = layer.get(summary_key, {}).get("per_head", [])
+        if values:
+            matrix[layer_pos, : min(head_count, len(values))] = np.asarray(values[:head_count], dtype=np.float32)
+    return matrix
 
 
 def _layer_head_labels(layer_indices, head_count):
@@ -696,26 +738,16 @@ def _module_dtype(module):
         return torch.float32
 
 
-def _build_layer_metrics(layer_idx, orig_selection, neighbor_selection):
+def _build_layer_metrics(layer_idx, prev_pair, orig_selection, next_pair, neighbor_selection):
     orig_cache = orig_selection.attn_cache.detach().to(dtype=torch.float32, device="cpu")
     neighbor_cache = neighbor_selection.attn_cache.detach().to(dtype=torch.float32, device="cpu")
     orig_idx = orig_selection.indices.detach().to(device="cpu")
     neighbor_idx = neighbor_selection.indices.detach().to(device="cpu")
 
-    per_head_overlap = []
-    per_head_jaccard = []
     per_head_cosine = []
     per_head_l1 = []
     per_head_l2 = []
-    topk = int(orig_idx.shape[-1])
-    for head_idx in range(orig_idx.shape[1]):
-        orig_set = set(orig_idx[0, head_idx].tolist())
-        neighbor_set = set(neighbor_idx[0, head_idx].tolist())
-        intersection = len(orig_set & neighbor_set)
-        union = len(orig_set | neighbor_set)
-        per_head_overlap.append(float(intersection / topk if topk else 0.0))
-        per_head_jaccard.append(float(intersection / union if union else 0.0))
-
+    for head_idx in range(orig_cache.shape[1]):
         orig_vec = orig_cache[0, head_idx].reshape(-1)
         neighbor_vec = neighbor_cache[0, head_idx].reshape(-1)
         per_head_cosine.append(float(F.cosine_similarity(orig_vec, neighbor_vec, dim=0).item()))
@@ -728,8 +760,12 @@ def _build_layer_metrics(layer_idx, orig_selection, neighbor_selection):
         "status": "saved",
         "attn_cache_shape": list(orig_cache.shape),
         "indices_shape": list(orig_idx.shape),
-        "overlap": _summarize_values(per_head_overlap, include_per_head=True),
-        "jaccard": _summarize_values(per_head_jaccard, include_per_head=True),
+        "overlap": _summarize_index_overlap(orig_idx, neighbor_idx),
+        "jaccard": _summarize_index_jaccard(orig_idx, neighbor_idx),
+        "prev_layer_overlap": _summarize_layer_pair_overlap(prev_pair),
+        "prev_layer_jaccard": _summarize_layer_pair_jaccard(prev_pair),
+        "next_layer_overlap": _summarize_layer_pair_overlap(next_pair),
+        "next_layer_jaccard": _summarize_layer_pair_jaccard(next_pair),
         "attn_cache_cosine": _summarize_values(per_head_cosine, include_per_head=True),
         "attn_cache_l1_diff": _summarize_values(per_head_l1, include_per_head=True),
         "attn_cache_l2_diff": _summarize_values(per_head_l2, include_per_head=True),
@@ -737,6 +773,54 @@ def _build_layer_metrics(layer_idx, orig_selection, neighbor_selection):
         "neighbor_avg_attn_cache": _distribution_stats(neighbor_cache.numpy()),
         "histogram_l1": histogram_l1,
     }
+
+
+def _summarize_layer_pair_overlap(layer_pair):
+    if layer_pair is None:
+        return _missing_pair_summary()
+    return _summarize_index_overlap(layer_pair["orig"].indices, layer_pair["neighbor"].indices)
+
+
+def _summarize_layer_pair_jaccard(layer_pair):
+    if layer_pair is None:
+        return _missing_pair_summary()
+    return _summarize_index_jaccard(layer_pair["orig"].indices, layer_pair["neighbor"].indices)
+
+
+def _missing_pair_summary():
+    return {
+        "status": "skipped_boundary",
+        "mean": None,
+        "min": None,
+        "max": None,
+        "per_head": [],
+    }
+
+
+def _summarize_index_overlap(left_indices, right_indices):
+    overlap, _jaccard = _compute_pairwise_index_overlap(left_indices, right_indices)
+    return _summarize_values(overlap, include_per_head=True)
+
+
+def _summarize_index_jaccard(left_indices, right_indices):
+    _overlap, jaccard = _compute_pairwise_index_overlap(left_indices, right_indices)
+    return _summarize_values(jaccard, include_per_head=True)
+
+
+def _compute_pairwise_index_overlap(left_indices, right_indices):
+    left = left_indices.detach().to(device="cpu") if torch.is_tensor(left_indices) else torch.as_tensor(left_indices)
+    right = right_indices.detach().to(device="cpu") if torch.is_tensor(right_indices) else torch.as_tensor(right_indices)
+    topk = int(left.shape[-1])
+    overlap = []
+    jaccard = []
+    for head_idx in range(left.shape[1]):
+        left_set = set(left[0, head_idx].tolist())
+        right_set = set(right[0, head_idx].tolist())
+        intersection = len(left_set & right_set)
+        union = len(left_set | right_set)
+        overlap.append(float(intersection / topk if topk else 0.0))
+        jaccard.append(float(intersection / union if union else 0.0))
+    return overlap, jaccard
 
 
 def _summarize_values(values, include_per_head=False):

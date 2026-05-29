@@ -7,6 +7,24 @@ python attn_viewer/server.py --root results/attn_heatmaps
 ###### gate indices overlap visualization for qwen3.5-9b
 
 CUDA_VISIBLE_DEVICES=0,1 python run_longbench.py --model qwen3.5-9b --gate_overlap_mode --num_samples 3 --domain "single-document QA" --compression --compression_mode "snapkv" --compression_budget 1024 --model_maxlen 10000 --use_linear_state --linear_state_weight 1 --linear_state_norm rank --linear_state_layer_range 1 --linear_state_score_type "write_norm"
+
+
+python run_longbench.py \
+  --model Qwen/Qwen3-8B \
+  --query_window_similarity_mode \
+  --query_window_size 8 \
+  --num_samples 3 \
+  --model_maxlen 10000 \
+  --domain "single-document QA" 
+
+python run_longbench.py \
+  --model Qwen/Qwen3-8B \
+  --snapkv_observation_mode \
+  --snapkv_observation_budget 1024 \
+  --num_samples 3 \
+  --model_maxlen 10000 \
+  --domain "single-document QA"
+
 ##### efficiency benchmark for qwen3.5-9b
 
 for input_len in 10000 20000 30000 40000 50000 60000; do
