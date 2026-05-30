@@ -98,6 +98,12 @@ class SnapKVNeighborShared:
                 layer_to_group[layer] = layers
 
             layer_set = set(layers)
+            budget_weight = group_spec.get("budget_weight")
+            if budget_weight is not None:
+                budget_weight = float(budget_weight)
+                if (not math.isfinite(budget_weight)) or budget_weight < 0.0:
+                    raise ValueError(f"Profile group {group_idx} budget_weight must be finite and non-negative.")
+
             mix_spec = group_spec.get("mix", {})
             if mix_spec is None:
                 mix_spec = {}
@@ -129,12 +135,20 @@ class SnapKVNeighborShared:
                 mix[target_layer] = tuple(
                     (source, weight / weight_sum) for source, weight in zip(sources, weights)
                 )
-            group_profiles[layers] = {"mix": mix}
+            group_profiles[layers] = {"mix": mix, "budget_weight": budget_weight}
+
+        budget_weights = [group["budget_weight"] for group in group_profiles.values()]
+        has_budget_weights = all(weight is not None for weight in budget_weights)
+        budget_weight_total = float(sum(budget_weights)) if has_budget_weights else 0.0
+        use_budget_weights = has_budget_weights and budget_weight_total > 0.0
 
         return {
             "metric": raw_profile.get("metric"),
             "groups": group_profiles,
             "layer_to_group": layer_to_group,
+            "profiled_layer_count": sum(len(layers) for layers in group_profiles),
+            "budget_weight_total": budget_weight_total,
+            "use_budget_weights": use_budget_weights,
         }
 
     def update_kv(self, key_states, query_states, value_states):
@@ -321,7 +335,7 @@ class SnapKVNeighborShared:
 
         batch_size = entries[0]["key_states"].shape[0]
         num_kv_heads = entries[0]["key_states"].shape[1]
-        total_budget = len(group_layers) * num_kv_heads * (self.budget - self.window_size)
+        total_budget = self._group_historical_budget(group_layers, num_kv_heads)
         rank_device = score_tensors[-1].device
         rank_dtype = score_tensors[-1].dtype
         flat_scores = torch.cat(
@@ -349,6 +363,20 @@ class SnapKVNeighborShared:
             selected = selected.to(device=entry["key_states"].device)
             self._pack_layer(entry, selected, hist_len)
             offset += width
+
+    def _group_historical_budget(self, group_layers, num_kv_heads):
+        per_layer_history = self.budget - self.window_size
+        if self.hidden_mix_profile is None or not self.hidden_mix_profile.get("use_budget_weights"):
+            return len(group_layers) * num_kv_heads * per_layer_history
+
+        group = self.hidden_mix_profile["groups"].get(tuple(group_layers))
+        budget_weight = None if group is None else group.get("budget_weight")
+        total_weight = self.hidden_mix_profile.get("budget_weight_total", 0.0)
+        profiled_layer_count = self.hidden_mix_profile.get("profiled_layer_count", len(group_layers))
+        if budget_weight is None or total_weight <= 0.0 or profiled_layer_count < 1:
+            return len(group_layers) * num_kv_heads * per_layer_history
+        total_hist_budget = int(profiled_layer_count) * num_kv_heads * per_layer_history
+        return max(1, int(round(total_hist_budget * float(budget_weight) / float(total_weight))))
 
     def _mixed_hidden_window(self, entry, entry_by_layer, group_layers, hidden_len):
         target_layer = int(entry["layer_idx"])
