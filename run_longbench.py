@@ -629,7 +629,7 @@ if __name__ == "__main__":
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
     parser.add_argument("--query_window_similarity_mode", action="store_true")
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
-    parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise cosine similarity.")
+    parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise query-window analysis.")
     parser.add_argument(
         "--query_window_similarity_submode",
         "--query_window_similarity_state",
@@ -637,7 +637,7 @@ if __name__ == "__main__":
         type=str,
         choices=sorted(SUPPORTED_SIMILARITY_STATES),
         default=SIMILARITY_STATE_HIDDEN,
-        help="Representation used for query-window layer similarity: hidden_states keeps the old behavior; query_states compares attention query states.",
+        help="Submode for query-window layer analysis: hidden_states/query_states use cosine similarity; hidden_states_l2_diff computes pairwise L2 norms of hidden-state differences.",
     )
     parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
     add_snapkv_observation_args(parser)

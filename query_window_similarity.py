@@ -14,11 +14,15 @@ from attn_heatmap import (
 
 
 SIMILARITY_REDUCTION = "flatten_window"
+SIMILARITY_METRIC_COSINE = "cosine_similarity"
+SIMILARITY_METRIC_L2_DIFF = "l2_norm_difference"
 SIMILARITY_STATE_HIDDEN = "hidden_states"
 SIMILARITY_STATE_QUERY = "query_states"
+SIMILARITY_STATE_HIDDEN_L2_DIFF = "hidden_states_l2_diff"
 SUPPORTED_SIMILARITY_STATES = {
     SIMILARITY_STATE_HIDDEN,
     SIMILARITY_STATE_QUERY,
+    SIMILARITY_STATE_HIDDEN_L2_DIFF,
 }
 
 
@@ -67,6 +71,36 @@ def build_similarity_from_layer_windows(layer_windows):
     vectors = torch.nn.functional.normalize(vectors, p=2, dim=1, eps=1e-12)
     similarity = torch.matmul(vectors, vectors.transpose(0, 1)).cpu().numpy()
     return similarity.astype(np.float32, copy=False), layer_indices
+
+
+def build_l2_difference_from_layer_windows(layer_windows):
+    if not layer_windows:
+        raise ValueError("No layer hidden states were captured.")
+    vectors = []
+    layer_indices = []
+    for layer_idx, window_state in layer_windows:
+        vectors.append(window_state.reshape(-1).cpu())
+        layer_indices.append(int(layer_idx))
+    vectors = torch.stack(vectors, dim=0).to(dtype=torch.float32)
+    squared_norms = (vectors * vectors).sum(dim=1, keepdim=True)
+    squared_distances = squared_norms + squared_norms.transpose(0, 1)
+    squared_distances = squared_distances - (2.0 * torch.matmul(vectors, vectors.transpose(0, 1)))
+    distances = torch.sqrt(torch.clamp(squared_distances, min=0.0))
+    distances.fill_diagonal_(0.0)
+    return distances.cpu().numpy().astype(np.float32, copy=False), layer_indices
+
+
+def get_query_window_similarity_metric(similarity_state):
+    if similarity_state == SIMILARITY_STATE_HIDDEN_L2_DIFF:
+        return SIMILARITY_METRIC_L2_DIFF
+    return SIMILARITY_METRIC_COSINE
+
+
+def get_query_window_similarity_colorbar_label(similarity_state):
+    metric = get_query_window_similarity_metric(similarity_state)
+    if metric == SIMILARITY_METRIC_L2_DIFF:
+        return "L2 norm of hidden-state difference"
+    return "Cosine similarity"
 
 
 def rotate_half(x):
@@ -152,7 +186,7 @@ def run_observation_forward(model, inputs, output_hidden_states=False):
             return model(**forward_kwargs)
 
 
-def compute_hidden_state_query_window_similarity(model, inputs, actual_window_size):
+def collect_hidden_state_layer_windows(model, inputs, actual_window_size):
     layers = get_decoder_layers(model)
     if layers:
         captured_windows = {}
@@ -186,8 +220,7 @@ def compute_hidden_state_query_window_similarity(model, inputs, actual_window_si
             if layer_idx in captured_windows
         ]
         if layer_windows:
-            similarity, layer_indices = build_similarity_from_layer_windows(layer_windows)
-            return similarity, layer_indices
+            return layer_windows
 
     outputs = run_observation_forward(model, inputs, output_hidden_states=True)
 
@@ -215,7 +248,17 @@ def compute_hidden_state_query_window_similarity(model, inputs, actual_window_si
         )
         for layer_idx, state in zip(layer_indices, layer_states)
     ]
+    return layer_windows
+
+
+def compute_hidden_state_query_window_similarity(model, inputs, actual_window_size):
+    layer_windows = collect_hidden_state_layer_windows(model, inputs, actual_window_size)
     return build_similarity_from_layer_windows(layer_windows)
+
+
+def compute_hidden_state_query_window_l2_difference(model, inputs, actual_window_size):
+    layer_windows = collect_hidden_state_layer_windows(model, inputs, actual_window_size)
+    return build_l2_difference_from_layer_windows(layer_windows)
 
 
 def compute_query_state_query_window_similarity(model, inputs, actual_window_size):
@@ -285,6 +328,12 @@ def compute_query_window_similarity(model, inputs, window_size, similarity_state
             inputs=inputs,
             actual_window_size=actual_window_size,
         )
+    elif similarity_state == SIMILARITY_STATE_HIDDEN_L2_DIFF:
+        similarity, layer_indices = compute_hidden_state_query_window_l2_difference(
+            model=model,
+            inputs=inputs,
+            actual_window_size=actual_window_size,
+        )
     else:
         similarity, layer_indices = compute_hidden_state_query_window_similarity(
             model=model,
@@ -294,7 +343,7 @@ def compute_query_window_similarity(model, inputs, window_size, similarity_state
     return similarity, layer_indices, actual_window_size
 
 
-def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path, title):
+def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path, title, similarity_state):
     cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "qwen35_compression_matplotlib_cache")
     os.makedirs(cache_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(cache_dir, "matplotlib"))
@@ -307,7 +356,10 @@ def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path,
     num_layers = len(layer_indices)
     fig_size = max(6.0, min(14.0, 0.28 * num_layers + 3.0))
     fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=160)
-    image = ax.imshow(similarity, cmap="coolwarm", vmin=-1.0, vmax=1.0, interpolation="nearest")
+    if get_query_window_similarity_metric(similarity_state) == SIMILARITY_METRIC_L2_DIFF:
+        image = ax.imshow(similarity, cmap="viridis", vmin=0.0, interpolation="nearest")
+    else:
+        image = ax.imshow(similarity, cmap="coolwarm", vmin=-1.0, vmax=1.0, interpolation="nearest")
     ax.set_title(title)
     ax.set_xlabel("Layer id")
     ax.set_ylabel("Layer id")
@@ -319,7 +371,7 @@ def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path,
     ax.set_yticks(tick_positions)
     ax.set_yticklabels(tick_labels)
     colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-    colorbar.set_label("Cosine similarity")
+    colorbar.set_label(get_query_window_similarity_colorbar_label(similarity_state))
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
@@ -374,6 +426,7 @@ class QueryWindowSimilarityRunWriter:
             "result_path": self.out_file,
             "query_window_size": self.window_size,
             "query_window_similarity_state": self.similarity_state,
+            "query_window_similarity_metric": get_query_window_similarity_metric(self.similarity_state),
             "similarity_reduction": SIMILARITY_REDUCTION,
             "query_window_max_prefill_tokens": self.max_prefill_tokens,
             "query_window_prefill_cap_mode": "fixed" if self.max_prefill_tokens is not None else "none",
@@ -421,6 +474,7 @@ class QueryWindowSimilaritySampleWriter:
             "token_count": len(input_ids),
             "query_window_size": self.run_writer.window_size,
             "query_window_similarity_state": self.run_writer.similarity_state,
+            "query_window_similarity_metric": get_query_window_similarity_metric(self.run_writer.similarity_state),
             "similarity_reduction": SIMILARITY_REDUCTION,
             "actual_window_size": actual_window_size,
             "window_token_start": window_token_start,
@@ -463,6 +517,9 @@ class QueryWindowSimilaritySampleWriter:
                 window_token_start=np.asarray(window_token_start, dtype=np.int64),
                 actual_window_size=np.asarray(actual_window_size, dtype=np.int64),
                 query_window_similarity_state=np.asarray(self.run_writer.similarity_state),
+                query_window_similarity_metric=np.asarray(
+                    get_query_window_similarity_metric(self.run_writer.similarity_state)
+                ),
                 similarity_reduction=np.asarray(SIMILARITY_REDUCTION),
             )
             record["status"] = "saved"
@@ -477,8 +534,10 @@ class QueryWindowSimilaritySampleWriter:
                     output_path=heatmap_path,
                     title=(
                         f"{label}: last {actual_window_size} token "
-                        f"{self.run_writer.similarity_state} cosine"
+                        f"{self.run_writer.similarity_state} "
+                        f"{get_query_window_similarity_metric(self.run_writer.similarity_state)}"
                     ),
+                    similarity_state=self.run_writer.similarity_state,
                 )
                 record["heatmap_file"] = heatmap_file_name
             except Exception as plot_exc:
@@ -504,6 +563,7 @@ class QueryWindowSimilaritySampleWriter:
             "token_count",
             "actual_window_size",
             "query_window_similarity_state",
+            "query_window_similarity_metric",
             "similarity_shape",
             "reason",
             "error",
