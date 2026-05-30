@@ -38,6 +38,7 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
 def build_compression_config(
     compression_mode,
     compression_budget,
+    hidden_mix_profile_path=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -47,6 +48,8 @@ def build_compression_config(
         "retain_direction": "last",
         "first_tokens": 4,
     }
+    if hidden_mix_profile_path:
+        method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
 
     return {
         "method": compression_mode,
@@ -160,6 +163,7 @@ def load_model_and_tokenizer(
     compression=False,
     compression_mode=None,
     compression_budget=4096,
+    hidden_mix_profile_path=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -194,6 +198,7 @@ def load_model_and_tokenizer(
         compression_config = build_compression_config(
             compression_mode,
             compression_budget,
+            hidden_mix_profile_path,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -293,6 +298,7 @@ class LLMNeedleHaystackTester:
                  compression=False,
                  compression_mode=None,
                  compression_budget=4096,
+                 hidden_mix_profile_path=None,
                  enable_thinking=False):
         """
         :param needle: The needle to be found in the haystack. Default is None.
@@ -339,6 +345,7 @@ class LLMNeedleHaystackTester:
         self.compression = compression
         self.compression_mode = compression_mode
         self.compression_budget = compression_budget
+        self.hidden_mix_profile_path = hidden_mix_profile_path
         self.enable_thinking = enable_thinking
 
 
@@ -383,6 +390,7 @@ class LLMNeedleHaystackTester:
             compression=self.compression,
             compression_mode=self.compression_mode,
             compression_budget=self.compression_budget,
+            hidden_mix_profile_path=self.hidden_mix_profile_path,
         )
 
 
@@ -696,6 +704,7 @@ if __name__ == "__main__":
     parser.add_argument("--compression", action="store_true")
     parser.add_argument("--compression_mode", type=str, default=None)
     parser.add_argument("--compression_budget", type=int, default=4096)
+    parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to chat templates that support it.")
     args = parser.parse_args()
 
@@ -716,6 +725,7 @@ if __name__ == "__main__":
                                  compression=args.compression,
                                  compression_mode=args.compression_mode,
                                  compression_budget=args.compression_budget,
+                                 hidden_mix_profile_path=args.hidden_mix_profile_path,
                                  enable_thinking=args.enable_thinking
                                  )
 

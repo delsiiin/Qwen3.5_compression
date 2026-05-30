@@ -110,17 +110,20 @@ class FirstTokenTimingCriteria(StoppingCriteria):
         return False
 
 
-def build_compression_config(compression_mode, compression_budget):
+def build_compression_config(compression_mode, compression_budget, hidden_mix_profile_path=None):
+    method_config = {
+        "budget": compression_budget,
+        "window_size": 8,
+        "mix_lambda": 0.07,
+        "retain_ratio": 0.2,
+        "retain_direction": "last",
+        "first_tokens": 4,
+    }
+    if hidden_mix_profile_path:
+        method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
     return {
         "method": compression_mode,
-        "method_config": {
-            "budget": compression_budget,
-            "window_size": 8,
-            "mix_lambda": 0.07,
-            "retain_ratio": 0.2,
-            "retain_direction": "last",
-            "first_tokens": 4,
-        },
+        "method_config": method_config,
         "compression": None,
         "update_kv": True,
     }
@@ -191,6 +194,7 @@ def load_model_and_tokenizer(
     compression=False,
     compression_mode=None,
     compression_budget=4096,
+    hidden_mix_profile_path=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -222,7 +226,7 @@ def load_model_and_tokenizer(
                 f"models, got: {model_path}"
             )
 
-        compression_config = build_compression_config(compression_mode, compression_budget)
+        compression_config = build_compression_config(compression_mode, compression_budget, hidden_mix_profile_path)
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         apply_compression_setup(model, tokenizer, compression_mode)
@@ -287,6 +291,7 @@ def measure_throughput(
     compression: bool = False,
     compression_mode: str = None,
     compression_budget: int = 4096,
+    hidden_mix_profile_path: str = None,
     # experiment arguments
     batch_size: int = 16,
     input_len: int = 128,
@@ -323,6 +328,7 @@ def measure_throughput(
         compression=compression,
         compression_mode=compression_mode,
         compression_budget=compression_budget,
+        hidden_mix_profile_path=hidden_mix_profile_path,
     )
 
     # Input Sequence      

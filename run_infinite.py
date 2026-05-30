@@ -127,6 +127,7 @@ def get_max_input_len(model_maxlen, max_new_tokens):
 def build_compression_config(
     compression_mode,
     compression_budget,
+    hidden_mix_profile_path=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -136,6 +137,8 @@ def build_compression_config(
         "retain_direction": "last",
         "first_tokens": 4,
     }
+    if hidden_mix_profile_path:
+        method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
 
     return {
         "method": compression_mode,
@@ -276,6 +279,7 @@ def load_model_and_tokenizer(args):
         compression_config = build_compression_config(
             args.compression_mode,
             args.compression_budget,
+            args.hidden_mix_profile_path,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
@@ -520,6 +524,7 @@ def parse_args() -> Namespace:
     p.add_argument("--compression", action="store_true")
     p.add_argument("--compression_mode", type=str, default=None)
     p.add_argument("--compression_budget", type=int, default=4096)
+    p.add_argument("--hidden_mix_profile_path", type=str, default=None)
     p.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to chat templates that support it.")
 
     p.add_argument(

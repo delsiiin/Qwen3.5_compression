@@ -10,5 +10,8 @@ tqdm==4.67.3
 transformers==5.5.4
 vllm==0.19.1
 matplotlib
+seaborn
+rouge_score
+jieba
 # causal_conv1d
 # flash-linear-attention

@@ -1,3 +1,7 @@
+import json
+import math
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -18,9 +22,13 @@ class SnapKVNeighborShared:
         model_config=None,
         model_type=None,
         mode=None,
+        hidden_mix_profile_path=None,
+        hidden_mix_fallback="self",
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
+        if hidden_mix_fallback != "self":
+            raise ValueError("hidden_mix_fallback currently supports only 'self'.")
         self.budget = budget
         self.window_size = window_size
         self.kernel_size = kernel_size
@@ -28,7 +36,10 @@ class SnapKVNeighborShared:
         self.model_config = model_config
         self.model_type = model_type
         self.mode = mode
+        self.hidden_mix_profile_path = hidden_mix_profile_path
+        self.hidden_mix_fallback = hidden_mix_fallback
         self.record_kept_token_indices = record_kept_token_indices
+        self.hidden_mix_profile = self._load_hidden_mix_profile(hidden_mix_profile_path)
         self.fallback = SnapKV(
             budget=budget,
             window_size=window_size,
@@ -42,6 +53,89 @@ class SnapKVNeighborShared:
         )
         if model_config is not None and not hasattr(model_config, "_snapkv_neighbor_shared_state"):
             model_config._snapkv_neighbor_shared_state = {"groups": {}}
+
+    def _load_hidden_mix_profile(self, profile_path):
+        if profile_path is None:
+            return None
+        if self.model_config is None:
+            raise ValueError("hidden_mix_profile_path requires model_config.")
+
+        profile_path = os.path.abspath(os.path.expanduser(str(profile_path)))
+        cached = getattr(self.model_config, "_snapkv_neighbor_shared_profile", None)
+        if cached is not None and cached.get("path") == profile_path:
+            return cached["profile"]
+
+        with open(profile_path, "r", encoding="utf-8") as handle:
+            raw_profile = json.load(handle)
+        profile = self._parse_hidden_mix_profile(raw_profile, profile_path)
+        self.model_config._snapkv_neighbor_shared_profile = {
+            "path": profile_path,
+            "profile": profile,
+        }
+        return profile
+
+    def _parse_hidden_mix_profile(self, raw_profile, profile_path):
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"Hidden mix profile must be a JSON object: {profile_path}")
+        groups = raw_profile.get("groups")
+        if not isinstance(groups, list):
+            raise ValueError("Hidden mix profile requires a list field named 'groups'.")
+
+        layer_to_group = {}
+        group_profiles = {}
+        for group_idx, group_spec in enumerate(groups):
+            if not isinstance(group_spec, dict):
+                raise ValueError(f"Profile group {group_idx} must be an object.")
+            layers = group_spec.get("layers")
+            if not isinstance(layers, list) or not layers:
+                raise ValueError(f"Profile group {group_idx} requires non-empty 'layers'.")
+            layers = tuple(int(layer) for layer in layers)
+            if len(set(layers)) != len(layers):
+                raise ValueError(f"Profile group {group_idx} contains duplicate layers.")
+            for layer in layers:
+                if layer in layer_to_group:
+                    raise ValueError(f"Layer {layer} appears in multiple hidden mix groups.")
+                layer_to_group[layer] = layers
+
+            layer_set = set(layers)
+            mix_spec = group_spec.get("mix", {})
+            if mix_spec is None:
+                mix_spec = {}
+            if not isinstance(mix_spec, dict):
+                raise ValueError(f"Profile group {group_idx} field 'mix' must be an object.")
+            mix = {}
+            for target_key, target_spec in mix_spec.items():
+                target_layer = int(target_key)
+                if target_layer not in layer_set:
+                    raise ValueError(f"Mix target layer {target_layer} is not in group {layers}.")
+                if not isinstance(target_spec, dict):
+                    raise ValueError(f"Mix target {target_layer} must be an object.")
+                sources = target_spec.get("sources")
+                weights = target_spec.get("weights")
+                if not isinstance(sources, list) or not sources:
+                    raise ValueError(f"Mix target {target_layer} requires non-empty sources.")
+                if not isinstance(weights, list) or len(weights) != len(sources):
+                    raise ValueError(f"Mix target {target_layer} requires one weight per source.")
+                sources = tuple(int(source) for source in sources)
+                for source in sources:
+                    if source not in layer_set:
+                        raise ValueError(f"Mix source layer {source} is not in target {target_layer} group {layers}.")
+                weights = tuple(float(weight) for weight in weights)
+                if any((not math.isfinite(weight)) or weight < 0.0 for weight in weights):
+                    raise ValueError(f"Mix target {target_layer} weights must be finite and non-negative.")
+                weight_sum = sum(weights)
+                if weight_sum <= 0.0:
+                    raise ValueError(f"Mix target {target_layer} weights must sum to a positive value.")
+                mix[target_layer] = tuple(
+                    (source, weight / weight_sum) for source, weight in zip(sources, weights)
+                )
+            group_profiles[layers] = {"mix": mix}
+
+        return {
+            "metric": raw_profile.get("metric"),
+            "groups": group_profiles,
+            "layer_to_group": layer_to_group,
+        }
 
     def update_kv(self, key_states, query_states, value_states):
         return self.fallback.update_kv(key_states, query_states, value_states)
@@ -120,6 +214,8 @@ class SnapKVNeighborShared:
         return not (self.model_config.compression is None or query_states.shape[-2] > 1)
 
     def _is_incomplete_tail_layer(self):
+        if self.hidden_mix_profile is not None:
+            return False
         num_layers = getattr(self.model_config, "num_hidden_layers", None)
         if num_layers is None:
             return False
@@ -127,6 +223,13 @@ class SnapKVNeighborShared:
 
     def _group_start(self, layer_idx):
         return (int(layer_idx) // 3) * 3
+
+    def _group_layers(self, layer_idx):
+        layer_idx = int(layer_idx)
+        if self.hidden_mix_profile is not None:
+            return self.hidden_mix_profile["layer_to_group"].get(layer_idx, (layer_idx,))
+        group_start = self._group_start(layer_idx)
+        return (group_start, group_start + 1, group_start + 2)
 
     def _state(self):
         if not hasattr(self.model_config, "_snapkv_neighbor_shared_state"):
@@ -142,12 +245,14 @@ class SnapKVNeighborShared:
         value_states,
         layer_cache,
     ):
-        group_start = self._group_start(self.layer_idx)
+        group_layers = self._group_layers(self.layer_idx)
+        group_key = tuple(group_layers)
         state = self._state()
-        if self.layer_idx == group_start:
-            state["groups"][group_start] = {}
-        group = state["groups"].setdefault(group_start, {})
+        if self.layer_idx == group_layers[0]:
+            state["groups"][group_key] = {}
+        group = state["groups"].setdefault(group_key, {})
         group[self.layer_idx] = {
+            "layer_idx": self.layer_idx,
             "attention": attention,
             "hidden_window": hidden_window,
             "position_window": position_window,
@@ -156,27 +261,29 @@ class SnapKVNeighborShared:
             "valid_mask": self._current_valid_mask(layer_cache, key_states),
             "layer_cache": layer_cache,
         }
-        expected_layers = (group_start, group_start + 1, group_start + 2)
-        if all(layer_idx in group for layer_idx in expected_layers):
-            entries = [group[layer_idx] for layer_idx in expected_layers]
+        if all(layer_idx in group for layer_idx in group_layers):
+            entries = [group[layer_idx] for layer_idx in group_layers]
             try:
-                self._compress_group(entries)
+                self._compress_group(entries, group_layers)
             finally:
                 for entry in entries:
                     entry.clear()
-                state["groups"].pop(group_start, None)
+                state["groups"].pop(group_key, None)
 
-    def _compress_group(self, entries):
+    def _compress_group(self, entries, group_layers):
         if any(self._valid_token_count(entry["layer_cache"], entry["key_states"]) < self.budget for entry in entries):
             return
 
         hidden_len = min(entry["hidden_window"].shape[-2] for entry in entries)
-        avg_device = entries[-1]["hidden_window"].device
-        avg_dtype = entries[-1]["hidden_window"].dtype
-        avg_hidden = sum(
-            entry["hidden_window"][:, -hidden_len:, :].to(device=avg_device, dtype=avg_dtype)
-            for entry in entries
-        ) / len(entries)
+        entry_by_layer = {int(entry["layer_idx"]): entry for entry in entries}
+        avg_hidden = None
+        if self.hidden_mix_profile is None:
+            avg_device = entries[-1]["hidden_window"].device
+            avg_dtype = entries[-1]["hidden_window"].dtype
+            avg_hidden = sum(
+                entry["hidden_window"][:, -hidden_len:, :].to(device=avg_device, dtype=avg_dtype)
+                for entry in entries
+            ) / len(entries)
         score_tensors = []
         valid_tensors = []
         hist_lengths = []
@@ -186,9 +293,12 @@ class SnapKVNeighborShared:
             hist_len = key_states.shape[-2] - self.window_size
             if hist_len < 1:
                 return
+            mixed_hidden = avg_hidden
+            if mixed_hidden is None:
+                mixed_hidden = self._mixed_hidden_window(entry, entry_by_layer, group_layers, hidden_len)
             query_states = self._project_query_window(
                 entry["attention"],
-                avg_hidden,
+                mixed_hidden,
                 self._slice_position_window(entry["position_window"], hidden_len),
             )
             attn_scores = compute_attention_scores(query_states, key_states)
@@ -211,7 +321,7 @@ class SnapKVNeighborShared:
 
         batch_size = entries[0]["key_states"].shape[0]
         num_kv_heads = entries[0]["key_states"].shape[1]
-        total_budget = 3 * num_kv_heads * (self.budget - self.window_size)
+        total_budget = len(group_layers) * num_kv_heads * (self.budget - self.window_size)
         rank_device = score_tensors[-1].device
         rank_dtype = score_tensors[-1].dtype
         flat_scores = torch.cat(
@@ -239,6 +349,30 @@ class SnapKVNeighborShared:
             selected = selected.to(device=entry["key_states"].device)
             self._pack_layer(entry, selected, hist_len)
             offset += width
+
+    def _mixed_hidden_window(self, entry, entry_by_layer, group_layers, hidden_len):
+        target_layer = int(entry["layer_idx"])
+        mix = self._target_mix(group_layers, target_layer)
+        if mix is None:
+            return entry["hidden_window"][:, -hidden_len:, :]
+
+        device = entry["hidden_window"].device
+        dtype = entry["hidden_window"].dtype
+        mixed_hidden = None
+        for source_layer, weight in mix:
+            source_hidden = entry_by_layer[int(source_layer)]["hidden_window"][:, -hidden_len:, :]
+            source_hidden = source_hidden.to(device=device, dtype=dtype)
+            weighted = source_hidden * weight
+            mixed_hidden = weighted if mixed_hidden is None else mixed_hidden + weighted
+        return mixed_hidden
+
+    def _target_mix(self, group_layers, target_layer):
+        if self.hidden_mix_profile is None:
+            return None
+        group = self.hidden_mix_profile["groups"].get(tuple(group_layers))
+        if group is None:
+            return None
+        return group["mix"].get(int(target_layer))
 
     def _pack_layer(self, entry, selected_hist_mask, hist_len):
         key_states = entry["key_states"]
