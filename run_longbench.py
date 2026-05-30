@@ -14,6 +14,7 @@ from attn_heatmap import (
     get_full_attention_layer_indices,
     is_qwen_attn_heatmap_model,
 )
+from attn_output_ratio import AttnOutputRatioRunWriter
 from misc import (
     build_output_path,
     load_json,
@@ -299,6 +300,7 @@ def query_llm(
     stop=None,
     enable_thinking=False,
     attn_sample_writer=None,
+    attn_output_ratio_sample_writer=None,
     query_window_sample_writer=None,
     snapkv_observation_sample_writer=None,
     prefill_label="response",
@@ -320,6 +322,14 @@ def query_llm(
         ).record
     if query_window_sample_writer is not None:
         query_window_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
+    if attn_output_ratio_sample_writer is not None:
+        attn_output_ratio_sample_writer.capture_prefill(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt,
@@ -402,6 +412,18 @@ def build_query_window_similarity_run_writer(args, out_file):
     )
 
 
+def build_attn_output_ratio_run_writer(args, out_file):
+    if not args.attn_output_ratio_mode:
+        return None
+    return AttnOutputRatioRunWriter(
+        root_dir=args.attn_output_ratio_dir,
+        model_name=args.model,
+        out_file=out_file,
+        max_prefill_tokens=args.attn_output_ratio_max_prefill_tokens,
+        layer_spec=args.attn_output_ratio_layers,
+    )
+
+
 def validate_args(args):
     if args.model_maxlen < 1:
         raise ValueError("--model_maxlen must be at least 1.")
@@ -415,6 +437,8 @@ def validate_args(args):
         raise ValueError("--query_window_size must be at least 1.")
     if args.query_window_max_prefill_tokens is not None and args.query_window_max_prefill_tokens < 1:
         raise ValueError("--query_window_max_prefill_tokens must be at least 1 when provided.")
+    if args.attn_output_ratio_max_prefill_tokens is not None and args.attn_output_ratio_max_prefill_tokens < 1:
+        raise ValueError("--attn_output_ratio_max_prefill_tokens must be at least 1 when provided.")
     if args.query_window_similarity_submode not in SUPPORTED_SIMILARITY_STATES:
         raise ValueError(
             "--query_window_similarity_submode must be one of "
@@ -427,6 +451,8 @@ def validate_args(args):
             raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
     if args.query_window_similarity_mode and args.n_proc != 1:
         raise ValueError("--query_window_similarity_mode currently requires --n_proc 1.")
+    if args.attn_output_ratio_mode and args.n_proc != 1:
+        raise ValueError("--attn_output_ratio_mode currently requires --n_proc 1.")
     validate_snapkv_observation_args(args)
 
 def get_pred(data, args, fout, out_file):
@@ -441,6 +467,7 @@ def get_pred(data, args, fout, out_file):
     )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
     query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
+    attn_output_ratio_run_writer = build_attn_output_ratio_run_writer(args, out_file)
     snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
@@ -448,6 +475,11 @@ def get_pred(data, args, fout, out_file):
         query_window_sample_writer = (
             query_window_run_writer.new_sample(item)
             if query_window_run_writer is not None
+            else None
+        )
+        attn_output_ratio_sample_writer = (
+            attn_output_ratio_run_writer.new_sample(item)
+            if attn_output_ratio_run_writer is not None
             else None
         )
         snapkv_observation_sample_writer = (
@@ -480,6 +512,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=1024,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="cot_reasoning",
@@ -495,6 +528,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="response",
@@ -515,6 +549,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     prefill_label="cot_answer_extraction",
@@ -535,6 +570,12 @@ def get_pred(data, args, fout, out_file):
                     query_window_sample_writer.sample_dir,
                     start=args.query_window_similarity_dir,
                 )
+            if attn_output_ratio_sample_writer is not None:
+                item["attn_output_ratio_status"] = attn_output_ratio_sample_writer.build_capture_status()
+                item["attn_output_ratio_artifact"] = os.path.relpath(
+                    attn_output_ratio_sample_writer.sample_dir,
+                    start=args.attn_output_ratio_dir,
+                )
             if snapkv_observation_sample_writer is not None:
                 item["snapkv_observation_status"] = snapkv_observation_sample_writer.build_capture_status()
                 item["snapkv_observation_artifact"] = os.path.relpath(
@@ -545,6 +586,8 @@ def get_pred(data, args, fout, out_file):
                 attn_sample_writer.finalize(item)
             if query_window_sample_writer is not None:
                 query_window_sample_writer.finalize(item)
+            if attn_output_ratio_sample_writer is not None:
+                attn_output_ratio_sample_writer.finalize(item)
             if snapkv_observation_sample_writer is not None:
                 snapkv_observation_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
@@ -566,6 +609,14 @@ def get_pred(data, args, fout, out_file):
                     start=args.query_window_similarity_dir,
                 )
                 query_window_sample_writer.finalize(item)
+            if attn_output_ratio_sample_writer is not None:
+                item["error"] = str(exc)
+                item["attn_output_ratio_status"] = attn_output_ratio_sample_writer.build_capture_status()
+                item["attn_output_ratio_artifact"] = os.path.relpath(
+                    attn_output_ratio_sample_writer.sample_dir,
+                    start=args.attn_output_ratio_dir,
+                )
+                attn_output_ratio_sample_writer.finalize(item)
             if snapkv_observation_sample_writer is not None:
                 item["error"] = str(exc)
                 item["snapkv_observation_status"] = snapkv_observation_sample_writer.build_capture_status()
@@ -640,6 +691,10 @@ if __name__ == "__main__":
         help="Submode for query-window layer analysis: hidden_states/query_states use cosine similarity; hidden_states_l2_diff computes pairwise L2 norms of hidden-state differences.",
     )
     parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--attn_output_ratio_mode", action="store_true", help="Capture per-layer per-token ||attn_output||_2 / ||hidden_states||_2 ratios during prefill and plot density curves.")
+    parser.add_argument("--attn_output_ratio_dir", type=str, default="output_dir/results_longbench/attn_output_ratios")
+    parser.add_argument("--attn_output_ratio_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25. Raw npz always stores every captured layer.")
+    parser.add_argument("--attn_output_ratio_max_prefill_tokens", type=int, default=None, help="Skip attention-output ratio capture when the prefill token count exceeds this cap.")
     add_snapkv_observation_args(parser)
     args = parser.parse_args()
     main(args)
