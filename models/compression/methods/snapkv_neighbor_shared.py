@@ -24,11 +24,14 @@ class SnapKVNeighborShared:
         mode=None,
         hidden_mix_profile_path=None,
         hidden_mix_fallback="self",
+        flatten_cache="auto",
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
         if hidden_mix_fallback != "self":
             raise ValueError("hidden_mix_fallback currently supports only 'self'.")
+        if flatten_cache not in ("auto", True, False):
+            raise ValueError("flatten_cache must be one of 'auto', True, or False.")
         self.budget = budget
         self.window_size = window_size
         self.kernel_size = kernel_size
@@ -38,6 +41,7 @@ class SnapKVNeighborShared:
         self.mode = mode
         self.hidden_mix_profile_path = hidden_mix_profile_path
         self.hidden_mix_fallback = hidden_mix_fallback
+        self.flatten_cache = flatten_cache
         self.record_kept_token_indices = record_kept_token_indices
         self.hidden_mix_profile = self._load_hidden_mix_profile(hidden_mix_profile_path)
         self.fallback = SnapKV(
@@ -165,6 +169,11 @@ class SnapKVNeighborShared:
         past_key_values,
         layer_cache,
     ):
+        if self._is_flatten_cache(layer_cache):
+            if query_states.shape[-2] != 1:
+                raise ValueError("snapkv_neighbor_shared flatten cache only supports q_len=1 after prefill.")
+            return self._append_flatten_cache(layer_cache, key_states, value_states)
+
         if self._should_append_to_cache(query_states, layer_cache):
             key_states, value_states = past_key_values.update(
                 key_states,
@@ -421,6 +430,11 @@ class SnapKVNeighborShared:
                 lengths[batch_idx, head_idx] = cur_indices.numel()
             keep_indices.append(per_batch)
 
+        layer_cache = entry["layer_cache"]
+        if self._should_use_flatten_cache(entry["attention"], key_states, value_states, lengths):
+            self._set_flatten_layer_cache(layer_cache, key_states, value_states, keep_indices, lengths)
+            return
+
         max_len = max(int(lengths.max().item()), 1)
         packed_keys = key_states.new_zeros(batch_size, num_heads, max_len, head_dim)
         packed_values = value_states.new_zeros(batch_size, num_heads, max_len, head_dim)
@@ -435,17 +449,129 @@ class SnapKVNeighborShared:
                 packed_values[batch_idx, head_idx, :cur_len] = value_states[batch_idx, head_idx].index_select(0, cur_indices)
                 packed_mask[batch_idx, head_idx, :cur_len] = True
 
-        layer_cache = entry["layer_cache"]
         self._set_layer_cache(layer_cache, packed_keys, packed_values)
         layer_cache.kv_valid_mask = packed_mask
         layer_cache.kv_lengths = lengths
 
     def _set_layer_cache(self, layer_cache, key_states, value_states):
+        self._clear_flatten_metadata(layer_cache)
         layer_cache.keys = key_states
         layer_cache.values = value_states
         layer_cache.dtype = key_states.dtype
         layer_cache.device = key_states.device
         layer_cache.is_initialized = True
+
+    def _should_use_flatten_cache(self, attention, key_states, value_states, lengths):
+        if self.flatten_cache is False:
+            return False
+
+        reasons = []
+        if getattr(self.model_config, "update_kv", None) is not True:
+            reasons.append("update_kv must be True")
+        if getattr(attention.config, "_attn_implementation", None) != "flash_attention_2":
+            reasons.append("attn_implementation must be flash_attention_2")
+        if key_states.shape[0] != 1:
+            reasons.append("batch_size must be 1")
+        if key_states.device.type != "cuda" or value_states.device.type != "cuda":
+            reasons.append("key/value states must be CUDA tensors")
+        if key_states.dtype not in (torch.float16, torch.bfloat16):
+            reasons.append("key/value dtype must be float16 or bfloat16")
+        if lengths.shape[0] != 1:
+            reasons.append("flatten metadata supports one batch only")
+
+        if reasons:
+            if self.flatten_cache is True:
+                raise ValueError("flatten_cache=True cannot be enabled: " + "; ".join(reasons) + ".")
+            return False
+        return True
+
+    def _set_flatten_layer_cache(self, layer_cache, key_states, value_states, keep_indices, lengths):
+        batch_size, num_heads, _, head_dim = key_states.shape
+        if batch_size != 1:
+            raise ValueError("snapkv_neighbor_shared flatten cache only supports batch_size=1.")
+
+        flat_keys = []
+        flat_values = []
+        for head_idx in range(num_heads):
+            cur_indices = keep_indices[0][head_idx]
+            if cur_indices.numel() == 0:
+                continue
+            flat_keys.append(key_states[0, head_idx].index_select(0, cur_indices))
+            flat_values.append(value_states[0, head_idx].index_select(0, cur_indices))
+
+        if flat_keys:
+            layer_cache.keys = torch.cat(flat_keys, dim=0).contiguous()
+            layer_cache.values = torch.cat(flat_values, dim=0).contiguous()
+        else:
+            layer_cache.keys = key_states.new_zeros(0, head_dim)
+            layer_cache.values = value_states.new_zeros(0, head_dim)
+        self._set_flatten_metadata(layer_cache, lengths[0])
+        layer_cache.dtype = key_states.dtype
+        layer_cache.device = key_states.device
+        layer_cache.is_initialized = True
+        self._clear_padding_metadata(layer_cache)
+
+    def _append_flatten_cache(self, layer_cache, key_states, value_states):
+        if key_states.shape[0] != 1 or key_states.shape[-2] != 1:
+            raise ValueError("snapkv_neighbor_shared flatten cache decode update requires shape [1, heads, 1, dim].")
+        if key_states.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("snapkv_neighbor_shared flatten cache requires float16 or bfloat16 key/value tensors.")
+        if key_states.device.type != "cuda" or value_states.device.type != "cuda":
+            raise ValueError("snapkv_neighbor_shared flatten cache requires CUDA key/value tensors.")
+
+        from tiny_api_cuda import update_flatten_view
+
+        head_lens = layer_cache.kv_head_lens.to(device=key_states.device, dtype=torch.int32).contiguous()
+        cu_lens = layer_cache.kv_cu_lens.to(device=key_states.device, dtype=torch.int32).contiguous()
+        _, num_heads, _, head_dim = key_states.shape
+        if head_lens.numel() != num_heads:
+            raise ValueError("flatten cache head count does not match the decode key/value tensors.")
+
+        flat_new_keys = key_states.contiguous().view(-1, head_dim)
+        flat_new_values = value_states.contiguous().view(-1, head_dim)
+        with torch.cuda.device(key_states.device):
+            layer_cache.keys = update_flatten_view(
+                layer_cache.keys.contiguous().view(-1, head_dim),
+                flat_new_keys,
+                head_lens,
+                cu_lens,
+            )
+            layer_cache.values = update_flatten_view(
+                layer_cache.values.contiguous().view(-1, head_dim),
+                flat_new_values,
+                head_lens,
+                cu_lens,
+            )
+        self._set_flatten_metadata(layer_cache, head_lens.to(dtype=torch.long) + 1)
+        layer_cache.dtype = key_states.dtype
+        layer_cache.device = key_states.device
+        layer_cache.is_initialized = True
+        return layer_cache.keys, layer_cache.values
+
+    def _set_flatten_metadata(self, layer_cache, head_lens):
+        from types import MethodType
+
+        head_lens = head_lens.to(device=layer_cache.keys.device, dtype=torch.int32).contiguous()
+        cu_lens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=head_lens.device),
+                torch.cumsum(head_lens, dim=0, dtype=torch.int32),
+            ],
+            dim=0,
+        )
+        layer_cache.kv_head_lens = head_lens
+        layer_cache.kv_cu_lens = cu_lens
+        layer_cache.kv_max_seqlen = int(head_lens.max().item()) if head_lens.numel() else 0
+        layer_cache.kv_flatten_enabled = True
+        layer_cache.kv_num_heads = int(head_lens.numel())
+
+        def _flatten_get_seq_length(cache_self):
+            return int(getattr(cache_self, "kv_max_seqlen", 0))
+
+        layer_cache.get_seq_length = MethodType(_flatten_get_seq_length, layer_cache)
+
+    def _is_flatten_cache(self, layer_cache):
+        return bool(getattr(layer_cache, "kv_flatten_enabled", False))
 
     def _set_attention_mask_for_current_step(self, layer_cache, key_states, query_states):
         if query_states.shape[-2] == 1:
@@ -495,6 +621,19 @@ class SnapKVNeighborShared:
             delattr(layer_cache, "kv_lengths")
         if hasattr(layer_cache, "attention_kv_valid_mask"):
             delattr(layer_cache, "attention_kv_valid_mask")
+
+    def _clear_flatten_metadata(self, layer_cache):
+        for attr in (
+            "kv_head_lens",
+            "kv_cu_lens",
+            "kv_max_seqlen",
+            "kv_flatten_enabled",
+            "kv_num_heads",
+        ):
+            if hasattr(layer_cache, attr):
+                delattr(layer_cache, attr)
+        if "get_seq_length" in getattr(layer_cache, "__dict__", {}):
+            delattr(layer_cache, "get_seq_length")
 
     def _update_hidden_window(self, layer_cache, hidden_states):
         if hidden_states.shape[-2] >= self.window_size or not hasattr(layer_cache, "neighbor_hidden_window"):

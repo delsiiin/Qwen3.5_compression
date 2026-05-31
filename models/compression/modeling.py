@@ -73,7 +73,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def _get_kv_valid_mask(attention, past_key_values, key_states, query_states):
-    if past_key_values is None:
+    if past_key_values is None or key_states.ndim != 4:
         return None
     layer_cache = past_key_values.layers[attention.layer_idx]
     if query_states.shape[-2] == 1:
@@ -84,6 +84,137 @@ def _get_kv_valid_mask(attention, past_key_values, key_states, query_states):
     if kv_valid_mask is None or kv_valid_mask.shape[-1] != key_states.shape[-2]:
         return None
     return kv_valid_mask.to(device=key_states.device)
+
+
+def _get_flatten_cache_layer(attention, past_key_values, key_states, query_states):
+    if past_key_values is None or key_states.ndim != 2 or query_states.shape[-2] != 1:
+        return None
+    if getattr(attention.config, "_attn_implementation", None) != "flash_attention_2":
+        return None
+    layer_cache = past_key_values.layers[attention.layer_idx]
+    if not getattr(layer_cache, "kv_flatten_enabled", False):
+        return None
+    if query_states.shape[0] != 1:
+        return None
+    return layer_cache
+
+
+def _flash_attn_varlen_func():
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except ImportError as exc:
+        raise ImportError("snapkv_neighbor_shared flatten cache requires flash_attn.") from exc
+    return flash_attn_varlen_func
+
+
+def flatten_varlen_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    layer_cache,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
+        logger.warning_once(
+            "snapkv_neighbor_shared flatten cache uses flash-attn varlen and does not return attentions/head masks."
+        )
+
+    num_kv_heads = int(layer_cache.kv_num_heads)
+    num_attention_heads = query.shape[1]
+    if num_attention_heads % num_kv_heads != 0:
+        raise ValueError("Number of attention heads must be divisible by flatten cache KV heads.")
+
+    num_key_value_groups = num_attention_heads // num_kv_heads
+    head_dim = query.shape[-1]
+    if query.dtype != key.dtype:
+        query = query.to(key.dtype)
+    if value.dtype != key.dtype:
+        value = value.to(key.dtype)
+
+    q = query[0, :, 0, :].contiguous().view(num_kv_heads, num_key_value_groups, head_dim)
+    k = key.contiguous().view(-1, 1, head_dim)
+    v = value.contiguous().view(-1, 1, head_dim)
+    cu_q = torch.arange(0, num_kv_heads + 1, dtype=torch.int32, device=query.device)
+    cu_k = layer_cache.kv_cu_lens.to(device=query.device, dtype=torch.int32)
+
+    flash_kwargs = {
+        "cu_seqlens_q": cu_q,
+        "cu_seqlens_k": cu_k,
+        "max_seqlen_q": 1,
+        "max_seqlen_k": int(layer_cache.kv_max_seqlen),
+        "softmax_scale": scaling,
+        "causal": True,
+    }
+    if dropout:
+        flash_kwargs["dropout_p"] = dropout
+
+    flash_attn_varlen_func = _flash_attn_varlen_func()
+    try:
+        attn_output = flash_attn_varlen_func(q, k, v, **flash_kwargs)
+    except TypeError:
+        if "dropout_p" not in flash_kwargs:
+            raise
+        flash_kwargs.pop("dropout_p")
+        attn_output = flash_attn_varlen_func(q, k, v, **flash_kwargs)
+    if isinstance(attn_output, tuple):
+        attn_output = attn_output[0]
+
+    attn_output = attn_output.reshape(1, num_attention_heads, 1, head_dim).transpose(1, 2).contiguous()
+    return attn_output, None
+
+
+def _attention_with_optional_flatten(
+    module,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    past_key_values,
+    attention_interface,
+    dropout,
+    scaling,
+    **kwargs,
+):
+    flatten_layer_cache = _get_flatten_cache_layer(module, past_key_values, key_states, query_states)
+    if flatten_layer_cache is not None:
+        return flatten_varlen_attention_forward(
+            module,
+            query_states,
+            key_states,
+            value_states,
+            flatten_layer_cache,
+            dropout=dropout,
+            scaling=scaling,
+            **kwargs,
+        )
+
+    kv_valid_mask = _get_kv_valid_mask(module, past_key_values, key_states, query_states)
+    if kv_valid_mask is not None:
+        return masked_eager_attention_forward(
+            module,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            kv_valid_mask,
+            dropout=dropout,
+            scaling=scaling,
+            **kwargs,
+        )
+
+    return attention_interface(
+        module,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=dropout,
+        scaling=scaling,
+        **kwargs,
+    )
 
 def Llama_Attention_init(self, config: LlamaConfig, layer_idx: int, compression_config: dict):
     nn.Module.__init__(self)
@@ -347,30 +478,18 @@ def Llama_Attention_forward(
         self.config._attn_implementation, llama_eager_attention_forward
     )
 
-    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
-    if kv_valid_mask is not None:
-        attn_output, attn_weights = masked_eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            kv_valid_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-    else:
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+    attn_output, attn_weights = _attention_with_optional_flatten(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        past_key_values,
+        attention_interface,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -487,32 +606,19 @@ def Qwen3_Attention_forward(
         self.config._attn_implementation, qwen3_eager_attention_forward
     )
 
-    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
-    if kv_valid_mask is not None:
-        attn_output, attn_weights = masked_eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            kv_valid_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
-    else:
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
-            **kwargs,
-        )
+    attn_output, attn_weights = _attention_with_optional_flatten(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        past_key_values,
+        attention_interface,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,  # diff with Llama
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
@@ -628,32 +734,19 @@ def Qwen3Moe_Attention_forward(
             self.config._attn_implementation, qwen3_moe_eager_attention_forward
         )
 
-        kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
-        if kv_valid_mask is not None:
-            attn_output, attn_weights = masked_eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                kv_valid_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
-            )
-        else:
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,  # diff with Llama
-                **kwargs,
-            )
+        attn_output, attn_weights = _attention_with_optional_flatten(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            past_key_values,
+            attention_interface,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,  # diff with Llama
+            **kwargs,
+        )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -786,30 +879,18 @@ def Qwen3_5Attention_forward(
     if attention_mask is not None and attention_mask.device != query_states.device:
         attention_mask = attention_mask.to(query_states.device)
 
-    kv_valid_mask = _get_kv_valid_mask(self, past_key_values, key_states, query_states)
-    if kv_valid_mask is not None:
-        attn_output, attn_weights = masked_eager_attention_forward(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            kv_valid_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-    else:
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
+    attn_output, attn_weights = _attention_with_optional_flatten(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        past_key_values,
+        attention_interface,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        **kwargs,
+    )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
