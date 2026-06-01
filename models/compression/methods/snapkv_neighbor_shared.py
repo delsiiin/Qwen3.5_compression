@@ -338,6 +338,8 @@ class SnapKVNeighborShared:
                 stride=1,
             )
             pooled_scores = pooled_scores.masked_fill(~hist_valid, torch.finfo(pooled_scores.dtype).min)
+            # Put each layer/head distribution on a common scale before the shared top-k.
+            pooled_scores = self._normalize_scores_for_global_rank(pooled_scores, hist_valid)
             score_tensors.append(pooled_scores)
             valid_tensors.append(hist_valid)
             hist_lengths.append(hist_len)
@@ -372,6 +374,19 @@ class SnapKVNeighborShared:
             selected = selected.to(device=entry["key_states"].device)
             self._pack_layer(entry, selected, hist_len)
             offset += width
+
+    def _normalize_scores_for_global_rank(self, scores, valid_mask):
+        rank_scores = scores.to(dtype=torch.float32)
+        valid_mask = valid_mask.to(device=rank_scores.device, dtype=torch.bool)
+        zeros = torch.zeros_like(rank_scores)
+        valid_scores = torch.where(valid_mask, rank_scores, zeros)
+        valid_count = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        mean = valid_scores.sum(dim=-1, keepdim=True) / valid_count
+        centered = torch.where(valid_mask, rank_scores - mean, zeros)
+        variance = centered.square().sum(dim=-1, keepdim=True) / valid_count
+        std = variance.sqrt().clamp_min(torch.finfo(rank_scores.dtype).eps)
+        normalized = centered / std
+        return normalized.masked_fill(~valid_mask, torch.finfo(normalized.dtype).min)
 
     def _group_historical_budget(self, group_layers, num_kv_heads):
         per_layer_history = self.budget - self.window_size
