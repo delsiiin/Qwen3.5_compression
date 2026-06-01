@@ -25,6 +25,7 @@ class SnapKVNeighborShared:
         hidden_mix_profile_path=None,
         hidden_mix_fallback="self",
         flatten_cache="auto",
+        importance_epsilon=1e-12,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -42,6 +43,7 @@ class SnapKVNeighborShared:
         self.hidden_mix_profile_path = hidden_mix_profile_path
         self.hidden_mix_fallback = hidden_mix_fallback
         self.flatten_cache = flatten_cache
+        self.importance_epsilon = float(importance_epsilon)
         self.record_kept_token_indices = record_kept_token_indices
         self.hidden_mix_profile = self._load_hidden_mix_profile(hidden_mix_profile_path)
         self.fallback = SnapKV(
@@ -331,6 +333,13 @@ class SnapKVNeighborShared:
             attn_probs = F.softmax(query_scores, dim=-1, dtype=torch.float32)
             attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
             attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            value_output_l1 = self._value_output_l1_norm(
+                entry["attention"],
+                entry["value_states"][:, :, :hist_len, :],
+            )
+            value_output_l1 = value_output_l1.to(device=attn_probs.device, dtype=attn_probs.dtype)
+            attn_probs = (attn_probs + self.importance_epsilon) * value_output_l1[:, :, None, :]
+            attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
             pooled_scores = F.max_pool1d(
                 attn_probs.mean(dim=-2).to(query_states.dtype),
                 kernel_size=self.kernel_size,
@@ -387,6 +396,51 @@ class SnapKVNeighborShared:
         std = variance.sqrt().clamp_min(torch.finfo(rank_scores.dtype).eps)
         normalized = centered / std
         return normalized.masked_fill(~valid_mask, torch.finfo(normalized.dtype).min)
+
+    def _value_output_l1_norm(self, attention, value_states):
+        o_proj = getattr(attention, "o_proj", None)
+        if o_proj is None or not hasattr(o_proj, "weight"):
+            raise ValueError("snapkv_neighbor_shared requires attention.o_proj.weight to compute value-output L1 scores.")
+
+        batch_size, num_kv_heads, seq_len, head_dim = value_states.shape
+        weight = o_proj.weight
+        if weight.shape[-1] % head_dim != 0:
+            raise ValueError("attention.o_proj input dimension must be divisible by value head_dim.")
+
+        num_attention_heads = weight.shape[-1] // head_dim
+        num_key_value_groups = int(getattr(attention, "num_key_value_groups", num_attention_heads // num_kv_heads))
+        if num_key_value_groups * num_kv_heads != num_attention_heads:
+            raise ValueError("attention.o_proj head layout does not match key/value head layout.")
+
+        weight = weight.to(device=value_states.device)
+        output_dim = weight.shape[0]
+        max_projected_elements = 16 * 1024 * 1024
+        chunk_len = max(1, max_projected_elements // max(1, batch_size * output_dim))
+        per_kv_head = []
+        for kv_head_idx in range(num_kv_heads):
+            values = value_states[:, kv_head_idx, :, :]
+            group_norm = None
+            for group_idx in range(num_key_value_groups):
+                attn_head_idx = kv_head_idx * num_key_value_groups + group_idx
+                start = attn_head_idx * head_dim
+                end = start + head_dim
+                weight_slice = weight[:, start:end]
+                cur_norm = torch.empty(
+                    batch_size,
+                    seq_len,
+                    dtype=torch.float32,
+                    device=value_states.device,
+                )
+                for token_start in range(0, seq_len, chunk_len):
+                    token_end = min(token_start + chunk_len, seq_len)
+                    projected = torch.matmul(
+                        values[:, token_start:token_end, :].to(dtype=weight_slice.dtype),
+                        weight_slice.transpose(0, 1),
+                    )
+                    cur_norm[:, token_start:token_end] = projected.float().abs().sum(dim=-1)
+                group_norm = cur_norm if group_norm is None else torch.maximum(group_norm, cur_norm)
+            per_kv_head.append(group_norm)
+        return torch.stack(per_kv_head, dim=1)
 
     def _group_historical_budget(self, group_layers, num_kv_heads):
         per_layer_history = self.budget - self.window_size
