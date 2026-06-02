@@ -45,6 +45,7 @@ from .methods import (
     StreamingLLM,
     H2O,
     CriticalKV,
+    DefensiveKV,
 )
 from .methods.snapkv_neighbor_shared import masked_eager_attention_forward
 
@@ -57,6 +58,7 @@ KV_COMPRESSION_MAP = {
     "streamingllm": StreamingLLM,
     "h2o": H2O,
     "criticalkv": CriticalKV,
+    "defensivekv": DefensiveKV,
 }
 
 logger = logging.get_logger(__name__)
