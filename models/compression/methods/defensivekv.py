@@ -2,6 +2,7 @@ import torch
 
 from . import compute_attention_scores
 import torch.nn.functional as F
+from torch import nn
 import math
 from .vw_norm import vw_l1norm
 
@@ -148,35 +149,28 @@ class DefensiveKV:
 
         key_states = repeat_kv(key_states, query_group_size)
 
-        if query_group_size == 1:
-            attn_weights = torch.matmul(
-                query_states, key_states.transpose(2, 3)
-            ) / math.sqrt(head_dim)
-        else:
-            # shape: [batch_size, kv_heads, query_group_size, q_len, head_dim]
-            # query_states = query_states.view(
-            #     batch_size, kv_heads, query_group_size, q_len, head_dim
-            # )
-
-            # shape: [batch_size, kv_heads, 1, kv_len, head_dim]
-            # key_states = key_states.unsqueeze(2)
-
-            # shape: [batch_size, kv_heads, query_group_size, q_len, kv_len]
-            attn_weights = torch.matmul(
-                query_states, key_states.transpose(2, 3)
-            ) / math.sqrt(head_dim)
-            
-        history_len = attn_weights.shape[-1] - recent_window
-        query_window = min(self.window_size, attn_weights.shape[-2])
-        attn_weights = torch.softmax(
-            attn_weights[..., -query_window:, :history_len],
-            dim=-1,
-            dtype=torch.float32,
-        ).to(query_states.dtype)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        attention_mask = torch.ones_like(attn_weights) * float("-inf")
+        attention_mask = torch.triu(attention_mask, diagonal=key_states.shape[-2] - recent_window + 1)
+        attn_weights += attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = attn_weights[..., :-recent_window]
 
         window_bias = attn_weights[..., -recent_window:].sum(dim=-1).mean().item()
 
         return attn_weights, window_bias
+            
+        # history_len = attn_weights.shape[-1] - recent_window
+        # query_window = min(self.window_size, attn_weights.shape[-2])
+        # attn_weights = torch.softmax(
+        #     attn_weights[..., -query_window:, :history_len],
+        #     dim=-1,
+        #     dtype=torch.float32,
+        # ).to(query_states.dtype)
+
+        # window_bias = attn_weights[..., -recent_window:].sum(dim=-1).mean().item()
+
+        # return attn_weights, window_bias
 
     def update_kv(
         self,

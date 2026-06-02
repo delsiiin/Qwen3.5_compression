@@ -2,7 +2,7 @@ import torch
 
 from . import compute_attention_scores
 import torch.nn.functional as F
-
+from torch import nn
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
@@ -77,14 +77,24 @@ class CriticalKV:
         return WoV_norm
 
     def score(self, key_states, query_states, recent_window):
+        
+        bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+        num_key_value_groups = query_states.shape[1] // num_key_value_heads
+
         attn_weights = compute_attention_scores(query_states, key_states)
-        history_len = attn_weights.shape[-1] - recent_window
-        query_window = min(self.window_size, attn_weights.shape[-2])
-        scores = torch.softmax(
-            attn_weights[:, :, -query_window:, :history_len],
-            dim=-1,
-            dtype=torch.float32,
-        ).mean(dim=-2).to(query_states.dtype)
+
+        attention_mask = torch.ones_like(attn_weights) * float("-inf")
+        attention_mask = torch.triu(attention_mask, diagonal=key_states.shape[-2] - recent_window + 1)
+        attn_weights += attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = attn_weights[..., :-recent_window]
+
+        window_bias = attn_weights[..., -recent_window:].sum(dim=-1).mean().item()
+
+        scores = attn_weights.view(
+            bsz, num_key_value_heads, num_key_value_groups, recent_window, kv_cache_len - recent_window
+        )
+        scores = scores.mean(dim=2).mean(dim=-2)
 
         scores = F.max_pool1d(
             scores,

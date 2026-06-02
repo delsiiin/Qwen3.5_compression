@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from ..utils import compute_attention_scores
 
@@ -63,7 +64,8 @@ def compute_snapkv_selection(
     window_size: int = 8,
     kernel_size: int = 7,
 ) -> SnapKVSelection:
-    kv_cache_len = key_states.shape[-2]
+    bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+    num_key_value_groups = query_states.shape[1] // num_key_value_heads
     if kv_cache_len < budget:
         raise ValueError("kv_cache_len must be at least budget.")
     if kv_cache_len <= window_size:
@@ -75,15 +77,20 @@ def compute_snapkv_selection(
         raise ValueError("budget - window_size cannot exceed candidate key count.")
 
     attn_weights = compute_attention_scores(query_states, key_states)
-    attn_weights_sum = (
-        F.softmax(
-            attn_weights[:, :, -window_size:, : -window_size],
-            dim=-1,
-            dtype=torch.float32,
-        )
-        .mean(dim=-2)
-        .to(query_states.dtype)
+
+    attention_mask = torch.ones_like(attn_weights) * float("-inf")
+    attention_mask = torch.triu(attention_mask, diagonal=key_states.shape[-2] - window_size + 1)
+    attn_weights += attention_mask
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = attn_weights[..., :-window_size]
+
+    window_bias = attn_weights[..., -window_size:].sum(dim=-1).mean().item()
+
+    scores = attn_weights.view(
+        bsz, num_key_value_heads, num_key_value_groups, window_size, kv_cache_len - window_size
     )
+    attn_weights_sum = scores.mean(dim=2).mean(dim=-2)
+
     attn_cache = F.max_pool1d(
         attn_weights_sum,
         kernel_size=kernel_size,

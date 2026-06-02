@@ -5,36 +5,28 @@ import torch
 #################################################################
 ###################### kv cache utilities #######################
 #################################################################
-def compute_attention_scores(query_states, key_states, pooling="max"):
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch,
+        num_key_value_heads,
+        n_rep,
+        seq_len,
+        head_dim,
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+
+def compute_attention_scores(query_states, key_states):
+
     batch_size, q_heads, q_len, head_dim = query_states.shape
     kv_heads = key_states.shape[1]
     query_group_size = q_heads // kv_heads
 
-    if query_group_size == 1:
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(head_dim)
-    else:
-        # shape: [batch_size, kv_heads, query_group_size, q_len, head_dim]
-        query_states = query_states.view(
-            batch_size, kv_heads, query_group_size, q_len, head_dim
-        )
+    key_states = repeat_kv(key_states, query_group_size)
 
-        # shape: [batch_size, kv_heads, 1, kv_len, head_dim]
-        key_states = key_states.unsqueeze(2)
-
-        # shape: [batch_size, kv_heads, query_group_size, q_len, kv_len]
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(3, 4)
-        ) / math.sqrt(head_dim)
-
-        # apply pooling over query_group_size dimension
-        if pooling == "mean":
-            attn_weights = attn_weights.mean(dim=2)
-        elif pooling == "max":
-            attn_weights = attn_weights.max(dim=2).values
-        else:
-            raise ValueError("Pooling method not supported")
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
     return attn_weights
 

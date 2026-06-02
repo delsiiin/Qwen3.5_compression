@@ -336,23 +336,49 @@ class SnapKVNeighborShared:
                 self._slice_position_window(entry["position_window"], hidden_len),
             )
             attn_scores = compute_attention_scores(query_states, key_states)
+
             hist_valid = valid_mask[:, :, :hist_len]
-            query_scores = attn_scores[:, :, -min(self.window_size, attn_scores.shape[-2]) :, :hist_len]
-            query_scores = query_scores.masked_fill(~hist_valid[:, :, None, :], torch.finfo(query_scores.dtype).min)
-            attn_probs = F.softmax(query_scores, dim=-1, dtype=torch.float32)
-            attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
-            attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+            num_key_value_groups = query_states.shape[1] // num_key_value_heads
+            query_window = min(self.window_size, attn_scores.shape[-2])
+            attn_scores = attn_scores[:, :, -query_window:, :]
+
+            attention_mask = torch.ones_like(attn_scores) * float("-inf")
+            attention_mask = torch.triu(attention_mask, diagonal=kv_cache_len - query_window + 1)
+            attn_scores = attn_scores + attention_mask
+
+            full_valid = valid_mask[:, :, None, :].expand(
+                bsz,
+                num_key_value_heads,
+                num_key_value_groups,
+                kv_cache_len,
+            )
+            full_valid = full_valid.reshape(bsz, query_states.shape[1], kv_cache_len)
+            attn_scores = attn_scores.masked_fill(
+                ~full_valid[:, :, None, :],
+                torch.finfo(attn_scores.dtype).min,
+            )
+            attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            hist_probs = attn_probs[..., :hist_len]
+            scores = hist_probs.reshape(
+                bsz,
+                num_key_value_heads,
+                num_key_value_groups,
+                query_window,
+                hist_len,
+            )
+            scores = scores.mean(dim=2).mean(dim=-2)
             value_output_l1 = self._mixed_value_output_l1_norm(
                 entry,
                 group_layers,
                 value_output_l1_by_layer,
                 hist_len,
             )
-            value_output_l1 = value_output_l1.to(device=attn_probs.device, dtype=attn_probs.dtype)
-            attn_probs = (attn_probs + self.importance_epsilon) * value_output_l1[:, :, None, :]
-            attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
+            value_output_l1 = value_output_l1.to(device=scores.device, dtype=scores.dtype)
+            scores = (scores + self.importance_epsilon) * value_output_l1
+            scores = torch.where(hist_valid, scores, torch.zeros_like(scores))
             pooled_scores = F.max_pool1d(
-                attn_probs.mean(dim=-2).to(query_states.dtype),
+                scores.to(query_states.dtype),
                 kernel_size=self.kernel_size,
                 padding=self.kernel_size // 2,
                 stride=1,

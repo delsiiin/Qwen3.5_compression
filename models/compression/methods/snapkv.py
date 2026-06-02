@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 from . import compute_attention_scores
 
 
@@ -41,22 +41,26 @@ class SnapKV:
         value_states,
     ):
         head_dim = query_states.shape[-1]
-        kv_cache_len = key_states.shape[-2]
+        bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+        num_key_value_groups = query_states.shape[1] // num_key_value_heads
 
         if kv_cache_len < self.budget:
             return key_states, value_states
         else:
             attn_weights = compute_attention_scores(query_states, key_states)
 
-            attn_weights_sum = (
-                nn.functional.softmax(
-                    attn_weights[:, :, -self.window_size :, : -self.window_size],
-                    dim=-1,
-                    dtype=torch.float32,
-                )
-                .mean(dim=-2)
-                .to(query_states.dtype)
+            attention_mask = torch.ones_like(attn_weights) * float("-inf")
+            attention_mask = torch.triu(attention_mask, diagonal=key_states.shape[-2] - self.window_size + 1)
+            attn_weights += attention_mask
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = attn_weights[..., :-self.window_size]
+
+            window_bias = attn_weights[..., -self.window_size:].sum(dim=-1).mean().item()
+
+            scores = attn_weights.view(
+                bsz, num_key_value_heads, num_key_value_groups, self.window_size, kv_cache_len - self.window_size
             )
+            attn_weights_sum = scores.mean(dim=2).mean(dim=-2)
 
             attn_cache = F.max_pool1d(
                 attn_weights_sum,
