@@ -425,49 +425,47 @@ class SnapKVNeighborShared:
         return normalized.masked_fill(~valid_mask, torch.finfo(normalized.dtype).min)
 
     def _value_output_l1_norm(self, attention, value_states):
-        o_proj = getattr(attention, "o_proj", None)
-        if o_proj is None or not hasattr(o_proj, "weight"):
-            raise ValueError("snapkv_neighbor_shared requires attention.o_proj.weight to compute value-output L1 scores.")
+        batch_size, num_key_value_heads, seq_len, _ = value_states.shape
+        num_key_value_groups = attention.config.num_attention_heads // num_key_value_heads
+        output_weight = attention.o_proj.weight.transpose(0, 1)
+        output_weight = output_weight.view(
+            attention.config.num_attention_heads,
+            attention.head_dim,
+            attention.config.hidden_size,
+        )
 
-        batch_size, num_kv_heads, seq_len, head_dim = value_states.shape
-        weight = o_proj.weight
-        if weight.shape[-1] % head_dim != 0:
-            raise ValueError("attention.o_proj input dimension must be divisible by value head_dim.")
+        if num_key_value_groups == 1:
+            repeated_values = value_states
+        else:
+            repeated_values = value_states[:, :, None, :, :].expand(
+                batch_size,
+                num_key_value_heads,
+                num_key_value_groups,
+                seq_len,
+                attention.head_dim,
+            )
+            repeated_values = repeated_values.reshape(
+                batch_size,
+                num_key_value_heads * num_key_value_groups,
+                seq_len,
+                attention.head_dim,
+            )
 
-        num_attention_heads = weight.shape[-1] // head_dim
-        num_key_value_groups = int(getattr(attention, "num_key_value_groups", num_attention_heads // num_kv_heads))
-        if num_key_value_groups * num_kv_heads != num_attention_heads:
-            raise ValueError("attention.o_proj head layout does not match key/value head layout.")
+        projected_norms = []
+        for head_idx in range(repeated_values.size(1)):
+            projected_values = repeated_values[:, head_idx, :, :].matmul(
+                output_weight[head_idx, :, :].unsqueeze(0)
+            )
+            projected_norms.append(torch.norm(projected_values, p=1, dim=-1))
 
-        weight = weight.to(device=value_states.device)
-        output_dim = weight.shape[0]
-        max_projected_elements = 16 * 1024 * 1024
-        chunk_len = max(1, max_projected_elements // max(1, batch_size * output_dim))
-        per_kv_head = []
-        for kv_head_idx in range(num_kv_heads):
-            values = value_states[:, kv_head_idx, :, :]
-            group_norm = None
-            for group_idx in range(num_key_value_groups):
-                attn_head_idx = kv_head_idx * num_key_value_groups + group_idx
-                start = attn_head_idx * head_dim
-                end = start + head_dim
-                weight_slice = weight[:, start:end]
-                cur_norm = torch.empty(
-                    batch_size,
-                    seq_len,
-                    dtype=torch.float32,
-                    device=value_states.device,
-                )
-                for token_start in range(0, seq_len, chunk_len):
-                    token_end = min(token_start + chunk_len, seq_len)
-                    projected = torch.matmul(
-                        values[:, token_start:token_end, :].to(dtype=weight_slice.dtype),
-                        weight_slice.transpose(0, 1),
-                    )
-                    cur_norm[:, token_start:token_end] = projected.float().abs().sum(dim=-1)
-                group_norm = cur_norm if group_norm is None else torch.maximum(group_norm, cur_norm)
-            per_kv_head.append(group_norm)
-        return torch.stack(per_kv_head, dim=1)
+        value_output_l1 = torch.stack(projected_norms, dim=1)
+        value_output_l1 = value_output_l1.view(
+            batch_size,
+            num_key_value_heads,
+            attention.num_key_value_groups,
+            seq_len,
+        ).mean(dim=2)
+        return value_output_l1
 
     def _group_historical_budget(self, group_layers, num_kv_heads):
         per_layer_history = self.budget - self.window_size
