@@ -312,12 +312,21 @@ class SnapKVNeighborShared:
         score_tensors = []
         valid_tensors = []
         hist_lengths = []
+        value_output_l1_by_layer = {}
         for entry in entries:
             key_states = entry["key_states"]
-            valid_mask = entry["valid_mask"]
             hist_len = key_states.shape[-2] - self.window_size
             if hist_len < 1:
                 return
+            hist_lengths.append(hist_len)
+            value_output_l1_by_layer[int(entry["layer_idx"])] = self._value_output_l1_norm(
+                entry["attention"],
+                entry["value_states"][:, :, :hist_len, :],
+            )
+
+        for entry, hist_len in zip(entries, hist_lengths):
+            key_states = entry["key_states"]
+            valid_mask = entry["valid_mask"]
             mixed_hidden = avg_hidden
             if mixed_hidden is None:
                 mixed_hidden = self._mixed_hidden_window(entry, entry_by_layer, group_layers, hidden_len)
@@ -333,9 +342,11 @@ class SnapKVNeighborShared:
             attn_probs = F.softmax(query_scores, dim=-1, dtype=torch.float32)
             attn_probs = torch.where(hist_valid[:, :, None, :], attn_probs, torch.zeros_like(attn_probs))
             attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            value_output_l1 = self._value_output_l1_norm(
-                entry["attention"],
-                entry["value_states"][:, :, :hist_len, :],
+            value_output_l1 = self._mixed_value_output_l1_norm(
+                entry,
+                group_layers,
+                value_output_l1_by_layer,
+                hist_len,
             )
             value_output_l1 = value_output_l1.to(device=attn_probs.device, dtype=attn_probs.dtype)
             attn_probs = (attn_probs + self.importance_epsilon) * value_output_l1[:, :, None, :]
@@ -351,7 +362,6 @@ class SnapKVNeighborShared:
             pooled_scores = self._normalize_scores_for_global_rank(pooled_scores, hist_valid)
             score_tensors.append(pooled_scores)
             valid_tensors.append(hist_valid)
-            hist_lengths.append(hist_len)
 
         batch_size = entries[0]["key_states"].shape[0]
         num_kv_heads = entries[0]["key_states"].shape[1]
@@ -441,6 +451,46 @@ class SnapKVNeighborShared:
                 group_norm = cur_norm if group_norm is None else torch.maximum(group_norm, cur_norm)
             per_kv_head.append(group_norm)
         return torch.stack(per_kv_head, dim=1)
+
+    def _mixed_value_output_l1_norm(
+        self,
+        entry,
+        group_layers,
+        value_output_l1_by_layer,
+        hist_len,
+    ):
+        target_layer = int(entry["layer_idx"])
+        local_l1 = value_output_l1_by_layer[target_layer][:, :, :hist_len]
+        mix = self._target_value_output_mix(group_layers, target_layer)
+        if len(mix) == 1 and int(mix[0][0]) == target_layer:
+            return local_l1
+
+        mixed_l1 = torch.zeros_like(local_l1, dtype=torch.float32)
+        weight_sum = torch.zeros_like(local_l1, dtype=torch.float32)
+        for source_layer, weight in mix:
+            source_l1 = value_output_l1_by_layer.get(int(source_layer))
+            if source_l1 is None:
+                continue
+            shared_len = min(hist_len, source_l1.shape[-1])
+            if shared_len < 1:
+                continue
+            source_weight = float(weight)
+            source_l1 = source_l1[:, :, :shared_len].to(device=mixed_l1.device, dtype=mixed_l1.dtype)
+            mixed_l1[:, :, :shared_len] = mixed_l1[:, :, :shared_len] + source_l1 * source_weight
+            weight_sum[:, :, :shared_len] = weight_sum[:, :, :shared_len] + source_weight
+
+        has_mix = weight_sum > 0
+        mixed_l1 = mixed_l1 / weight_sum.clamp_min(self.importance_epsilon)
+        return torch.where(has_mix, mixed_l1.to(device=local_l1.device, dtype=local_l1.dtype), local_l1)
+
+    def _target_value_output_mix(self, group_layers, target_layer):
+        if self.hidden_mix_profile is None:
+            weight = 1.0 / len(group_layers)
+            return tuple((int(layer), weight) for layer in group_layers)
+        mix = self._target_mix(group_layers, target_layer)
+        if mix is None:
+            return ((int(target_layer), 1.0),)
+        return mix
 
     def _group_historical_budget(self, group_layers, num_kv_heads):
         per_layer_history = self.budget - self.window_size
