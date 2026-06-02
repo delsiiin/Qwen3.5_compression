@@ -44,6 +44,7 @@ from .methods import (
     SnapKVNeighborShared,
     StreamingLLM,
     H2O,
+    CriticalKV,
 )
 from .methods.snapkv_neighbor_shared import masked_eager_attention_forward
 
@@ -55,6 +56,7 @@ KV_COMPRESSION_MAP = {
     "snapkv_neighbor_shared": SnapKVNeighborShared,
     "streamingllm": StreamingLLM,
     "h2o": H2O,
+    "criticalkv": CriticalKV,
 }
 
 logger = logging.get_logger(__name__)
@@ -246,6 +248,8 @@ def Llama_Attention_init(self, config: LlamaConfig, layer_idx: int, compression_
         model_type="llama",
         **compression_config["method_config"],
     )
+    if hasattr(self.kv_cluster, "bind_attention"):
+        self.kv_cluster.bind_attention(self)
     # =============== New logic end =================
 
 def Qwen3_Attention_init(self, config: Qwen3Config, layer_idx: int, compression_config: dict):
@@ -282,6 +286,8 @@ def Qwen3_Attention_init(self, config: Qwen3Config, layer_idx: int, compression_
         model_type="qwen3",
         **compression_config["method_config"],
     )
+    if hasattr(self.kv_cluster, "bind_attention"):
+        self.kv_cluster.bind_attention(self)
     # =============== New logic end =================
 
 def Qwen3Moe_Attention_init(self, config: Qwen3MoeConfig, layer_idx: int, compression_config: dict):
@@ -317,6 +323,8 @@ def Qwen3Moe_Attention_init(self, config: Qwen3MoeConfig, layer_idx: int, compre
         model_type="qwen3_moe",
         **compression_config["method_config"],
     )
+    if hasattr(self.kv_cluster, "bind_attention"):
+        self.kv_cluster.bind_attention(self)
     # =============== New logic end =================
 
 def Qwen3_5Attention_init(
@@ -365,6 +373,8 @@ def Qwen3_5Attention_init(
         model_type="qwen3.5",
         **compression_config["method_config"],
     )
+    if hasattr(self.kv_cluster, "bind_attention"):
+        self.kv_cluster.bind_attention(self)
     # =============== New logic end =================
 
 def Llama_Attention_forward(
