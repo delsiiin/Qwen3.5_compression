@@ -1,6 +1,7 @@
 import torch
 
 from . import compute_attention_scores
+import torch.nn.functional as F
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -75,15 +76,23 @@ class CriticalKV:
         WoV_norm = WoV_norm.view(bsz, num_key_value_heads, module.num_key_value_groups, q_len).mean(dim=2)
         return WoV_norm
 
-    def score(self, key_states, query_states):
+    def score(self, key_states, query_states, recent_window):
         attn_weights = compute_attention_scores(query_states, key_states)
+        history_len = attn_weights.shape[-1] - recent_window
         query_window = min(self.window_size, attn_weights.shape[-2])
         scores = torch.softmax(
-            attn_weights[:, :, -query_window:, :],
+            attn_weights[:, :, -query_window:, :history_len],
             dim=-1,
             dtype=torch.float32,
+        ).mean(dim=-2).to(query_states.dtype)
+
+        scores = F.max_pool1d(
+            scores,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
         )
-        return scores.mean(dim=-2).to(query_states.dtype)
+        return scores
 
     def update_kv(
         self,
@@ -99,36 +108,70 @@ class CriticalKV:
         if kv_cache_len <= self.budget:
             return key_states, value_states
 
-        scores = self.score(key_states, query_states)
-        selection_budget = int(self.budget * self.first_stage_ratio)
+        recent_window = min(self.window_size, kv_cache_len)
+        history_len = kv_cache_len - recent_window
+        history_budget = self.budget - recent_window
+
+        if history_budget <= 0:
+            key_states = key_states[:, :, history_len:, :]
+            value_states = value_states[:, :, history_len:, :]
+            if self.record_kept_token_indices:
+                empty_scores = key_states.new_empty(key_states.shape[0], key_states.shape[1], 0)
+                empty_indices = torch.empty(
+                    key_states.shape[0],
+                    key_states.shape[1],
+                    0,
+                    dtype=torch.long,
+                    device=key_states.device,
+                )
+                self._record_kept_tokens(empty_indices, empty_scores, kv_cache_len, recent_window)
+            return key_states, value_states
+
+        scores = self.score(key_states, query_states, recent_window)
+        selection_budget = min(int(history_budget * self.first_stage_ratio), history_len)
         if selection_budget > 0:
             top_k_index = torch.topk(scores, selection_budget, sorted=True, dim=-1).indices
 
-        projected_norm = self.vwl1norm(value_states, self.attention).to(device=scores.device, dtype=scores.dtype)
+        projected_norm = self.vwl1norm(value_states[:, :, :history_len, :], self.attention).to(
+            device=scores.device, dtype=scores.dtype
+        )
         scores = (scores + self.epsilon) * projected_norm
 
         if selection_budget > 0:
             scores.scatter_(-1, top_k_index, torch.finfo(scores.dtype).max)
 
-        indices = torch.topk(scores, self.budget, sorted=True, dim=-1).indices
+        indices = torch.topk(scores, history_budget, sorted=True, dim=-1).indices
 
         if self.record_kept_token_indices:
-            self._record_kept_tokens(indices, scores, kv_cache_len)
+            self._record_kept_tokens(indices, scores, kv_cache_len, recent_window)
 
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        key_states = key_states.gather(dim=2, index=indices)
-        value_states = value_states.gather(dim=2, index=indices)
+        k_past_compress = key_states[:, :, :history_len, :].gather(dim=2, index=indices)
+        v_past_compress = value_states[:, :, :history_len, :].gather(dim=2, index=indices)
+        k_cur = key_states[:, :, history_len:, :]
+        v_cur = value_states[:, :, history_len:, :]
+        key_states = torch.cat([k_past_compress, k_cur], dim=2)
+        value_states = torch.cat([v_past_compress, v_cur], dim=2)
         return key_states, value_states
 
-    def _record_kept_tokens(self, indices, scores, kv_cache_len):
+    def _record_kept_tokens(self, indices, scores, kv_cache_len, recent_window):
         indices_cl = indices.clone().squeeze(0).to("cpu")
         score_cl = scores.clone().squeeze(0).to("cpu")
-        kept_scores = torch.gather(score_cl, dim=1, index=indices_cl)
+        recent_window_indices = torch.arange(
+            kv_cache_len - recent_window, kv_cache_len, device="cpu"
+        ).expand(indices_cl.shape[0], -1)
+        cur_indices = torch.cat([indices_cl, recent_window_indices], dim=-1)
 
-        cur_indices = indices_cl
+        recent_scores = score_cl.new_full(
+            (score_cl.shape[0], recent_window),
+            torch.finfo(score_cl.dtype).max,
+        )
+        score_cl = torch.cat([score_cl, recent_scores], dim=-1)
+        kept_scores = torch.gather(score_cl, dim=1, index=cur_indices)
+
         if self.evicted_token_num > 0:
             prev_indices = self.kept_token_indices[-1]
-            mask = cur_indices < self.budget
+            mask = cur_indices < prev_indices.shape[-1]
 
             for i in range(cur_indices.shape[0]):
                 positions = torch.where(mask[i])[0]
@@ -140,4 +183,4 @@ class CriticalKV:
 
         self.kept_attention_scores.append(kept_scores)
         self.kept_token_indices.append(cur_indices)
-        self.evicted_token_num += kv_cache_len - self.budget
+        self.evicted_token_num += kv_cache_len - cur_indices.shape[-1]
