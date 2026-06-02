@@ -46,6 +46,7 @@ from .methods import (
     H2O,
     CriticalKV,
     DefensiveKV,
+    LaProx,
 )
 from .methods.snapkv_neighbor_shared import masked_eager_attention_forward
 
@@ -59,6 +60,7 @@ KV_COMPRESSION_MAP = {
     "h2o": H2O,
     "criticalkv": CriticalKV,
     "defensivekv": DefensiveKV,
+    "laprox": LaProx,
 }
 
 logger = logging.get_logger(__name__)

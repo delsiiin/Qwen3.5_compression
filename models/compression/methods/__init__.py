@@ -6,5 +6,6 @@ from .streamingllm import StreamingLLM
 from .h2o import H2O
 from .criticalkv import CriticalKV
 from .defensivekv import DefensiveKV
+from .laprox import LaProx
 
-__all__ = ["SnapKV", "SnapKVNeighborShared", "StreamingLLM", "H2O", "CriticalKV", "DefensiveKV"]
+__all__ = ["SnapKV", "SnapKVNeighborShared", "StreamingLLM", "H2O", "CriticalKV", "DefensiveKV", "LaProx"]
