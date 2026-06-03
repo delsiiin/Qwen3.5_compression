@@ -15,6 +15,7 @@ from attn_heatmap import (
     is_qwen_attn_heatmap_model,
 )
 from attn_output_ratio import AttnOutputRatioRunWriter
+from hidden_state_pca_observation import HiddenStatePCARunWriter
 from misc import (
     build_output_path,
     load_json,
@@ -303,6 +304,7 @@ def query_llm(
     attn_output_ratio_sample_writer=None,
     query_window_sample_writer=None,
     snapkv_observation_sample_writer=None,
+    hidden_state_pca_sample_writer=None,
     prefill_label="response",
 ):
     max_input_len = get_max_input_len(model_maxlen, max_new_tokens)
@@ -338,6 +340,14 @@ def query_llm(
         )
     if snapkv_observation_sample_writer is not None:
         snapkv_observation_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
+    if hidden_state_pca_sample_writer is not None:
+        hidden_state_pca_sample_writer.capture_prefill(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt,
@@ -424,6 +434,20 @@ def build_attn_output_ratio_run_writer(args, out_file):
     )
 
 
+def build_hidden_state_pca_run_writer(args, out_file):
+    if not args.hidden_state_pca_mode:
+        return None
+    return HiddenStatePCARunWriter(
+        root_dir=args.hidden_state_pca_dir,
+        model_name=args.model,
+        out_file=out_file,
+        max_prefill_tokens=args.hidden_state_pca_max_prefill_tokens,
+        layer_spec=args.hidden_state_pca_layers,
+        token_start=args.hidden_state_pca_token_start,
+        token_end=args.hidden_state_pca_token_end,
+    )
+
+
 def validate_args(args):
     if args.model_maxlen < 1:
         raise ValueError("--model_maxlen must be at least 1.")
@@ -439,6 +463,15 @@ def validate_args(args):
         raise ValueError("--query_window_max_prefill_tokens must be at least 1 when provided.")
     if args.attn_output_ratio_max_prefill_tokens is not None and args.attn_output_ratio_max_prefill_tokens < 1:
         raise ValueError("--attn_output_ratio_max_prefill_tokens must be at least 1 when provided.")
+    if args.hidden_state_pca_max_prefill_tokens is not None and args.hidden_state_pca_max_prefill_tokens < 1:
+        raise ValueError("--hidden_state_pca_max_prefill_tokens must be at least 1 when provided.")
+    if (
+        args.hidden_state_pca_token_end is not None
+        and args.hidden_state_pca_token_start >= 0
+        and args.hidden_state_pca_token_end >= 0
+        and args.hidden_state_pca_token_end <= args.hidden_state_pca_token_start
+    ):
+        raise ValueError("--hidden_state_pca_token_end must be greater than --hidden_state_pca_token_start.")
     if args.query_window_similarity_submode not in SUPPORTED_SIMILARITY_STATES:
         raise ValueError(
             "--query_window_similarity_submode must be one of "
@@ -453,6 +486,8 @@ def validate_args(args):
         raise ValueError("--query_window_similarity_mode currently requires --n_proc 1.")
     if args.attn_output_ratio_mode and args.n_proc != 1:
         raise ValueError("--attn_output_ratio_mode currently requires --n_proc 1.")
+    if args.hidden_state_pca_mode and args.n_proc != 1:
+        raise ValueError("--hidden_state_pca_mode currently requires --n_proc 1.")
     validate_snapkv_observation_args(args)
 
 def get_pred(data, args, fout, out_file):
@@ -469,6 +504,7 @@ def get_pred(data, args, fout, out_file):
     query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
     attn_output_ratio_run_writer = build_attn_output_ratio_run_writer(args, out_file)
     snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
+    hidden_state_pca_run_writer = build_hidden_state_pca_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
@@ -485,6 +521,11 @@ def get_pred(data, args, fout, out_file):
         snapkv_observation_sample_writer = (
             snapkv_observation_run_writer.new_sample(item)
             if snapkv_observation_run_writer is not None
+            else None
+        )
+        hidden_state_pca_sample_writer = (
+            hidden_state_pca_run_writer.new_sample(item)
+            if hidden_state_pca_run_writer is not None
             else None
         )
         try:
@@ -515,6 +556,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="cot_reasoning",
                 )
             else:
@@ -531,6 +573,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="response",
                 )
             if output == '':
@@ -552,6 +595,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="cot_answer_extraction",
                 )
                 if output == '':
@@ -582,6 +626,12 @@ def get_pred(data, args, fout, out_file):
                     snapkv_observation_sample_writer.sample_dir,
                     start=args.snapkv_observation_dir,
                 )
+            if hidden_state_pca_sample_writer is not None:
+                item["hidden_state_pca_status"] = hidden_state_pca_sample_writer.build_capture_status()
+                item["hidden_state_pca_artifact"] = os.path.relpath(
+                    hidden_state_pca_sample_writer.sample_dir,
+                    start=args.hidden_state_pca_dir,
+                )
             if attn_sample_writer is not None:
                 attn_sample_writer.finalize(item)
             if query_window_sample_writer is not None:
@@ -590,6 +640,8 @@ def get_pred(data, args, fout, out_file):
                 attn_output_ratio_sample_writer.finalize(item)
             if snapkv_observation_sample_writer is not None:
                 snapkv_observation_sample_writer.finalize(item)
+            if hidden_state_pca_sample_writer is not None:
+                hidden_state_pca_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
             fout.flush()
         except Exception as exc:
@@ -625,6 +677,14 @@ def get_pred(data, args, fout, out_file):
                     start=args.snapkv_observation_dir,
                 )
                 snapkv_observation_sample_writer.finalize(item)
+            if hidden_state_pca_sample_writer is not None:
+                item["error"] = str(exc)
+                item["hidden_state_pca_status"] = hidden_state_pca_sample_writer.build_capture_status()
+                item["hidden_state_pca_artifact"] = os.path.relpath(
+                    hidden_state_pca_sample_writer.sample_dir,
+                    start=args.hidden_state_pca_dir,
+                )
+                hidden_state_pca_sample_writer.finalize(item)
             continue
 
 
@@ -695,6 +755,12 @@ if __name__ == "__main__":
     parser.add_argument("--attn_output_ratio_dir", type=str, default="output_dir/results_longbench/attn_output_ratios")
     parser.add_argument("--attn_output_ratio_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25. Raw npz always stores every captured layer.")
     parser.add_argument("--attn_output_ratio_max_prefill_tokens", type=int, default=None, help="Skip attention-output ratio capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--hidden_state_pca_mode", action="store_true", help="Capture per-layer key/value states for one token span during prefill and plot separate shared-PCA 2D scatters for key and value states.")
+    parser.add_argument("--hidden_state_pca_dir", type=str, default="output_dir/results_longbench/hidden_state_pca")
+    parser.add_argument("--hidden_state_pca_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25.")
+    parser.add_argument("--hidden_state_pca_token_start", type=int, default=0, help="Start token index for hidden-state PCA span. Negative values count from the prompt end.")
+    parser.add_argument("--hidden_state_pca_token_end", type=int, default=None, help="Exclusive end token index for hidden-state PCA span. Defaults to the prompt end; negative values count from the prompt end.")
+    parser.add_argument("--hidden_state_pca_max_prefill_tokens", type=int, default=None, help="Skip hidden-state PCA capture when the prefill token count exceeds this cap.")
     add_snapkv_observation_args(parser)
     args = parser.parse_args()
     main(args)
