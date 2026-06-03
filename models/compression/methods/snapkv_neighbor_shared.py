@@ -360,6 +360,12 @@ class SnapKVNeighborShared:
                 hist_len,
             )
             scores = scores.mean(dim=2).mean(dim=-2)
+            scores = F.max_pool1d(
+                scores.to(query_states.dtype),
+                kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2,
+                stride=1,
+            )
             value_output_l1 = self._value_output_l1_norm(
                 entry["attention"],
                 entry["value_states"][:, :, :hist_len, :],
@@ -367,16 +373,10 @@ class SnapKVNeighborShared:
             value_output_l1 = value_output_l1.to(device=scores.device, dtype=scores.dtype)
             scores = (scores + self.importance_epsilon) * value_output_l1
             scores = torch.where(hist_valid, scores, torch.zeros_like(scores))
-            pooled_scores = F.max_pool1d(
-                scores.to(query_states.dtype),
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-            pooled_scores = pooled_scores.masked_fill(~hist_valid, torch.finfo(pooled_scores.dtype).min)
+            scores = scores.masked_fill(~hist_valid, torch.finfo(scores.dtype).min)
             # Put each layer/head distribution on a common scale before the shared top-k.
-            pooled_scores = self._normalize_scores_for_global_rank(pooled_scores, hist_valid)
-            score_tensors.append(pooled_scores)
+            scores = self._normalize_scores_for_global_rank(scores, hist_valid)
+            score_tensors.append(scores)
             valid_tensors.append(hist_valid)
             hist_lengths.append(hist_len)
 
