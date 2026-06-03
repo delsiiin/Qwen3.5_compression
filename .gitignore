@@ -55,3 +55,7 @@ Thumbs.db
 *.pdf
 *.csv
 *.npz
+
+# Keep the Paul Graham essay dataset tracked.
+!data/PaulGrahamEssays/
+!data/PaulGrahamEssays/**
