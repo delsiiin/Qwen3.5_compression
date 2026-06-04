@@ -263,6 +263,65 @@ def plot_attn_output_ratio_density(
     plt.close(fig)
 
 
+def plot_attn_output_l2_norm_heatmap(
+    attn_output_l2_norms,
+    layer_indices,
+    output_path,
+    title,
+):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    values = np.asarray(attn_output_l2_norms, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"attn_output_l2_norms must be 2D, got shape {values.shape}.")
+    if values.shape[0] != len(layer_indices):
+        raise ValueError(
+            "Layer count mismatch for attn_output_l2_norms heatmap: "
+            f"{values.shape[0]} rows vs {len(layer_indices)} layer indices."
+        )
+
+    token_count = values.shape[1]
+    fig_width = min(18.0, max(8.0, token_count / 45.0))
+    fig_height = min(12.0, max(4.8, len(layer_indices) * 0.28 + 1.8))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=180)
+
+    cbar_kws = {"label": r"$\Vert\Delta_{\mathrm{attn}}\Vert_2$"}
+    sns.heatmap(
+        values,
+        ax=ax,
+        cmap="mako",
+        cbar=True,
+        cbar_kws=cbar_kws,
+        xticklabels=False,
+        yticklabels=[str(layer_idx) for layer_idx in layer_indices],
+        rasterized=True,
+    )
+
+    if token_count > 0:
+        tick_count = min(12, token_count)
+        tick_positions = np.linspace(0, token_count - 1, num=tick_count).round().astype(int)
+        ax.set_xticks(tick_positions + 0.5)
+        ax.set_xticklabels([str(token_pos + 1) for token_pos in tick_positions.tolist()], rotation=0, fontsize=8)
+        ax.set_xlabel(
+            "Sequence length",
+            fontsize=12,
+            fontweight="bold",
+        )
+    else:
+        ax.set_xlabel("Sequence length", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Layer", fontsize=12, fontweight="bold")
+    ax.set_title(title, fontsize=15, fontweight="bold")
+
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 
 class AttnOutputRatioRunWriter:
     def __init__(
@@ -360,6 +419,7 @@ class AttnOutputRatioSampleWriter:
             "tokens": build_token_entries(tokenizer, input_ids),
             "ratio_file": None,
             "density_plot_file": None,
+            "attn_output_l2_heatmap_file": None,
             "ratio_shape": None,
             "layer_indices": [],
             "token_mixer_names": [],
@@ -380,15 +440,18 @@ class AttnOutputRatioSampleWriter:
             )
             ratio_file_name = f"prefill_{prefill_index:03d}_attn_output_hidden_l2_ratio.npz"
             density_plot_file_name = f"prefill_{prefill_index:03d}_attn_output_hidden_l2_ratio_density.png"
+            l2_heatmap_file_name = f"prefill_{prefill_index:03d}_attn_output_l2_norm_heatmap.png"
             ratio_path = os.path.join(self.sample_dir, ratio_file_name)
             density_plot_path = os.path.join(self.sample_dir, density_plot_file_name)
+            l2_heatmap_path = os.path.join(self.sample_dir, l2_heatmap_file_name)
+            token_ids = input_ids[: ratios.shape[1]]
             np.savez_compressed(
                 ratio_path,
                 ratios=ratios.astype(np.float32, copy=False),
                 input_l2_norms=input_l2_norms.astype(np.float32, copy=False),
                 attn_output_l2_norms=attn_output_l2_norms.astype(np.float32, copy=False),
                 layer_indices=np.asarray(layer_indices, dtype=np.int16),
-                token_ids=np.asarray(input_ids[: ratios.shape[1]], dtype=np.int64),
+                token_ids=np.asarray(token_ids, dtype=np.int64),
                 token_mixer_names=np.asarray(mixer_names),
                 ratio_metric=np.asarray(ATTN_OUTPUT_RATIO_METRIC),
                 ratio_reduction=np.asarray(ATTN_OUTPUT_RATIO_REDUCTION),
@@ -408,6 +471,13 @@ class AttnOutputRatioSampleWriter:
                     layer_spec=self.run_writer.layer_spec,
                 )
                 record["density_plot_file"] = density_plot_file_name
+                plot_attn_output_l2_norm_heatmap(
+                    attn_output_l2_norms=attn_output_l2_norms,
+                    layer_indices=layer_indices,
+                    output_path=l2_heatmap_path,
+                    title=f"Random Sample {self.sample_index + 1} Attention Output L2 Norms",
+                )
+                record["attn_output_l2_heatmap_file"] = l2_heatmap_file_name
             except Exception as plot_exc:
                 record["status"] = "saved_npz_plot_error"
                 record["plot_error"] = str(plot_exc)
