@@ -178,14 +178,6 @@ def build_group_budget_stats(groups, ratio_layer_sums):
     return group_sums, budget_weights
 
 
-def _softmax(values, temperature):
-    if temperature <= 0.0:
-        raise ValueError("temperature must be positive.")
-    scaled = np.asarray(values, dtype=np.float64) / float(temperature)
-    scaled = scaled - np.max(scaled)
-    exp_values = np.exp(scaled)
-    return exp_values / np.sum(exp_values)
-
 
 def build_profile_from_similarity(
     similarity,
@@ -194,16 +186,12 @@ def build_profile_from_similarity(
     similarity_state="hidden_states",
     group_threshold=0.85,
     max_group_size=6,
-    temperature=0.05,
-    min_weight=0.03,
     attn_output_ratio=None,
     attn_output_ratio_layer_indices=None,
     group_scheme=GROUP_SCHEME_SIMILARITY,
     key_pca_adjacent_angles_deg=None,
     key_pca_angle_threshold=90.0,
 ):
-    if min_weight < 0.0:
-        raise ValueError("min_weight must be non-negative.")
     similarity = np.asarray(similarity, dtype=np.float64)
     layer_indices = np.asarray(layer_indices, dtype=np.int64)
     if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
@@ -213,7 +201,6 @@ def build_profile_from_similarity(
     if group_scheme not in SUPPORTED_GROUP_SCHEMES:
         raise ValueError(f"group_scheme must be one of {SUPPORTED_GROUP_SCHEMES}.")
 
-    layer_to_pos = {int(layer): pos for pos, layer in enumerate(layer_indices.tolist())}
     if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
         if key_pca_adjacent_angles_deg is None:
             raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
@@ -245,25 +232,7 @@ def build_profile_from_similarity(
 
     profile_groups = []
     for group_idx, layers in enumerate(groups):
-        mix = {}
-        source_positions = [layer_to_pos[int(layer)] for layer in layers]
-        for target_layer in layers:
-            target_pos = layer_to_pos[int(target_layer)]
-            scores = similarity[target_pos, source_positions]
-            weights = _softmax(scores, temperature)
-            kept = [
-                (int(source_layer), float(weight))
-                for source_layer, weight in zip(layers, weights)
-                if float(weight) >= float(min_weight)
-            ]
-            if not kept:
-                kept = [(int(target_layer), 1.0)]
-            weight_sum = sum(weight for _source, weight in kept)
-            mix[str(int(target_layer))] = {
-                "sources": [source for source, _weight in kept],
-                "weights": [weight / weight_sum for _source, weight in kept],
-            }
-        group_profile = {"layers": [int(layer) for layer in layers], "mix": mix}
+        group_profile = {"layers": [int(layer) for layer in layers]}
         if group_ratio_sums is not None:
             group_profile["attn_output_ratio_sum"] = float(group_ratio_sums[group_idx])
             group_profile["budget_weight"] = float(group_budget_weights[group_idx])
@@ -283,8 +252,6 @@ def build_profile_from_similarity(
         "group_threshold": float(group_threshold),
         "key_pca_angle_threshold": float(key_pca_angle_threshold),
         "max_group_size": int(max_group_size),
-        "temperature": float(temperature),
-        "min_weight": float(min_weight),
         "actual_window_size": None if actual_window_size is None else int(actual_window_size),
         "layer_count": int(len(layer_indices)),
         "group_sizes": [len(group) for group in groups],
@@ -309,8 +276,6 @@ def build_profile_from_npz(
     group_threshold=0.85,
     key_pca_angle_threshold=90.0,
     max_group_size=6,
-    temperature=0.05,
-    min_weight=0.03,
 ):
     similarity, layer_indices, actual_window_size, similarity_state = load_similarity_npz(similarity_npz)
     attn_output_ratio = None
@@ -332,8 +297,6 @@ def build_profile_from_npz(
         group_threshold=group_threshold,
         key_pca_angle_threshold=key_pca_angle_threshold,
         max_group_size=max_group_size,
-        temperature=temperature,
-        min_weight=min_weight,
         attn_output_ratio=attn_output_ratio,
         attn_output_ratio_layer_indices=attn_output_ratio_layer_indices,
         group_scheme=group_scheme,
@@ -368,8 +331,6 @@ def parse_args():
     parser.add_argument("--group_threshold", type=float, default=0.85)
     parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
     parser.add_argument("--max_group_size", type=int, default=6)
-    parser.add_argument("--temperature", type=float, default=0.05)
-    parser.add_argument("--min_weight", type=float, default=0.03)
     return parser.parse_args()
 
 
@@ -383,8 +344,6 @@ def main():
         group_threshold=args.group_threshold,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
         max_group_size=args.max_group_size,
-        temperature=args.temperature,
-        min_weight=args.min_weight,
     )
     output_path = write_profile(profile, args.output)
     print(output_path)

@@ -103,45 +103,13 @@ class SnapKVNeighborShared:
                     raise ValueError(f"Layer {layer} appears in multiple hidden mix groups.")
                 layer_to_group[layer] = layers
 
-            layer_set = set(layers)
             budget_weight = group_spec.get("budget_weight")
             if budget_weight is not None:
                 budget_weight = float(budget_weight)
                 if (not math.isfinite(budget_weight)) or budget_weight < 0.0:
                     raise ValueError(f"Profile group {group_idx} budget_weight must be finite and non-negative.")
 
-            mix_spec = group_spec.get("mix", {})
-            if mix_spec is None:
-                mix_spec = {}
-            if not isinstance(mix_spec, dict):
-                raise ValueError(f"Profile group {group_idx} field 'mix' must be an object.")
-            mix = {}
-            for target_key, target_spec in mix_spec.items():
-                target_layer = int(target_key)
-                if target_layer not in layer_set:
-                    raise ValueError(f"Mix target layer {target_layer} is not in group {layers}.")
-                if not isinstance(target_spec, dict):
-                    raise ValueError(f"Mix target {target_layer} must be an object.")
-                sources = target_spec.get("sources")
-                weights = target_spec.get("weights")
-                if not isinstance(sources, list) or not sources:
-                    raise ValueError(f"Mix target {target_layer} requires non-empty sources.")
-                if not isinstance(weights, list) or len(weights) != len(sources):
-                    raise ValueError(f"Mix target {target_layer} requires one weight per source.")
-                sources = tuple(int(source) for source in sources)
-                for source in sources:
-                    if source not in layer_set:
-                        raise ValueError(f"Mix source layer {source} is not in target {target_layer} group {layers}.")
-                weights = tuple(float(weight) for weight in weights)
-                if any((not math.isfinite(weight)) or weight < 0.0 for weight in weights):
-                    raise ValueError(f"Mix target {target_layer} weights must be finite and non-negative.")
-                weight_sum = sum(weights)
-                if weight_sum <= 0.0:
-                    raise ValueError(f"Mix target {target_layer} weights must sum to a positive value.")
-                mix[target_layer] = tuple(
-                    (source, weight / weight_sum) for source, weight in zip(sources, weights)
-                )
-            group_profiles[layers] = {"mix": mix, "budget_weight": budget_weight}
+            group_profiles[layers] = {"budget_weight": budget_weight}
 
         budget_weights = [group["budget_weight"] for group in group_profiles.values()]
         has_budget_weights = all(weight is not None for weight in budget_weights)
@@ -300,15 +268,6 @@ class SnapKVNeighborShared:
             return
 
         hidden_len = min(entry["hidden_window"].shape[-2] for entry in entries)
-        entry_by_layer = {int(entry["layer_idx"]): entry for entry in entries}
-        avg_hidden = None
-        if self.hidden_mix_profile is None:
-            avg_device = entries[-1]["hidden_window"].device
-            avg_dtype = entries[-1]["hidden_window"].dtype
-            avg_hidden = sum(
-                entry["hidden_window"][:, -hidden_len:, :].to(device=avg_device, dtype=avg_dtype)
-                for entry in entries
-            ) / len(entries)
         score_tensors = []
         valid_tensors = []
         hist_lengths = []
@@ -318,13 +277,10 @@ class SnapKVNeighborShared:
             hist_len = key_states.shape[-2] - self.window_size
             if hist_len < 1:
                 return
-            
-            mixed_hidden = avg_hidden
-            if mixed_hidden is None:
-                mixed_hidden = self._mixed_hidden_window(entry, entry_by_layer, group_layers, hidden_len)
+
             query_states = self._project_query_window(
                 entry["attention"],
-                mixed_hidden,
+                entry["hidden_window"][:, -hidden_len:, :],
                 self._slice_position_window(entry["position_window"], hidden_len),
             )
             attn_scores = compute_attention_scores(query_states, key_states)
@@ -480,30 +436,6 @@ class SnapKVNeighborShared:
             return len(group_layers) * num_kv_heads * per_layer_history
         total_hist_budget = int(profiled_layer_count) * num_kv_heads * per_layer_history
         return max(1, int(round(total_hist_budget * float(budget_weight) / float(total_weight))))
-
-    def _mixed_hidden_window(self, entry, entry_by_layer, group_layers, hidden_len):
-        target_layer = int(entry["layer_idx"])
-        mix = self._target_mix(group_layers, target_layer)
-        if mix is None:
-            return entry["hidden_window"][:, -hidden_len:, :]
-
-        device = entry["hidden_window"].device
-        dtype = entry["hidden_window"].dtype
-        mixed_hidden = None
-        for source_layer, weight in mix:
-            source_hidden = entry_by_layer[int(source_layer)]["hidden_window"][:, -hidden_len:, :]
-            source_hidden = source_hidden.to(device=device, dtype=dtype)
-            weighted = source_hidden * weight
-            mixed_hidden = weighted if mixed_hidden is None else mixed_hidden + weighted
-        return mixed_hidden
-
-    def _target_mix(self, group_layers, target_layer):
-        if self.hidden_mix_profile is None:
-            return None
-        group = self.hidden_mix_profile["groups"].get(tuple(group_layers))
-        if group is None:
-            return None
-        return group["mix"].get(int(target_layer))
 
     def _pack_layer(self, entry, selected_hist_mask, hist_len):
         key_states = entry["key_states"]
