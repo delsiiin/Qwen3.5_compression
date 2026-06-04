@@ -162,20 +162,61 @@ def split_layer_groups_by_key_pca_angle(
     return groups
 
 
-def build_group_budget_stats(groups, ratio_layer_sums):
-    group_sums = []
+def build_group_budget_stats(groups, ratio_layer_scores):
+    group_scores = []
     for layers in groups:
-        missing = [int(layer) for layer in layers if int(layer) not in ratio_layer_sums]
+        missing = [int(layer) for layer in layers if int(layer) not in ratio_layer_scores]
         if missing:
             raise ValueError(f"attn output ratio npz is missing layers required by similarity profile: {missing}")
-        group_sums.append(float(sum(ratio_layer_sums[int(layer)] for layer in layers)))
+        group_scores.append(float(sum(ratio_layer_scores[int(layer)] for layer in layers)))
 
-    total_sum = float(sum(group_sums))
+    total_score = float(sum(group_scores))
     budget_weights = [
-        (group_sum / total_sum) if total_sum > 0.0 else 0.0
-        for group_sum in group_sums
+        (group_score / total_score) if total_score > 0.0 else 0.0
+        for group_score in group_scores
     ]
-    return group_sums, budget_weights
+    return group_scores, budget_weights
+
+
+def build_group_mix(similarity, layer_indices, groups, temperature=0.1, min_weight=0.0):
+    if temperature <= 0.0:
+        raise ValueError("temperature must be greater than 0.")
+    if min_weight < 0.0:
+        raise ValueError("min_weight must be non-negative.")
+
+    layer_to_pos = {int(layer): pos for pos, layer in enumerate(layer_indices.tolist())}
+    group_mixes = []
+    for layers in groups:
+        mix = {}
+        for target_layer in layers:
+            target_pos = layer_to_pos[int(target_layer)]
+            source_layers = [int(layer) for layer in layers]
+            source_positions = [layer_to_pos[layer] for layer in source_layers]
+            logits = similarity[target_pos, source_positions] / float(temperature)
+            logits = logits - np.max(logits)
+            weights = np.exp(logits)
+            weight_sum = float(np.sum(weights))
+            if weight_sum <= 0.0 or not np.isfinite(weight_sum):
+                mix[str(int(target_layer))] = {"sources": [int(target_layer)], "weights": [1.0]}
+                continue
+
+            weights = weights / weight_sum
+            kept = [
+                (source, float(weight))
+                for source, weight in zip(source_layers, weights.tolist())
+                if float(weight) >= float(min_weight)
+            ]
+            kept_weight_sum = float(sum(weight for _, weight in kept))
+            if kept_weight_sum <= 0.0 or not np.isfinite(kept_weight_sum):
+                mix[str(int(target_layer))] = {"sources": [int(target_layer)], "weights": [1.0]}
+                continue
+
+            mix[str(int(target_layer))] = {
+                "sources": [source for source, _ in kept],
+                "weights": [weight / kept_weight_sum for _, weight in kept],
+            }
+        group_mixes.append(mix)
+    return group_mixes
 
 
 
@@ -191,6 +232,8 @@ def build_profile_from_similarity(
     group_scheme=GROUP_SCHEME_SIMILARITY,
     key_pca_adjacent_angles_deg=None,
     key_pca_angle_threshold=90.0,
+    temperature=0.1,
+    min_weight=0.0,
 ):
     similarity = np.asarray(similarity, dtype=np.float64)
     layer_indices = np.asarray(layer_indices, dtype=np.int64)
@@ -224,17 +267,25 @@ def build_profile_from_similarity(
             or attn_output_ratio_layer_indices.shape[0] != attn_output_ratio.shape[0]
         ):
             raise ValueError("attn_output_ratio_layer_indices must match attn_output_ratio first dimension.")
-        ratio_layer_sums = {
-            int(layer): float(np.sum(attn_output_ratio[pos]))
+        ratio_layer_scores = {
+            int(layer): float(np.var(attn_output_ratio[pos]))
             for pos, layer in enumerate(attn_output_ratio_layer_indices.tolist())
         }
-        group_ratio_sums, group_budget_weights = build_group_budget_stats(groups, ratio_layer_sums)
+        group_ratio_sums, group_budget_weights = build_group_budget_stats(groups, ratio_layer_scores)
+
+    group_mixes = build_group_mix(
+        similarity=similarity,
+        layer_indices=layer_indices,
+        groups=groups,
+        temperature=temperature,
+        min_weight=min_weight,
+    )
 
     profile_groups = []
     for group_idx, layers in enumerate(groups):
-        group_profile = {"layers": [int(layer) for layer in layers]}
+        group_profile = {"layers": [int(layer) for layer in layers], "mix": group_mixes[group_idx]}
         if group_ratio_sums is not None:
-            group_profile["attn_output_ratio_sum"] = float(group_ratio_sums[group_idx])
+            group_profile["attn_output_ratio_variance_sum"] = float(group_ratio_sums[group_idx])
             group_profile["budget_weight"] = float(group_budget_weights[group_idx])
         profile_groups.append(group_profile)
 
@@ -251,6 +302,8 @@ def build_profile_from_similarity(
         "group_scheme": str(group_scheme),
         "group_threshold": float(group_threshold),
         "key_pca_angle_threshold": float(key_pca_angle_threshold),
+        "mix_temperature": float(temperature),
+        "mix_min_weight": float(min_weight),
         "max_group_size": int(max_group_size),
         "actual_window_size": None if actual_window_size is None else int(actual_window_size),
         "layer_count": int(len(layer_indices)),
@@ -264,7 +317,7 @@ def build_profile_from_similarity(
         "groups": profile_groups,
     }
     if group_ratio_sums is not None:
-        profile["budget_weight_metric"] = "attn_output_hidden_l2_ratio_sum"
+        profile["budget_weight_metric"] = "attn_output_hidden_l2_ratio_variance_sum"
     return profile
 
 
@@ -276,6 +329,8 @@ def build_profile_from_npz(
     group_threshold=0.85,
     key_pca_angle_threshold=90.0,
     max_group_size=6,
+    temperature=0.1,
+    min_weight=0.0,
 ):
     similarity, layer_indices, actual_window_size, similarity_state = load_similarity_npz(similarity_npz)
     attn_output_ratio = None
@@ -301,6 +356,8 @@ def build_profile_from_npz(
         attn_output_ratio_layer_indices=attn_output_ratio_layer_indices,
         group_scheme=group_scheme,
         key_pca_adjacent_angles_deg=key_pca_adjacent_angles_deg,
+        temperature=temperature,
+        min_weight=min_weight,
     )
     profile["similarity_npz"] = os.path.abspath(os.path.expanduser(str(similarity_npz)))
     if attn_output_ratio_npz is not None:
@@ -331,6 +388,8 @@ def parse_args():
     parser.add_argument("--group_threshold", type=float, default=0.85)
     parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
     parser.add_argument("--max_group_size", type=int, default=6)
+    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--min_weight", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -344,6 +403,8 @@ def main():
         group_threshold=args.group_threshold,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
         max_group_size=args.max_group_size,
+        temperature=args.temperature,
+        min_weight=args.min_weight,
     )
     output_path = write_profile(profile, args.output)
     print(output_path)
