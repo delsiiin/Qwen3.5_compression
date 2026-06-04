@@ -67,13 +67,50 @@ def parse_layer_spec(layer_spec, available_layers):
     return selected
 
 
+def compute_parallel_orthogonal_components(input_hidden_states, attn_output, eps=1e-12):
+    input_vectors = input_hidden_states.detach().to(dtype=torch.float32)
+    output_vectors = attn_output.detach().to(dtype=torch.float32)
+    actual_len = min(int(input_vectors.shape[0]), int(output_vectors.shape[0]))
+    if actual_len < 1:
+        return None
+
+    input_vectors = input_vectors[:actual_len]
+    output_vectors = output_vectors[:actual_len]
+    input_sq_norms = torch.sum(input_vectors * input_vectors, dim=-1)
+    input_l2_norms = torch.sqrt(torch.clamp(input_sq_norms, min=0.0))
+    output_sq_norms = torch.sum(output_vectors * output_vectors, dim=-1)
+    attn_output_l2_norms = torch.sqrt(torch.clamp(output_sq_norms, min=0.0))
+
+    dot_products = torch.sum(input_vectors * output_vectors, dim=-1)
+    safe_input_sq_norms = torch.clamp(input_sq_norms, min=float(eps))
+    safe_input_l2_norms = torch.clamp(input_l2_norms, min=float(eps))
+    parallel_l2_norms = torch.abs(dot_products) / safe_input_l2_norms
+    perpendicular_sq_norms = torch.clamp(output_sq_norms - parallel_l2_norms * parallel_l2_norms, min=0.0)
+    perpendicular_l2_norms = torch.sqrt(perpendicular_sq_norms)
+
+    ratios = attn_output_l2_norms / safe_input_l2_norms
+    parallel_ratios = parallel_l2_norms / safe_input_l2_norms
+    perpendicular_ratios = perpendicular_l2_norms / safe_input_l2_norms
+    signed_parallel_ratios = dot_products / safe_input_sq_norms
+    return {
+        "ratios": ratios,
+        "input_l2_norms": input_l2_norms,
+        "attn_output_l2_norms": attn_output_l2_norms,
+        "parallel_l2_norms": parallel_l2_norms,
+        "perpendicular_l2_norms": perpendicular_l2_norms,
+        "parallel_ratios": parallel_ratios,
+        "perpendicular_ratios": perpendicular_ratios,
+        "signed_parallel_ratios": signed_parallel_ratios,
+    }
+
+
 def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
     layers = get_decoder_layers(model)
     if not layers:
         raise ValueError("No decoder layers were found; cannot capture attention-output ratios.")
 
     captured = {}
-    pending_input_norms = {}
+    pending_inputs = {}
     token_mixer_names = {}
     handles = []
 
@@ -82,10 +119,7 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
             hidden_states = extract_attention_arg(args, kwargs, "hidden_states", 0)
             if hidden_states is None or not torch.is_tensor(hidden_states) or hidden_states.ndim < 3:
                 return
-            pending_input_norms[layer_idx] = (
-                torch.linalg.vector_norm(hidden_states[0].detach().to(dtype=torch.float32), ord=2, dim=-1)
-                .cpu()
-            )
+            pending_inputs[layer_idx] = hidden_states[0].detach()
 
         return hook
 
@@ -94,23 +128,19 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
             attn_output = extract_token_mixer_output(output)
             if attn_output is None or not torch.is_tensor(attn_output) or attn_output.ndim < 3:
                 return
-            input_norms = pending_input_norms.pop(layer_idx, None)
-            if input_norms is None:
+            input_vectors = pending_inputs.pop(layer_idx, None)
+            if input_vectors is None:
                 return
-            output_norms = (
-                torch.linalg.vector_norm(attn_output[0].detach().to(dtype=torch.float32), ord=2, dim=-1)
-                .cpu()
+            component_values = compute_parallel_orthogonal_components(
+                input_hidden_states=input_vectors,
+                attn_output=attn_output[0],
+                eps=eps,
             )
-            actual_len = min(int(input_norms.shape[0]), int(output_norms.shape[0]))
-            if actual_len < 1:
+            if component_values is None:
                 return
-            input_norms = input_norms[:actual_len]
-            output_norms = output_norms[:actual_len]
-            ratios = output_norms / torch.clamp(input_norms, min=float(eps))
             captured[layer_idx] = {
-                "ratios": ratios.numpy().astype(np.float32, copy=False),
-                "input_l2_norms": input_norms.numpy().astype(np.float32, copy=False),
-                "attn_output_l2_norms": output_norms.numpy().astype(np.float32, copy=False),
+                key: value.cpu().numpy().astype(np.float32, copy=False)
+                for key, value in component_values.items()
             }
             token_mixer_names[layer_idx] = token_mixer_name
 
@@ -133,35 +163,87 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
         raise ValueError("No attention outputs were captured during prefill.")
 
     token_count = min(captured[layer_idx]["ratios"].shape[0] for layer_idx in layer_indices)
-    ratios = np.stack([captured[layer_idx]["ratios"][:token_count] for layer_idx in layer_indices], axis=0)
-    input_l2_norms = np.stack(
-        [captured[layer_idx]["input_l2_norms"][:token_count] for layer_idx in layer_indices],
-        axis=0,
-    )
-    attn_output_l2_norms = np.stack(
-        [captured[layer_idx]["attn_output_l2_norms"][:token_count] for layer_idx in layer_indices],
-        axis=0,
-    )
+
+    def stack_metric(metric_name):
+        return np.stack(
+            [captured[layer_idx][metric_name][:token_count] for layer_idx in layer_indices],
+            axis=0,
+        )
+
+    ratios = stack_metric("ratios")
+    input_l2_norms = stack_metric("input_l2_norms")
+    attn_output_l2_norms = stack_metric("attn_output_l2_norms")
+    parallel_l2_norms = stack_metric("parallel_l2_norms")
+    perpendicular_l2_norms = stack_metric("perpendicular_l2_norms")
+    parallel_ratios = stack_metric("parallel_ratios")
+    perpendicular_ratios = stack_metric("perpendicular_ratios")
+    signed_parallel_ratios = stack_metric("signed_parallel_ratios")
     mixer_names = [token_mixer_names.get(layer_idx, "unknown") for layer_idx in layer_indices]
-    return ratios, input_l2_norms, attn_output_l2_norms, layer_indices, mixer_names
+    return (
+        ratios,
+        input_l2_norms,
+        attn_output_l2_norms,
+        parallel_l2_norms,
+        perpendicular_l2_norms,
+        parallel_ratios,
+        perpendicular_ratios,
+        signed_parallel_ratios,
+        layer_indices,
+        mixer_names,
+    )
 
 
-def build_layer_stats(ratios, layer_indices):
+def _summarize_values(values, prefix=None):
+    summary = {
+        "sum": float(np.sum(values)),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "min": float(np.min(values)),
+        "median": float(np.median(values)),
+        "max": float(np.max(values)),
+    }
+    if prefix is None:
+        return summary
+    return {f"{prefix}_{key}": value for key, value in summary.items()}
+
+
+def build_layer_stats(
+    ratios,
+    layer_indices,
+    parallel_ratios=None,
+    perpendicular_ratios=None,
+    signed_parallel_ratios=None,
+):
     stats = []
     for layer_pos, layer_idx in enumerate(layer_indices):
         values = ratios[layer_pos].astype(np.float32, copy=False)
-        stats.append(
-            {
-                "layer": int(layer_idx),
-                "token_count": int(values.shape[0]),
-                "sum": float(np.sum(values)),
-                "mean": float(np.mean(values)),
-                "std": float(np.std(values)),
-                "min": float(np.min(values)),
-                "median": float(np.median(values)),
-                "max": float(np.max(values)),
-            }
-        )
+        layer_stats = {
+            "layer": int(layer_idx),
+            "token_count": int(values.shape[0]),
+        }
+        layer_stats.update(_summarize_values(values))
+        if parallel_ratios is not None:
+            layer_stats.update(
+                _summarize_values(
+                    parallel_ratios[layer_pos].astype(np.float32, copy=False),
+                    prefix="parallel_ratio",
+                )
+            )
+        if perpendicular_ratios is not None:
+            layer_stats.update(
+                _summarize_values(
+                    perpendicular_ratios[layer_pos].astype(np.float32, copy=False),
+                    prefix="perpendicular_ratio",
+                )
+            )
+        if signed_parallel_ratios is not None:
+            layer_stats.update(
+                _summarize_values(
+                    signed_parallel_ratios[layer_pos].astype(np.float32, copy=False),
+                    prefix="signed_parallel_ratio",
+                )
+            )
+        stats.append(layer_stats)
     return stats
 
 
@@ -263,63 +345,169 @@ def plot_attn_output_ratio_density(
     plt.close(fig)
 
 
-def plot_attn_output_l2_norm_heatmap(
+def plot_attn_output_l2_norm_layer_curves(
     attn_output_l2_norms,
     layer_indices,
-    output_path,
-    title,
+    output_dir,
+    file_prefix,
+    title_prefix,
 ):
     setup_matplotlib_cache()
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import seaborn as sns
 
     values = np.asarray(attn_output_l2_norms, dtype=np.float32)
     if values.ndim != 2:
         raise ValueError(f"attn_output_l2_norms must be 2D, got shape {values.shape}.")
     if values.shape[0] != len(layer_indices):
         raise ValueError(
-            "Layer count mismatch for attn_output_l2_norms heatmap: "
+            "Layer count mismatch for attn_output_l2_norms layer plots: "
             f"{values.shape[0]} rows vs {len(layer_indices)} layer indices."
         )
 
     token_count = values.shape[1]
-    fig_width = min(18.0, max(8.0, token_count / 45.0))
-    fig_height = min(12.0, max(4.8, len(layer_indices) * 0.28 + 1.8))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=180)
-
-    cbar_kws = {"label": r"$\Vert\Delta_{\mathrm{attn}}\Vert_2$"}
-    sns.heatmap(
-        values,
-        ax=ax,
-        cmap="mako",
-        cbar=True,
-        cbar_kws=cbar_kws,
-        xticklabels=False,
-        yticklabels=[str(layer_idx) for layer_idx in layer_indices],
-        rasterized=True,
-    )
-
-    if token_count > 0:
-        tick_count = min(12, token_count)
-        tick_positions = np.linspace(0, token_count - 1, num=tick_count).round().astype(int)
-        ax.set_xticks(tick_positions + 0.5)
-        ax.set_xticklabels([str(token_pos + 1) for token_pos in tick_positions.tolist()], rotation=0, fontsize=8)
+    x_values = np.arange(1, token_count + 1)
+    output_files = []
+    for layer_pos, layer_idx in enumerate(layer_indices):
+        fig_width = min(18.0, max(8.0, token_count / 45.0))
+        fig, ax = plt.subplots(figsize=(fig_width, 4.8), dpi=180)
+        ax.plot(x_values, values[layer_pos], color="#355f83", linewidth=1.4)
+        ax.fill_between(x_values, values[layer_pos], color="#4dae6b", alpha=0.16)
         ax.set_xlabel(
             "Sequence length",
             fontsize=12,
             fontweight="bold",
         )
-    else:
-        ax.set_xlabel("Sequence length", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Layer", fontsize=12, fontweight="bold")
-    ax.set_title(title, fontsize=15, fontweight="bold")
+        ax.set_ylabel(r"$\Vert\Delta_{\mathrm{attn}}\Vert_2$", fontsize=12, fontweight="bold")
+        ax.set_title(f"{title_prefix} Layer {layer_idx}", fontsize=15, fontweight="bold")
+        ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+        if token_count > 0:
+            tick_count = min(12, token_count)
+            tick_positions = np.linspace(1, token_count, num=tick_count).round().astype(int)
+            ax.set_xticks(tick_positions)
+        file_name = f"{file_prefix}_layer_{int(layer_idx):03d}_attn_output_l2_norm.png"
+        output_path = os.path.join(output_dir, file_name)
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+        output_files.append(file_name)
 
-    fig.tight_layout()
-    fig.savefig(output_path)
-    plt.close(fig)
+    return output_files
+
+
+def plot_attn_output_decomposition_layer_curves(
+    parallel_l2_norms,
+    perpendicular_l2_norms,
+    parallel_ratios,
+    perpendicular_ratios,
+    signed_parallel_ratios,
+    layer_indices,
+    output_dir,
+    file_prefix,
+    title_prefix,
+):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    metric_arrays = {
+        "parallel_l2_norms": np.asarray(parallel_l2_norms, dtype=np.float32),
+        "perpendicular_l2_norms": np.asarray(perpendicular_l2_norms, dtype=np.float32),
+        "parallel_ratios": np.asarray(parallel_ratios, dtype=np.float32),
+        "perpendicular_ratios": np.asarray(perpendicular_ratios, dtype=np.float32),
+        "signed_parallel_ratios": np.asarray(signed_parallel_ratios, dtype=np.float32),
+    }
+    expected_shape = metric_arrays["parallel_ratios"].shape
+    if len(expected_shape) != 2:
+        raise ValueError(f"Decomposition metrics must be 2D, got shape {expected_shape}.")
+    if expected_shape[0] != len(layer_indices):
+        raise ValueError(
+            "Layer count mismatch for decomposition layer plots: "
+            f"{expected_shape[0]} rows vs {len(layer_indices)} layer indices."
+        )
+    for metric_name, values in metric_arrays.items():
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Shape mismatch for {metric_name}: got {values.shape}, expected {expected_shape}."
+            )
+
+    token_count = expected_shape[1]
+    x_values = np.arange(1, token_count + 1)
+    output_files = []
+    for layer_pos, layer_idx in enumerate(layer_indices):
+        fig_width = min(18.0, max(8.4, token_count / 45.0))
+        fig, (ratio_ax, norm_ax) = plt.subplots(
+            2,
+            1,
+            figsize=(fig_width, 7.0),
+            dpi=180,
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.15, 1.0]},
+        )
+        ratio_ax.plot(
+            x_values,
+            metric_arrays["parallel_ratios"][layer_pos],
+            color="#355f83",
+            linewidth=1.45,
+            label=r"$R_{\parallel}$",
+        )
+        ratio_ax.plot(
+            x_values,
+            metric_arrays["perpendicular_ratios"][layer_pos],
+            color="#b64b6a",
+            linewidth=1.45,
+            label=r"$R_{\perp}$",
+        )
+        ratio_ax.plot(
+            x_values,
+            metric_arrays["signed_parallel_ratios"][layer_pos],
+            color="#6b5b95",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.9,
+            label=r"signed $R_{\parallel}$",
+        )
+        ratio_ax.axhline(0.0, color="#2f2f2f", linewidth=0.8, alpha=0.45)
+        ratio_ax.set_ylabel("Ratio to input L2", fontsize=11, fontweight="bold")
+        ratio_ax.set_title(f"{title_prefix} Layer {layer_idx}", fontsize=15, fontweight="bold")
+        ratio_ax.legend(loc="upper right", frameon=True)
+        ratio_ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+
+        norm_ax.plot(
+            x_values,
+            metric_arrays["parallel_l2_norms"][layer_pos],
+            color="#355f83",
+            linewidth=1.35,
+            label=r"$\Vert\Delta x_{\parallel}\Vert_2$",
+        )
+        norm_ax.plot(
+            x_values,
+            metric_arrays["perpendicular_l2_norms"][layer_pos],
+            color="#b64b6a",
+            linewidth=1.35,
+            label=r"$\Vert\Delta x_{\perp}\Vert_2$",
+        )
+        norm_ax.set_xlabel("Sequence length", fontsize=12, fontweight="bold")
+        norm_ax.set_ylabel("Component L2 norm", fontsize=11, fontweight="bold")
+        norm_ax.legend(loc="upper right", frameon=True)
+        norm_ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+        if token_count > 0:
+            tick_count = min(12, token_count)
+            tick_positions = np.linspace(1, token_count, num=tick_count).round().astype(int)
+            norm_ax.set_xticks(tick_positions)
+
+        file_name = f"{file_prefix}_layer_{int(layer_idx):03d}_attn_output_decomposition.png"
+        output_path = os.path.join(output_dir, file_name)
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+        output_files.append(file_name)
+
+    return output_files
 
 
 
@@ -419,7 +607,8 @@ class AttnOutputRatioSampleWriter:
             "tokens": build_token_entries(tokenizer, input_ids),
             "ratio_file": None,
             "density_plot_file": None,
-            "attn_output_l2_heatmap_file": None,
+            "attn_output_l2_layer_plot_files": [],
+            "attn_output_decomposition_layer_plot_files": [],
             "ratio_shape": None,
             "layer_indices": [],
             "token_mixer_names": [],
@@ -435,21 +624,33 @@ class AttnOutputRatioSampleWriter:
             return record
 
         try:
-            ratios, input_l2_norms, attn_output_l2_norms, layer_indices, mixer_names = (
-                compute_attn_output_hidden_state_ratios(model=model, inputs=inputs)
-            )
+            (
+                ratios,
+                input_l2_norms,
+                attn_output_l2_norms,
+                parallel_l2_norms,
+                perpendicular_l2_norms,
+                parallel_ratios,
+                perpendicular_ratios,
+                signed_parallel_ratios,
+                layer_indices,
+                mixer_names,
+            ) = compute_attn_output_hidden_state_ratios(model=model, inputs=inputs)
             ratio_file_name = f"prefill_{prefill_index:03d}_attn_output_hidden_l2_ratio.npz"
             density_plot_file_name = f"prefill_{prefill_index:03d}_attn_output_hidden_l2_ratio_density.png"
-            l2_heatmap_file_name = f"prefill_{prefill_index:03d}_attn_output_l2_norm_heatmap.png"
             ratio_path = os.path.join(self.sample_dir, ratio_file_name)
             density_plot_path = os.path.join(self.sample_dir, density_plot_file_name)
-            l2_heatmap_path = os.path.join(self.sample_dir, l2_heatmap_file_name)
             token_ids = input_ids[: ratios.shape[1]]
             np.savez_compressed(
                 ratio_path,
                 ratios=ratios.astype(np.float32, copy=False),
                 input_l2_norms=input_l2_norms.astype(np.float32, copy=False),
                 attn_output_l2_norms=attn_output_l2_norms.astype(np.float32, copy=False),
+                parallel_l2_norms=parallel_l2_norms.astype(np.float32, copy=False),
+                perpendicular_l2_norms=perpendicular_l2_norms.astype(np.float32, copy=False),
+                parallel_ratios=parallel_ratios.astype(np.float32, copy=False),
+                perpendicular_ratios=perpendicular_ratios.astype(np.float32, copy=False),
+                signed_parallel_ratios=signed_parallel_ratios.astype(np.float32, copy=False),
                 layer_indices=np.asarray(layer_indices, dtype=np.int16),
                 token_ids=np.asarray(token_ids, dtype=np.int64),
                 token_mixer_names=np.asarray(mixer_names),
@@ -461,7 +662,13 @@ class AttnOutputRatioSampleWriter:
             record["ratio_shape"] = list(ratios.shape)
             record["layer_indices"] = [int(layer_idx) for layer_idx in layer_indices]
             record["token_mixer_names"] = mixer_names
-            record["layer_stats"] = build_layer_stats(ratios, layer_indices)
+            record["layer_stats"] = build_layer_stats(
+                ratios,
+                layer_indices,
+                parallel_ratios=parallel_ratios,
+                perpendicular_ratios=perpendicular_ratios,
+                signed_parallel_ratios=signed_parallel_ratios,
+            )
             try:
                 plot_attn_output_ratio_density(
                     ratios=ratios,
@@ -471,13 +678,26 @@ class AttnOutputRatioSampleWriter:
                     layer_spec=self.run_writer.layer_spec,
                 )
                 record["density_plot_file"] = density_plot_file_name
-                plot_attn_output_l2_norm_heatmap(
+                record["attn_output_l2_layer_plot_files"] = plot_attn_output_l2_norm_layer_curves(
                     attn_output_l2_norms=attn_output_l2_norms,
                     layer_indices=layer_indices,
-                    output_path=l2_heatmap_path,
-                    title=f"Random Sample {self.sample_index + 1} Attention Output L2 Norms",
+                    output_dir=self.sample_dir,
+                    file_prefix=f"prefill_{prefill_index:03d}",
+                    title_prefix=f"Random Sample {self.sample_index + 1} Attention Output L2 Norms",
                 )
-                record["attn_output_l2_heatmap_file"] = l2_heatmap_file_name
+                record["attn_output_decomposition_layer_plot_files"] = (
+                    plot_attn_output_decomposition_layer_curves(
+                        parallel_l2_norms=parallel_l2_norms,
+                        perpendicular_l2_norms=perpendicular_l2_norms,
+                        parallel_ratios=parallel_ratios,
+                        perpendicular_ratios=perpendicular_ratios,
+                        signed_parallel_ratios=signed_parallel_ratios,
+                        layer_indices=layer_indices,
+                        output_dir=self.sample_dir,
+                        file_prefix=f"prefill_{prefill_index:03d}",
+                        title_prefix=f"Random Sample {self.sample_index + 1} Attention Output Decomposition",
+                    )
+                )
             except Exception as plot_exc:
                 record["status"] = "saved_npz_plot_error"
                 record["plot_error"] = str(plot_exc)
