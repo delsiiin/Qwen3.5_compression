@@ -5,6 +5,11 @@ import os
 import numpy as np
 
 
+GROUP_SCHEME_SIMILARITY = "similarity"
+GROUP_SCHEME_KEY_PCA_ANGLE = "key_pca_angle"
+SUPPORTED_GROUP_SCHEMES = (GROUP_SCHEME_SIMILARITY, GROUP_SCHEME_KEY_PCA_ANGLE)
+
+
 def _scalar_from_npz(value, default=None):
     if value is None:
         return default
@@ -60,6 +65,54 @@ def load_attn_output_ratio_npz(path):
     return ratios, layer_indices.astype(np.int64, copy=False)
 
 
+def compute_adjacent_angles_from_centers(centers):
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[-1] != 2:
+        raise ValueError("key_layer_centers must have shape [layer, 2].")
+    if centers.shape[0] < 2:
+        return np.empty((0,), dtype=np.float64)
+
+    angles = np.full((centers.shape[0] - 1,), np.nan, dtype=np.float64)
+    for pos in range(centers.shape[0] - 1):
+        first = centers[pos]
+        second = centers[pos + 1]
+        if not np.all(np.isfinite(first)) or not np.all(np.isfinite(second)):
+            continue
+        first_norm = float(np.linalg.norm(first))
+        second_norm = float(np.linalg.norm(second))
+        if first_norm <= 1e-8 or second_norm <= 1e-8:
+            continue
+        cosine = float(np.dot(first, second) / (first_norm * second_norm))
+        cosine = max(-1.0, min(1.0, cosine))
+        angles[pos] = np.degrees(np.arccos(cosine))
+    return angles
+
+
+def load_hidden_state_pca_npz(path):
+    with np.load(path, allow_pickle=False) as data:
+        if "layer_indices" not in data:
+            raise ValueError("hidden-state PCA npz must contain 'layer_indices'.")
+        layer_indices = np.asarray(data["layer_indices"], dtype=np.int64)
+        if "key_adjacent_layer_angles_deg" in data:
+            key_adjacent_angles = np.asarray(data["key_adjacent_layer_angles_deg"], dtype=np.float64)
+        elif "key_layer_centers" in data:
+            key_adjacent_angles = compute_adjacent_angles_from_centers(data["key_layer_centers"])
+        else:
+            raise ValueError(
+                "hidden-state PCA npz must contain 'key_adjacent_layer_angles_deg' "
+                "or 'key_layer_centers'."
+            )
+
+    if layer_indices.ndim != 1:
+        raise ValueError("PCA layer_indices must be 1D.")
+    if len(set(int(layer) for layer in layer_indices.tolist())) != layer_indices.shape[0]:
+        raise ValueError("PCA layer_indices contains duplicate layers.")
+    expected_angle_count = max(0, layer_indices.shape[0] - 1)
+    if key_adjacent_angles.shape != (expected_angle_count,):
+        raise ValueError("key_adjacent_layer_angles_deg must have shape [layer_count - 1].")
+    return layer_indices.astype(np.int64, copy=False), key_adjacent_angles.astype(np.float64, copy=False)
+
+
 def split_layer_groups(similarity, layer_indices, group_threshold=0.85, max_group_size=6):
     if max_group_size < 1:
         raise ValueError("max_group_size must be at least 1.")
@@ -68,6 +121,38 @@ def split_layer_groups(similarity, layer_indices, group_threshold=0.85, max_grou
     for pos in range(1, len(layer_indices)):
         should_split = len(current) >= max_group_size
         if float(similarity[pos - 1, pos]) < float(group_threshold):
+            should_split = True
+        if should_split:
+            groups.append(current)
+            current = []
+        current.append(int(layer_indices[pos]))
+    groups.append(current)
+    return groups
+
+
+def split_layer_groups_by_key_pca_angle(
+    layer_indices,
+    key_adjacent_angles_deg,
+    angle_threshold=90.0,
+    max_group_size=6,
+):
+    if max_group_size < 1:
+        raise ValueError("max_group_size must be at least 1.")
+    if angle_threshold < 0.0 or angle_threshold > 180.0:
+        raise ValueError("angle_threshold must be in [0, 180].")
+
+    layer_indices = np.asarray(layer_indices, dtype=np.int64)
+    key_adjacent_angles_deg = np.asarray(key_adjacent_angles_deg, dtype=np.float64)
+    expected_angle_count = max(0, layer_indices.shape[0] - 1)
+    if key_adjacent_angles_deg.shape != (expected_angle_count,):
+        raise ValueError("key_adjacent_angles_deg must have shape [layer_count - 1].")
+
+    groups = []
+    current = [int(layer_indices[0])]
+    for pos in range(1, len(layer_indices)):
+        angle = float(key_adjacent_angles_deg[pos - 1])
+        should_split = len(current) >= max_group_size
+        if np.isfinite(angle) and angle > float(angle_threshold):
             should_split = True
         if should_split:
             groups.append(current)
@@ -113,6 +198,9 @@ def build_profile_from_similarity(
     min_weight=0.03,
     attn_output_ratio=None,
     attn_output_ratio_layer_indices=None,
+    group_scheme=GROUP_SCHEME_SIMILARITY,
+    key_pca_adjacent_angles_deg=None,
+    key_pca_angle_threshold=90.0,
 ):
     if min_weight < 0.0:
         raise ValueError("min_weight must be non-negative.")
@@ -122,9 +210,21 @@ def build_profile_from_similarity(
         raise ValueError("similarity must be a square matrix.")
     if layer_indices.ndim != 1 or layer_indices.shape[0] != similarity.shape[0]:
         raise ValueError("layer_indices must be 1D and match similarity size.")
+    if group_scheme not in SUPPORTED_GROUP_SCHEMES:
+        raise ValueError(f"group_scheme must be one of {SUPPORTED_GROUP_SCHEMES}.")
 
     layer_to_pos = {int(layer): pos for pos, layer in enumerate(layer_indices.tolist())}
-    groups = split_layer_groups(similarity, layer_indices, group_threshold, max_group_size)
+    if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
+        if key_pca_adjacent_angles_deg is None:
+            raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
+        groups = split_layer_groups_by_key_pca_angle(
+            layer_indices,
+            key_pca_adjacent_angles_deg,
+            angle_threshold=key_pca_angle_threshold,
+            max_group_size=max_group_size,
+        )
+    else:
+        groups = split_layer_groups(similarity, layer_indices, group_threshold, max_group_size)
     group_ratio_sums = None
     group_budget_weights = None
     if attn_output_ratio is not None:
@@ -170,11 +270,18 @@ def build_profile_from_similarity(
         profile_groups.append(group_profile)
 
     adjacent = [float(similarity[pos, pos + 1]) for pos in range(max(0, len(layer_indices) - 1))]
+    key_pca_adjacent_angles = None
+    finite_key_pca_angles = None
+    if key_pca_adjacent_angles_deg is not None:
+        key_pca_adjacent_angles = np.asarray(key_pca_adjacent_angles_deg, dtype=np.float64)
+        finite_key_pca_angles = key_pca_adjacent_angles[np.isfinite(key_pca_adjacent_angles)]
     profile = {
         "metric": "cosine",
         "similarity_state": str(similarity_state),
         "source": "single_sample",
+        "group_scheme": str(group_scheme),
         "group_threshold": float(group_threshold),
+        "key_pca_angle_threshold": float(key_pca_angle_threshold),
         "max_group_size": int(max_group_size),
         "temperature": float(temperature),
         "min_weight": float(min_weight),
@@ -182,6 +289,11 @@ def build_profile_from_similarity(
         "layer_count": int(len(layer_indices)),
         "group_sizes": [len(group) for group in groups],
         "mean_adjacent_similarity": None if not adjacent else float(np.mean(adjacent)),
+        "mean_adjacent_key_pca_angle_deg": (
+            None
+            if finite_key_pca_angles is None or finite_key_pca_angles.size == 0
+            else float(np.mean(finite_key_pca_angles))
+        ),
         "groups": profile_groups,
     }
     if group_ratio_sums is not None:
@@ -192,7 +304,10 @@ def build_profile_from_similarity(
 def build_profile_from_npz(
     similarity_npz,
     attn_output_ratio_npz=None,
+    hidden_state_pca_npz=None,
+    group_scheme=GROUP_SCHEME_SIMILARITY,
     group_threshold=0.85,
+    key_pca_angle_threshold=90.0,
     max_group_size=6,
     temperature=0.05,
     min_weight=0.03,
@@ -202,21 +317,33 @@ def build_profile_from_npz(
     attn_output_ratio_layer_indices = None
     if attn_output_ratio_npz is not None:
         attn_output_ratio, attn_output_ratio_layer_indices = load_attn_output_ratio_npz(attn_output_ratio_npz)
+    key_pca_adjacent_angles_deg = None
+    if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
+        if hidden_state_pca_npz is None:
+            raise ValueError("--hidden_state_pca_npz is required when --group_scheme key_pca_angle.")
+        pca_layer_indices, key_pca_adjacent_angles_deg = load_hidden_state_pca_npz(hidden_state_pca_npz)
+        if not np.array_equal(layer_indices, pca_layer_indices):
+            raise ValueError("hidden-state PCA layer_indices must exactly match similarity layer_indices.")
     profile = build_profile_from_similarity(
         similarity=similarity,
         layer_indices=layer_indices,
         actual_window_size=actual_window_size,
         similarity_state=similarity_state,
         group_threshold=group_threshold,
+        key_pca_angle_threshold=key_pca_angle_threshold,
         max_group_size=max_group_size,
         temperature=temperature,
         min_weight=min_weight,
         attn_output_ratio=attn_output_ratio,
         attn_output_ratio_layer_indices=attn_output_ratio_layer_indices,
+        group_scheme=group_scheme,
+        key_pca_adjacent_angles_deg=key_pca_adjacent_angles_deg,
     )
     profile["similarity_npz"] = os.path.abspath(os.path.expanduser(str(similarity_npz)))
     if attn_output_ratio_npz is not None:
         profile["attn_output_ratio_npz"] = os.path.abspath(os.path.expanduser(str(attn_output_ratio_npz)))
+    if hidden_state_pca_npz is not None:
+        profile["hidden_state_pca_npz"] = os.path.abspath(os.path.expanduser(str(hidden_state_pca_npz)))
     return profile
 
 
@@ -235,8 +362,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build a single-sample hidden-mix profile for snapkv_neighbor_shared.")
     parser.add_argument("--similarity_npz", required=True, help="Path to one query-window similarity .npz file.")
     parser.add_argument("--attn_output_ratio_npz", default=None, help="Optional attn-output ratio .npz for group budget weights.")
+    parser.add_argument("--hidden_state_pca_npz", default=None, help="Hidden-state PCA .npz used by --group_scheme key_pca_angle.")
     parser.add_argument("--output", required=True, help="Output JSON profile path.")
+    parser.add_argument("--group_scheme", choices=SUPPORTED_GROUP_SCHEMES, default=GROUP_SCHEME_SIMILARITY)
     parser.add_argument("--group_threshold", type=float, default=0.85)
+    parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
     parser.add_argument("--max_group_size", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--min_weight", type=float, default=0.03)
@@ -248,7 +378,10 @@ def main():
     profile = build_profile_from_npz(
         similarity_npz=args.similarity_npz,
         attn_output_ratio_npz=args.attn_output_ratio_npz,
+        hidden_state_pca_npz=args.hidden_state_pca_npz,
+        group_scheme=args.group_scheme,
         group_threshold=args.group_threshold,
+        key_pca_angle_threshold=args.key_pca_angle_threshold,
         max_group_size=args.max_group_size,
         temperature=args.temperature,
         min_weight=args.min_weight,
