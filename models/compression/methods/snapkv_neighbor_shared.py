@@ -45,6 +45,10 @@ class SnapKVNeighborShared:
         self.flatten_cache = flatten_cache
         self.importance_epsilon = float(importance_epsilon)
         self.record_kept_token_indices = record_kept_token_indices
+        if self.record_kept_token_indices:
+            self.evicted_token_num = 0
+            self.kept_token_indices = []
+            self.kept_attention_scores = []
         self.hidden_mix_profile = self._load_hidden_mix_profile(hidden_mix_profile_path)
         self.fallback = SnapKV(
             budget=budget,
@@ -103,13 +107,45 @@ class SnapKVNeighborShared:
                     raise ValueError(f"Layer {layer} appears in multiple hidden mix groups.")
                 layer_to_group[layer] = layers
 
+            raw_mix = group_spec.get("mix", {})
+            if raw_mix is None:
+                raw_mix = {}
+            if not isinstance(raw_mix, dict):
+                raise ValueError(f"Profile group {group_idx} mix must be an object.")
+            mix = {}
+            for target_text, mix_spec in raw_mix.items():
+                target_layer = int(target_text)
+                if target_layer not in layers:
+                    raise ValueError(f"Profile group {group_idx} has mix target outside layers: {target_layer}.")
+                if not isinstance(mix_spec, dict):
+                    raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} must be an object.")
+                sources = mix_spec.get("sources")
+                weights = mix_spec.get("weights")
+                if not isinstance(sources, list) or not isinstance(weights, list) or len(sources) != len(weights):
+                    raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} needs equal sources/weights lists.")
+                if not sources:
+                    raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} must not be empty.")
+                parsed_sources = tuple(int(source) for source in sources)
+                parsed_weights = tuple(float(weight) for weight in weights)
+                if any(source not in layers for source in parsed_sources):
+                    raise ValueError(f"Profile group {group_idx} mix source must stay within its group.")
+                weight_sum = float(sum(parsed_weights))
+                if (not math.isfinite(weight_sum)) or weight_sum <= 0.0:
+                    raise ValueError(f"Profile group {group_idx} mix weights must have a positive finite sum.")
+                if any((not math.isfinite(weight)) or weight < 0.0 for weight in parsed_weights):
+                    raise ValueError(f"Profile group {group_idx} mix weights must be finite and non-negative.")
+                mix[target_layer] = {
+                    "sources": parsed_sources,
+                    "weights": tuple(weight / weight_sum for weight in parsed_weights),
+                }
+
             budget_weight = group_spec.get("budget_weight")
             if budget_weight is not None:
                 budget_weight = float(budget_weight)
                 if (not math.isfinite(budget_weight)) or budget_weight < 0.0:
                     raise ValueError(f"Profile group {group_idx} budget_weight must be finite and non-negative.")
 
-            group_profiles[layers] = {"budget_weight": budget_weight}
+            group_profiles[layers] = {"mix": mix, "budget_weight": budget_weight}
 
         budget_weights = [group["budget_weight"] for group in group_profiles.values()]
         has_budget_weights = all(weight is not None for weight in budget_weights)
@@ -161,12 +197,9 @@ class SnapKVNeighborShared:
         if self.model_config.update_kv is not True:
             return key_states, value_states
 
-        hidden_window = self._update_hidden_window(layer_cache, hidden_states)
-        position_window = self._update_position_window(layer_cache, position_embeddings, hidden_states.shape[-2])
         should_compress = (
             self.model_config.compression is None
             or query_states.shape[-2] > 1
-            or self.model_config.compression is True
         )
         self._set_attention_mask_for_current_step(layer_cache, key_states, query_states)
         if not should_compress:
@@ -186,12 +219,19 @@ class SnapKVNeighborShared:
             return key_states, value_states
 
         self._set_attention_mask_for_current_step(layer_cache, key_states, query_states)
+        query_cache = getattr(layer_cache, "query_cache", None)
+        if query_cache is None or query_cache.shape[-2] == 0:
+            query_cache = query_states[:, :, -self.window_size :, :]
+        attn_cache = self._compute_attn_cache(
+            key_states,
+            query_cache,
+            self._current_valid_mask(layer_cache, key_states),
+        )
         self._store_group_entry(
             attention=attention,
-            hidden_window=hidden_window,
-            position_window=position_window,
             key_states=key_states,
             value_states=value_states,
+            attn_cache=attn_cache,
             layer_cache=layer_cache,
         )
         return key_states, value_states
@@ -232,10 +272,9 @@ class SnapKVNeighborShared:
     def _store_group_entry(
         self,
         attention,
-        hidden_window,
-        position_window,
         key_states,
         value_states,
+        attn_cache,
         layer_cache,
     ):
         group_layers = self._group_layers(self.layer_idx)
@@ -247,27 +286,177 @@ class SnapKVNeighborShared:
         group[self.layer_idx] = {
             "layer_idx": self.layer_idx,
             "attention": attention,
-            "hidden_window": hidden_window,
-            "position_window": position_window,
             "key_states": key_states,
             "value_states": value_states,
+            "attn_cache": attn_cache,
             "valid_mask": self._current_valid_mask(layer_cache, key_states),
             "layer_cache": layer_cache,
+            "cosine_importance": None,
+            "finalized": False,
         }
-        if all(layer_idx in group for layer_idx in group_layers):
+
+    def finalize_after_attention(self, attention, hidden_states, attn_output, layer_cache):
+        group_layers = self._group_layers(self.layer_idx)
+        group_key = tuple(group_layers)
+        group = self._state()["groups"].get(group_key)
+        if group is None:
+            return
+        entry = group.get(self.layer_idx)
+        if entry is None:
+            return
+
+        importance = self._compute_cosine_importance(
+            attention=attention,
+            hidden_states=hidden_states,
+            attn_output=attn_output,
+            num_key_value_heads=entry["attn_cache"].shape[1],
+            hist_len=entry["attn_cache"].shape[-1],
+        )
+        importance = importance.to(device=entry["attn_cache"].device, dtype=entry["attn_cache"].dtype)
+        if importance.shape != entry["attn_cache"].shape:
+            raise ValueError("snapkv_neighbor_shared cosine importance must match attn_cache shape.")
+        entry["cosine_importance"] = importance
+        entry["finalized"] = True
+        if all(layer_idx in group and group[layer_idx].get("finalized") for layer_idx in group_layers):
             entries = [group[layer_idx] for layer_idx in group_layers]
             try:
                 self._compress_group(entries, group_layers)
             finally:
-                for entry in entries:
-                    entry.clear()
-                state["groups"].pop(group_key, None)
+                for cur_entry in entries:
+                    cur_entry.clear()
+                self._state()["groups"].pop(group_key, None)
+
+    def _compute_cosine_importance(
+        self,
+        attention,
+        hidden_states,
+        attn_output,
+        num_key_value_heads,
+        hist_len,
+    ):
+        if (
+            hidden_states is None
+            or attn_output is None
+            or not torch.is_tensor(hidden_states)
+            or not torch.is_tensor(attn_output)
+            or hidden_states.ndim != 3
+            or attn_output.ndim != 3
+            or hist_len < 1
+        ):
+            if torch.is_tensor(hidden_states):
+                device = hidden_states.device
+            elif torch.is_tensor(attn_output):
+                device = attn_output.device
+            else:
+                device = torch.device("cpu")
+            return torch.ones(1, int(num_key_value_heads), int(hist_len), device=device)
+
+        batch_size = hidden_states.shape[0]
+        actual_len = min(int(hidden_states.shape[1]), int(attn_output.shape[1]), int(hist_len))
+        device = hidden_states.device
+        importance = torch.ones(
+            batch_size,
+            int(num_key_value_heads),
+            int(hist_len),
+            dtype=torch.float32,
+            device=device,
+        )
+        if actual_len < 1:
+            return importance
+
+        input_vectors = hidden_states[:, :actual_len, :].detach().to(dtype=torch.float32)
+        output_vectors = attn_output[:, :actual_len, :].detach().to(device=device, dtype=torch.float32)
+        cosine = self._token_cosine(input_vectors, output_vectors)
+
+        num_attention_heads = getattr(getattr(attention, "config", None), "num_attention_heads", None)
+        head_dim = getattr(attention, "head_dim", None)
+        hidden_size = input_vectors.shape[-1]
+        if (
+            num_attention_heads is not None
+            and head_dim is not None
+            and int(num_attention_heads) > 0
+            and int(num_key_value_heads) > 0
+            and int(num_attention_heads) % int(num_key_value_heads) == 0
+            and hidden_size == int(num_attention_heads) * int(head_dim)
+            and output_vectors.shape[-1] == hidden_size
+        ):
+            num_attention_heads = int(num_attention_heads)
+            head_dim = int(head_dim)
+            num_key_value_groups = num_attention_heads // int(num_key_value_heads)
+            head_input = input_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+            head_output = output_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+            head_cosine = self._token_cosine(head_input, head_output)
+            cosine = head_cosine.transpose(1, 2).reshape(
+                batch_size,
+                int(num_key_value_heads),
+                num_key_value_groups,
+                actual_len,
+            ).mean(dim=2)
+        else:
+            cosine = cosine[:, None, :].expand(batch_size, int(num_key_value_heads), actual_len)
+
+        importance[:, :, :actual_len] = torch.exp(cosine.clamp(min=-1.0, max=1.0))
+        return importance
+
+    def _token_cosine(self, input_vectors, output_vectors):
+        dot = (input_vectors * output_vectors).sum(dim=-1)
+        input_norm = input_vectors.square().sum(dim=-1).sqrt()
+        output_norm = output_vectors.square().sum(dim=-1).sqrt()
+        denom = (input_norm * output_norm).clamp_min(self.importance_epsilon)
+        return (dot / denom).clamp(min=-1.0, max=1.0)
+
+    def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
+        bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+        hist_len = kv_cache_len - self.window_size
+        if hist_len < 1:
+            return key_states.new_zeros(bsz, num_key_value_heads, 0)
+
+        num_key_value_groups = query_states.shape[1] // num_key_value_heads
+        query_window = min(self.window_size, query_states.shape[-2])
+        query_states = query_states[:, :, -query_window:, :]
+
+        attn_weights = compute_attention_scores(query_states, key_states)
+        attention_mask = torch.ones_like(attn_weights) * float("-inf")
+        attention_mask = torch.triu(attention_mask, diagonal=kv_cache_len - query_window + 1)
+        attn_weights = attn_weights + attention_mask
+        if valid_mask is not None:
+            full_valid = valid_mask[:, :, None, :].expand(
+                bsz,
+                num_key_value_heads,
+                num_key_value_groups,
+                kv_cache_len,
+            )
+            full_valid = full_valid.reshape(bsz, query_states.shape[1], kv_cache_len)
+            attn_weights = attn_weights.masked_fill(
+                ~full_valid[:, :, None, :],
+                torch.finfo(attn_weights.dtype).min,
+            )
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = attn_weights[..., :hist_len]
+
+        scores = attn_weights.view(
+            bsz,
+            num_key_value_heads,
+            num_key_value_groups,
+            query_window,
+            hist_len,
+        )
+        attn_weights_sum = scores.mean(dim=2).mean(dim=-2)
+        attn_cache = F.max_pool1d(
+            attn_weights_sum,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
+        if valid_mask is not None:
+            hist_valid = valid_mask[:, :, :hist_len].to(device=attn_cache.device, dtype=torch.bool)
+            attn_cache = torch.where(hist_valid, attn_cache, torch.zeros_like(attn_cache))
+        return attn_cache
 
     def _compress_group(self, entries, group_layers):
         if any(self._valid_token_count(entry["layer_cache"], entry["key_states"]) < self.budget for entry in entries):
             return
 
-        hidden_len = min(entry["hidden_window"].shape[-2] for entry in entries)
         score_tensors = []
         valid_tensors = []
         hist_lengths = []
@@ -277,64 +466,27 @@ class SnapKVNeighborShared:
             hist_len = key_states.shape[-2] - self.window_size
             if hist_len < 1:
                 return
+            if entry["attn_cache"].shape[-1] != hist_len:
+                raise ValueError("snapkv_neighbor_shared attn_cache length must match historical cache length.")
 
-            query_states = self._project_query_window(
-                entry["attention"],
-                entry["hidden_window"][:, -hidden_len:, :],
-                self._slice_position_window(entry["position_window"], hidden_len),
-            )
-            attn_scores = compute_attention_scores(query_states, key_states)
-
-            hist_valid = valid_mask[:, :, :hist_len]
-            bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
-            num_key_value_groups = query_states.shape[1] // num_key_value_heads
-            query_window = min(self.window_size, attn_scores.shape[-2])
-            attn_scores = attn_scores[:, :, -query_window:, :]
-
-            attention_mask = torch.ones_like(attn_scores) * float("-inf")
-            attention_mask = torch.triu(attention_mask, diagonal=kv_cache_len - query_window + 1)
-            attn_scores = attn_scores + attention_mask
-
-            full_valid = valid_mask[:, :, None, :].expand(
-                bsz,
-                num_key_value_heads,
-                num_key_value_groups,
-                kv_cache_len,
-            )
-            full_valid = full_valid.reshape(bsz, query_states.shape[1], kv_cache_len)
-            attn_scores = attn_scores.masked_fill(
-                ~full_valid[:, :, None, :],
-                torch.finfo(attn_scores.dtype).min,
-            )
-            attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            hist_probs = attn_probs[..., :hist_len]
-            scores = hist_probs.reshape(
-                bsz,
-                num_key_value_heads,
-                num_key_value_groups,
-                query_window,
-                hist_len,
-            )
-            scores = scores.mean(dim=2).mean(dim=-2)
-            scores = F.max_pool1d(
-                scores.to(query_states.dtype),
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-            value_output_l1 = self._value_output_l1_norm(
-                entry["attention"],
-                entry["value_states"][:, :, :hist_len, :],
-            )
-            value_output_l1 = value_output_l1.to(device=scores.device, dtype=scores.dtype)
-            scores = (scores + self.importance_epsilon) * value_output_l1
+            hist_valid = valid_mask[:, :, :hist_len].to(device=entry["attn_cache"].device, dtype=torch.bool)
+            scores = entry["attn_cache"].to(device=hist_valid.device)
             scores = torch.where(hist_valid, scores, torch.zeros_like(scores))
-            scores = scores.masked_fill(~hist_valid, torch.finfo(scores.dtype).min)
-            # Put each layer/head distribution on a common scale before the shared top-k.
-            scores = self._normalize_scores_for_global_rank(scores, hist_valid)
             score_tensors.append(scores)
             valid_tensors.append(hist_valid)
             hist_lengths.append(hist_len)
+
+        mixed_tensors = self._mix_score_tensors(entries, group_layers, score_tensors, valid_tensors)
+        score_tensors = []
+        for entry, mixed_scores, hist_valid in zip(entries, mixed_tensors, valid_tensors):
+            importance = entry.get("cosine_importance")
+            if importance is not None:
+                importance = importance.to(device=mixed_scores.device, dtype=mixed_scores.dtype)
+                if importance.shape != mixed_scores.shape:
+                    raise ValueError("snapkv_neighbor_shared cosine importance must match mixed score shape.")
+                mixed_scores = mixed_scores * importance
+            mixed_scores = mixed_scores.masked_fill(~hist_valid, torch.finfo(mixed_scores.dtype).min)
+            score_tensors.append(mixed_scores)
 
         batch_size = entries[0]["key_states"].shape[0]
         num_kv_heads = entries[0]["key_states"].shape[1]
@@ -366,6 +518,51 @@ class SnapKVNeighborShared:
             selected = selected.to(device=entry["key_states"].device)
             self._pack_layer(entry, selected, hist_len)
             offset += width
+
+    def _mix_score_tensors(self, entries, group_layers, score_tensors, valid_tensors):
+        entry_by_layer = {int(entry["layer_idx"]): idx for idx, entry in enumerate(entries)}
+        mixed_tensors = []
+        for target_idx, entry in enumerate(entries):
+            target_layer = int(entry["layer_idx"])
+            target_scores = score_tensors[target_idx]
+            mix = self._mix_for_layer(group_layers, target_layer)
+            mixed_scores = None
+            for source_layer, weight in zip(mix["sources"], mix["weights"]):
+                source_idx = entry_by_layer[int(source_layer)]
+                source_scores = score_tensors[source_idx].to(device=target_scores.device, dtype=target_scores.dtype)
+                source_valid = valid_tensors[source_idx].to(device=target_scores.device, dtype=torch.bool)
+                if source_scores.shape != target_scores.shape:
+                    raise ValueError("snapkv_neighbor_shared requires matching score shapes within a layer group.")
+                normalized_scores = self._normalize_scores_for_mix(source_scores, source_valid)
+                weighted_scores = normalized_scores * float(weight)
+                mixed_scores = weighted_scores if mixed_scores is None else mixed_scores + weighted_scores
+            if mixed_scores is None:
+                mixed_scores = self._normalize_scores_for_mix(target_scores, valid_tensors[target_idx])
+            target_valid = valid_tensors[target_idx].to(device=mixed_scores.device, dtype=torch.bool)
+            mixed_tensors.append(mixed_scores.masked_fill(~target_valid, torch.finfo(mixed_scores.dtype).min))
+        return mixed_tensors
+
+    def _normalize_scores_for_mix(self, scores, valid_mask):
+        rank_scores = scores.to(dtype=torch.float32)
+        valid_mask = valid_mask.to(device=rank_scores.device, dtype=torch.bool)
+        zeros = torch.zeros_like(rank_scores)
+        valid_scores = torch.where(valid_mask, rank_scores, zeros)
+        valid_count = valid_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        mean = valid_scores.sum(dim=-1, keepdim=True) / valid_count
+        centered = torch.where(valid_mask, rank_scores - mean, zeros)
+        variance = centered.square().sum(dim=-1, keepdim=True) / valid_count
+        std = variance.sqrt().clamp_min(torch.finfo(rank_scores.dtype).eps)
+        normalized = centered / std
+        return torch.where(valid_mask, normalized, zeros).to(dtype=scores.dtype)
+
+    def _mix_for_layer(self, group_layers, target_layer):
+        if self.hidden_mix_profile is None:
+            return {"sources": (target_layer,), "weights": (1.0,)}
+        group = self.hidden_mix_profile["groups"].get(tuple(group_layers), {})
+        mix = group.get("mix", {}).get(int(target_layer))
+        if mix is None:
+            return {"sources": (target_layer,), "weights": (1.0,)}
+        return mix
 
     def _normalize_scores_for_global_rank(self, scores, valid_mask):
         rank_scores = scores.to(dtype=torch.float32)
