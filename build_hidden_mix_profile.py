@@ -257,6 +257,7 @@ def build_profile_from_similarity(
         groups = split_layer_groups(similarity, layer_indices, group_threshold, max_group_size)
     group_ratio_sums = None
     group_budget_weights = None
+    ratio_layer_sums = None
     if attn_output_ratio is not None:
         attn_output_ratio = np.asarray(attn_output_ratio, dtype=np.float64)
         attn_output_ratio_layer_indices = np.asarray(attn_output_ratio_layer_indices, dtype=np.int64)
@@ -269,6 +270,10 @@ def build_profile_from_similarity(
             raise ValueError("attn_output_ratio_layer_indices must match attn_output_ratio first dimension.")
         ratio_layer_scores = {
             int(layer): float(np.var(attn_output_ratio[pos]))
+            for pos, layer in enumerate(attn_output_ratio_layer_indices.tolist())
+        }
+        ratio_layer_sums = {
+            int(layer): float(np.sum(attn_output_ratio[pos]))
             for pos, layer in enumerate(attn_output_ratio_layer_indices.tolist())
         }
         group_ratio_sums, group_budget_weights = build_group_budget_stats(groups, ratio_layer_scores)
@@ -284,6 +289,11 @@ def build_profile_from_similarity(
     profile_groups = []
     for group_idx, layers in enumerate(groups):
         group_profile = {"layers": [int(layer) for layer in layers], "mix": group_mixes[group_idx]}
+        if ratio_layer_sums is not None:
+            group_profile["attn_output_ratio_sums"] = {
+                str(int(layer)): float(ratio_layer_sums[int(layer)])
+                for layer in layers
+            }
         if group_ratio_sums is not None:
             group_profile["attn_output_ratio_variance_sum"] = float(group_ratio_sums[group_idx])
             group_profile["budget_weight"] = float(group_budget_weights[group_idx])
@@ -318,6 +328,7 @@ def build_profile_from_similarity(
     }
     if group_ratio_sums is not None:
         profile["budget_weight_metric"] = "attn_output_hidden_l2_ratio_variance_sum"
+        profile["layer_budget_metric"] = "attn_output_hidden_l2_ratio_sum"
     return profile
 
 
