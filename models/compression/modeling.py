@@ -509,6 +509,8 @@ def Llama_Attention_forward(
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
+    if past_key_values is not None and hasattr(self.kv_cluster, "finalize_after_attention"):
+        self.kv_cluster.finalize_after_attention(self, hidden_states, attn_output, layer_cache)
     return attn_output, attn_weights
 
 def Qwen3_Attention_forward(
@@ -638,6 +640,8 @@ def Qwen3_Attention_forward(
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
+    if past_key_values is not None and hasattr(self.kv_cluster, "finalize_after_attention"):
+        self.kv_cluster.finalize_after_attention(self, hidden_states, attn_output, layer_cache)
     return attn_output, attn_weights
 
 def Qwen3Moe_Attention_forward(
@@ -766,6 +770,8 @@ def Qwen3Moe_Attention_forward(
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        if past_key_values is not None and hasattr(self.kv_cluster, "finalize_after_attention"):
+            self.kv_cluster.finalize_after_attention(self, hidden_states, attn_output, layer_cache)
         return attn_output, attn_weights
 
 
@@ -911,6 +917,8 @@ def Qwen3_5Attention_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
     attn_output = self.o_proj(attn_output)
+    if past_key_values is not None and hasattr(self.kv_cluster, "finalize_after_attention"):
+        self.kv_cluster.finalize_after_attention(self, hidden_states, attn_output, layer_cache)
     return attn_output, attn_weights
 
 def Llama_CausalLM_forward(

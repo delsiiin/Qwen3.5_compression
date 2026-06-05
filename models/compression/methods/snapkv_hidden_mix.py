@@ -24,6 +24,7 @@ class SnapKVHiddenMix:
         mode=None,
         hidden_mix_profile_path=None,
         hidden_mix_fallback="self",
+        importance_epsilon=1e-12,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -38,6 +39,7 @@ class SnapKVHiddenMix:
         self.mode = mode
         self.hidden_mix_profile_path = hidden_mix_profile_path
         self.hidden_mix_fallback = hidden_mix_fallback
+        self.importance_epsilon = float(importance_epsilon)
         self.record_kept_token_indices = record_kept_token_indices
         if self.record_kept_token_indices:
             self.evicted_token_num = 0
@@ -166,7 +168,6 @@ class SnapKVHiddenMix:
         should_compress = (
             self.model_config.compression is None
             or query_states.shape[-2] > 1
-            or self.model_config.compression is True
         )
         if not should_compress or key_states.shape[-2] < self.budget:
             return key_states, value_states
@@ -182,6 +183,116 @@ class SnapKVHiddenMix:
             layer_cache=layer_cache,
         )
         return key_states, value_states
+
+    def finalize_after_attention(self, attention, hidden_states, attn_output, layer_cache):
+        group_layers = self._group_layers(self.layer_idx)
+        group_key = tuple(group_layers)
+        group = self._state()["groups"].get(group_key)
+        if group is None:
+            return
+        entry = group.get(self.layer_idx)
+        if entry is None:
+            return
+
+        importance = self._compute_cosine_importance(
+            attention=attention,
+            hidden_states=hidden_states,
+            attn_output=attn_output,
+            num_key_value_heads=entry["attn_cache"].shape[1],
+            hist_len=entry["attn_cache"].shape[-1],
+        )
+        importance = importance.to(device=entry["attn_cache"].device, dtype=entry["attn_cache"].dtype)
+        if importance.shape != entry["attn_cache"].shape:
+            raise ValueError("snapkv_hidden_mix cosine importance must match attn_cache shape.")
+        entry["cosine_importance"] = importance
+        entry["finalized"] = True
+        if all(layer_idx in group and group[layer_idx].get("finalized") for layer_idx in group_layers):
+            entries = [group[layer_idx] for layer_idx in group_layers]
+            try:
+                self._compress_group(entries, group_layers)
+            finally:
+                for cur_entry in entries:
+                    cur_entry.clear()
+                self._state()["groups"].pop(group_key, None)
+
+    def _compute_cosine_importance(
+        self,
+        attention,
+        hidden_states,
+        attn_output,
+        num_key_value_heads,
+        hist_len,
+    ):
+        if (
+            hidden_states is None
+            or attn_output is None
+            or not torch.is_tensor(hidden_states)
+            or not torch.is_tensor(attn_output)
+            or hidden_states.ndim != 3
+            or attn_output.ndim != 3
+            or hist_len < 1
+        ):
+            if torch.is_tensor(hidden_states):
+                device = hidden_states.device
+            elif torch.is_tensor(attn_output):
+                device = attn_output.device
+            else:
+                device = torch.device("cpu")
+            return torch.ones(1, int(num_key_value_heads), int(hist_len), device=device)
+
+        batch_size = hidden_states.shape[0]
+        actual_len = min(int(hidden_states.shape[1]), int(attn_output.shape[1]), int(hist_len))
+        device = hidden_states.device
+        importance = torch.ones(
+            batch_size,
+            int(num_key_value_heads),
+            int(hist_len),
+            dtype=torch.float32,
+            device=device,
+        )
+        if actual_len < 1:
+            return importance
+
+        input_vectors = hidden_states[:, :actual_len, :].detach().to(dtype=torch.float32)
+        output_vectors = attn_output[:, :actual_len, :].detach().to(device=device, dtype=torch.float32)
+        cosine = self._token_cosine(input_vectors, output_vectors)
+
+        num_attention_heads = getattr(getattr(attention, "config", None), "num_attention_heads", None)
+        head_dim = getattr(attention, "head_dim", None)
+        hidden_size = input_vectors.shape[-1]
+        if (
+            num_attention_heads is not None
+            and head_dim is not None
+            and int(num_attention_heads) > 0
+            and int(num_key_value_heads) > 0
+            and int(num_attention_heads) % int(num_key_value_heads) == 0
+            and hidden_size == int(num_attention_heads) * int(head_dim)
+            and output_vectors.shape[-1] == hidden_size
+        ):
+            num_attention_heads = int(num_attention_heads)
+            head_dim = int(head_dim)
+            num_key_value_groups = num_attention_heads // int(num_key_value_heads)
+            head_input = input_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+            head_output = output_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+            head_cosine = self._token_cosine(head_input, head_output)
+            cosine = head_cosine.transpose(1, 2).reshape(
+                batch_size,
+                int(num_key_value_heads),
+                num_key_value_groups,
+                actual_len,
+            ).mean(dim=2)
+        else:
+            cosine = cosine[:, None, :].expand(batch_size, int(num_key_value_heads), actual_len)
+
+        importance[:, :, :actual_len] = torch.exp(cosine.clamp(min=-1.0, max=1.0))
+        return importance
+
+    def _token_cosine(self, input_vectors, output_vectors):
+        dot = (input_vectors * output_vectors).sum(dim=-1)
+        input_norm = input_vectors.square().sum(dim=-1).sqrt()
+        output_norm = output_vectors.square().sum(dim=-1).sqrt()
+        denom = (input_norm * output_norm).clamp_min(self.importance_epsilon)
+        return (dot / denom).clamp(min=-1.0, max=1.0)
 
     def _should_append_to_cache(self, query_states, layer_cache):
         has_existing_cache = (
@@ -246,15 +357,9 @@ class SnapKVHiddenMix:
             "value_states": value_states,
             "attn_cache": attn_cache,
             "layer_cache": layer_cache,
+            "cosine_importance": None,
+            "finalized": False,
         }
-        if all(layer_idx in group for layer_idx in group_layers):
-            entries = [group[layer_idx] for layer_idx in group_layers]
-            try:
-                self._compress_group(entries, group_layers)
-            finally:
-                for entry in entries:
-                    entry.clear()
-                state["groups"].pop(group_key, None)
 
     def _compress_group(self, entries, group_layers):
         entry_by_layer = {int(entry["layer_idx"]): entry for entry in entries}
@@ -270,6 +375,12 @@ class SnapKVHiddenMix:
                 normalized_cache = self._normalize_attn_cache(source_cache)
                 weighted = normalized_cache * float(weight)
                 mixed_cache = weighted if mixed_cache is None else mixed_cache + weighted
+            importance = entry.get("cosine_importance")
+            if importance is not None:
+                importance = importance.to(device=mixed_cache.device, dtype=mixed_cache.dtype)
+                if importance.shape != mixed_cache.shape:
+                    raise ValueError("snapkv_hidden_mix cosine importance must match mixed attn_cache shape.")
+                mixed_cache = mixed_cache * importance
             self._pack_layer(entry, mixed_cache)
 
     def _normalize_attn_cache(self, attn_cache):
