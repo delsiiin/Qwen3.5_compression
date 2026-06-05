@@ -41,6 +41,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 
 from .methods import (
     SnapKV,
+    SnapKVAda,
     SnapKVNeighborShared,
     SnapKVHiddenMix,
     SnapKVHiddenMixLayer,
@@ -57,6 +58,7 @@ import torch.nn.functional as F
 
 KV_COMPRESSION_MAP = {
     "snapkv": SnapKV,
+    "snapkv_ada": SnapKVAda,
     "snapkv_neighbor_shared": SnapKVNeighborShared,
     "snapkv_hidden_mix": SnapKVHiddenMix,
     "snapkv_hidden_mix_layer": SnapKVHiddenMixLayer,
@@ -68,6 +70,13 @@ KV_COMPRESSION_MAP = {
 }
 
 logger = logging.get_logger(__name__)
+
+
+def _kv_cluster_manages_cache(kv_cluster):
+    return (
+        getattr(kv_cluster, "requires_layer_coordination", False)
+        or getattr(kv_cluster, "manages_kv_cache", False)
+    )
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -430,7 +439,7 @@ def Llama_Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+        if _kv_cluster_manages_cache(self.kv_cluster):
             key_states, value_states = self.kv_cluster.update_kv_cache(
                 self,
                 hidden_states,
@@ -560,7 +569,7 @@ def Qwen3_Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+        if _kv_cluster_manages_cache(self.kv_cluster):
             key_states, value_states = self.kv_cluster.update_kv_cache(
                 self,
                 hidden_states,
@@ -691,7 +700,7 @@ def Qwen3Moe_Attention_forward(
                     ]
             # =============== Enable Query Cache end =========
 
-            if getattr(self.kv_cluster, "requires_layer_coordination", False):
+            if _kv_cluster_manages_cache(self.kv_cluster):
                 key_states, value_states = self.kv_cluster.update_kv_cache(
                     self,
                     hidden_states,
@@ -833,7 +842,7 @@ def Qwen3_5Attention_forward(
                 ]
         # =============== Enable Query Cache end =========
 
-        if getattr(self.kv_cluster, "requires_layer_coordination", False):
+        if _kv_cluster_manages_cache(self.kv_cluster):
             key_states, value_states = self.kv_cluster.update_kv_cache(
                 self,
                 hidden_states,
