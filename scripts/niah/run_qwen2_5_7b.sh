@@ -1,16 +1,16 @@
 #!/bin/bash
-# Needle-in-a-Haystack on Llama-3.1-8B-Instruct
+# Needle-in-a-Haystack on Qwen2.5-7B-Instruct
 # Tests at budget=128L and budget=1024L
 
-MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"  # e.g., meta-llama/Llama-3.1-8B-Instruct
+MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"  # e.g., meta-llama/Llama-3.1-8B-Instruct
 ATTN="flash_attention_2"
 
 EXPERIMENTS=(
-    "FullKV 1024 Qwen3"
-    "snapkv 1024 Qwen3"
-    "criticalkv 1024 Qwen3"
-    "defensivekv 1024 Qwen3"
-    "snapkv_hidden_mix 1024 Qwen3"
+    "FullKV 1024 Qwen"
+    "snapkv 1024 Qwen"
+    "criticalkv 1024 Qwen"
+    "defensivekv 1024 Qwen"
+    "snapkv_hidden_mix 1024 Qwen"
 )
 
 # Each entry is one visible GPU group for a single process.
@@ -26,7 +26,7 @@ cleanup() {
     trap - INT TERM
     if ((${#PIDS[@]} > 0)); then
         echo
-        echo "Interrupted. Stopping running Needle Llama-3.1-8B-Instruct jobs..."
+        echo "Interrupted. Stopping running Needle Qwen2.5-7B-Instruct jobs..."
         kill -TERM "${PIDS[@]}" 2>/dev/null || true
         wait "${PIDS[@]}" 2>/dev/null || true
     fi
@@ -48,15 +48,15 @@ for exp in "${EXPERIMENTS[@]}"; do
     gpu_group=${CUDA_DEVICE_GROUPS[$((IDX % NUM_GPU_GROUPS))]}
 
     compression_args=()
-    version_args=(--model_version "Llama-3.1-8B-Instruct_FullKV_${capacity}")
+    version_args=(--model_version "Qwen2.5-7B-Instruct_FullKV_${capacity}")
     if [[ "${method}" != "FullKV" ]]; then
         compression_args=(
             --compression
             --compression_mode "${method}"
             --compression_budget "${capacity}"
-            --hidden_mix_profile_path "/home/yangx/new_compression/hidden_mix_profile_llama_8b.json"
+            --hidden_mix_profile_path "/home/yangx/new_compression/hidden_mix_profile_qwen2_5_7b.json"
         )
-        version_args=(--model_version "Llama-3.1-8B-Instruct")
+        version_args=(--model_version "Qwen2.5-7B-Instruct")
     fi
     CUDA_VISIBLE_DEVICES="${gpu_group}" python -u run_niah.py \
         --s_len 5000 --e_len 50001 \
@@ -74,4 +74,4 @@ for exp in "${EXPERIMENTS[@]}"; do
     fi
 done
 wait_for_batch
-echo "All Needle Llama-3.1-8B-Instruct experiments completed."
+echo "All Needle Qwen2.5-7B-Instruct experiments completed."

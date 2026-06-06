@@ -8,7 +8,9 @@ ATTN="flash_attention_2"
 EXPERIMENTS=(
     "FullKV 1024 Qwen3"
     "snapkv 1024 Qwen3"
-    "snapkv_neighbor_shared 1024 Qwen3"
+    "criticalkv 1024 Qwen3"
+    "defensivekv 1024 Qwen3"
+    "snapkv_hidden_mix 1024 Qwen3"
 )
 
 # Each entry is one visible GPU group for a single process.
@@ -52,7 +54,7 @@ for exp in "${EXPERIMENTS[@]}"; do
             --compression
             --compression_mode "${method}"
             --compression_budget "${capacity}"
-            --hidden_mix_profile_path "/home/yangx/zmw/new_compression/output_dir/results_longbench/hidden_mix_profile/qwen3-4b_domain_single-document_QA_20260530_124055/hidden_mix_profile.json"
+            --hidden_mix_profile_path "/home/yangx/new_compression/hidden_mix_profile_qwen3_4b.json"
         )
         version_args=(--model_version "Qwen3-4B")
     fi
