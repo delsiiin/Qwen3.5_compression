@@ -40,6 +40,11 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen3moe",
     "qwen3.5",
 }
+QWEN2_5_ROPE_SCALING = {
+    "factor": 4.0,
+    "original_max_position_embeddings": 32768,
+    "type": "yarn",
+}
 
 DATA_NAME_TO_PATH = {
     # Retrieval tasks
@@ -150,6 +155,18 @@ def build_compression_config(
     }
 
 
+def apply_qwen2_5_rope_scaling(config):
+    config.rope_scaling = dict(QWEN2_5_ROPE_SCALING)
+    rope_parameters = dict(getattr(config, "rope_parameters", None) or {})
+    config.rope_parameters = {
+        "rope_type": QWEN2_5_ROPE_SCALING["type"],
+        "factor": QWEN2_5_ROPE_SCALING["factor"],
+        "original_max_position_embeddings": QWEN2_5_ROPE_SCALING["original_max_position_embeddings"],
+        "rope_theta": rope_parameters.get("rope_theta", 10000.0),
+    }
+    return config
+
+
 def get_model_family(model_path):
     model_path_lower = model_path.lower()
     if "qwen3.5" in model_path_lower or "qwen3_5" in model_path_lower:
@@ -242,7 +259,7 @@ def load_local_model(model_family, model_path, model_kwargs):
         from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
         from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
-        config = Qwen2Config.from_pretrained(model_path)
+        config = apply_qwen2_5_rope_scaling(Qwen2Config.from_pretrained(model_path))
         return Qwen2ForCausalLM.from_pretrained(model_path, config=config, **model_kwargs)
 
     if model_family == "qwen3":
@@ -310,7 +327,13 @@ def load_model_and_tokenizer(args):
             args.hidden_mix_profile_path,
         )
         apply_compression_monkeypatch(model_family, compression_config)
-        model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
+        if model_family == "qwen2.5":
+            from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+
+            config = apply_qwen2_5_rope_scaling(Qwen2Config.from_pretrained(args.model_path))
+            model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, **model_kwargs)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
         apply_compression_setup(model, tokenizer, args.compression_mode)
     else:
         model = load_local_model(
