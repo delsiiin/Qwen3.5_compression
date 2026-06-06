@@ -103,6 +103,13 @@ def get_query_window_similarity_colorbar_label(similarity_state):
     return "Cosine similarity"
 
 
+def setup_matplotlib_cache():
+    cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "qwen35_compression_matplotlib_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(cache_dir, "matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -344,10 +351,7 @@ def compute_query_window_similarity(model, inputs, window_size, similarity_state
 
 
 def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path, title, similarity_state):
-    cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "qwen35_compression_matplotlib_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", os.path.join(cache_dir, "matplotlib"))
-    os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+    setup_matplotlib_cache()
     import matplotlib
 
     matplotlib.use("Agg")
@@ -375,6 +379,85 @@ def plot_query_window_similarity_heatmap(similarity, layer_indices, output_path,
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
+
+
+def get_adjacent_layer_scores(similarity, layer_indices):
+    similarity = np.asarray(similarity)
+    layer_indices = np.asarray(layer_indices)
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError("similarity must be a square matrix.")
+    if layer_indices.ndim != 1 or layer_indices.shape[0] != similarity.shape[0]:
+        raise ValueError("layer_indices must be 1D and match similarity size.")
+
+    return [
+        {
+            "from_layer": int(layer_indices[pos]),
+            "to_layer": int(layer_indices[pos + 1]),
+            "score": float(similarity[pos, pos + 1]),
+        }
+        for pos in range(max(0, len(layer_indices) - 1))
+    ]
+
+
+def plot_adjacent_layer_score_curve(similarity, layer_indices, output_path, title, similarity_state):
+    adjacent_scores = get_adjacent_layer_scores(similarity, layer_indices)
+    if not adjacent_scores:
+        return None
+
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    output_path = os.path.abspath(os.path.expanduser(str(output_path)))
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    metric = get_query_window_similarity_metric(similarity_state)
+    x_positions = np.arange(len(adjacent_scores))
+    y_values = np.asarray([item["score"] for item in adjacent_scores], dtype=np.float64)
+    x_labels = [f"{item['from_layer']}-{item['to_layer']}" for item in adjacent_scores]
+    width = max(7.2, min(16.0, 0.32 * len(adjacent_scores) + 3.6))
+
+    fig, ax = plt.subplots(figsize=(width, 4.4), dpi=180)
+    ax.plot(
+        x_positions,
+        y_values,
+        color="#355f83" if metric == SIMILARITY_METRIC_COSINE else "#7faa3d",
+        linewidth=1.8,
+        marker="o",
+        markersize=4.0,
+    )
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("Adjacent layer pair", fontsize=11, fontweight="bold")
+    ax.set_ylabel(get_query_window_similarity_colorbar_label(similarity_state), fontsize=11, fontweight="bold")
+    ax.set_xticks(x_positions)
+    tick_step = max(1, len(x_positions) // 18)
+    ax.set_xticklabels(
+        [label if idx % tick_step == 0 else "" for idx, label in enumerate(x_labels)],
+        rotation=45,
+        ha="right",
+    )
+    finite_values = y_values[np.isfinite(y_values)]
+    if finite_values.size > 0:
+        min_value = float(np.min(finite_values))
+        max_value = float(np.max(finite_values))
+        padding = max(0.01, (max_value - min_value) * 0.08)
+        lower = min_value - padding
+        upper = max_value + padding
+        if metric == SIMILARITY_METRIC_COSINE:
+            lower = max(-1.0, lower)
+            upper = min(1.0, upper)
+        else:
+            lower = max(0.0, lower)
+        ax.set_ylim(lower, upper)
+    ax.grid(axis="y", alpha=0.28, linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    return output_path
 
 
 class QueryWindowSimilarityRunWriter:
@@ -482,6 +565,8 @@ class QueryWindowSimilaritySampleWriter:
             "tokens": build_token_entries(tokenizer, input_ids),
             "similarity_file": None,
             "heatmap_file": None,
+            "adjacent_layer_curve_file": None,
+            "adjacent_layer_scores": [],
             "similarity_shape": None,
             "layer_indices": [],
         }
@@ -507,12 +592,29 @@ class QueryWindowSimilaritySampleWriter:
             heatmap_file_name = (
                 f"prefill_{prefill_index:03d}_{self.run_writer.similarity_state}_query_window_similarity.png"
             )
+            adjacent_layer_curve_file_name = (
+                f"prefill_{prefill_index:03d}_{self.run_writer.similarity_state}_adjacent_layer_curve.png"
+            )
             similarity_path = os.path.join(self.sample_dir, similarity_file_name)
             heatmap_path = os.path.join(self.sample_dir, heatmap_file_name)
+            adjacent_layer_curve_path = os.path.join(self.sample_dir, adjacent_layer_curve_file_name)
+            adjacent_layer_scores = get_adjacent_layer_scores(similarity, layer_indices)
             np.savez_compressed(
                 similarity_path,
                 similarity=similarity,
                 layer_indices=np.asarray(layer_indices, dtype=np.int16),
+                adjacent_layer_from_indices=np.asarray(
+                    [item["from_layer"] for item in adjacent_layer_scores],
+                    dtype=np.int16,
+                ),
+                adjacent_layer_to_indices=np.asarray(
+                    [item["to_layer"] for item in adjacent_layer_scores],
+                    dtype=np.int16,
+                ),
+                adjacent_layer_scores=np.asarray(
+                    [item["score"] for item in adjacent_layer_scores],
+                    dtype=np.float32,
+                ),
                 window_token_ids=np.asarray(record["window_token_ids"], dtype=np.int64),
                 window_token_start=np.asarray(window_token_start, dtype=np.int64),
                 actual_window_size=np.asarray(actual_window_size, dtype=np.int64),
@@ -526,6 +628,7 @@ class QueryWindowSimilaritySampleWriter:
             record["similarity_file"] = similarity_file_name
             record["similarity_shape"] = list(similarity.shape)
             record["layer_indices"] = layer_indices
+            record["adjacent_layer_scores"] = adjacent_layer_scores
             record["actual_window_size"] = actual_window_size
             try:
                 plot_query_window_similarity_heatmap(
@@ -540,6 +643,18 @@ class QueryWindowSimilaritySampleWriter:
                     similarity_state=self.run_writer.similarity_state,
                 )
                 record["heatmap_file"] = heatmap_file_name
+                adjacent_layer_curve_path = plot_adjacent_layer_score_curve(
+                    similarity=similarity,
+                    layer_indices=layer_indices,
+                    output_path=adjacent_layer_curve_path,
+                    title=(
+                        f"{label}: adjacent layer "
+                        f"{get_query_window_similarity_metric(self.run_writer.similarity_state)}"
+                    ),
+                    similarity_state=self.run_writer.similarity_state,
+                )
+                if adjacent_layer_curve_path is not None:
+                    record["adjacent_layer_curve_file"] = adjacent_layer_curve_file_name
             except Exception as plot_exc:
                 record["status"] = "saved_npz_plot_error"
                 record["plot_error"] = str(plot_exc)
@@ -565,6 +680,7 @@ class QueryWindowSimilaritySampleWriter:
             "query_window_similarity_state",
             "query_window_similarity_metric",
             "similarity_shape",
+            "adjacent_layer_curve_file",
             "reason",
             "error",
             "plot_error",
