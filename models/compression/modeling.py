@@ -7,6 +7,7 @@ from transformers.processing_utils import Unpack
 
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.mistral.configuration_mistral import MistralConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
@@ -19,6 +20,10 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb as llama_apply_rotary_pos_emb,
     eager_attention_forward as llama_eager_attention_forward,
+)
+from transformers.models.mistral.modeling_mistral import (
+    apply_rotary_pos_emb as mistral_apply_rotary_pos_emb,
+    eager_attention_forward as mistral_eager_attention_forward,
 )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
@@ -271,6 +276,41 @@ def Llama_Attention_init(self, config: LlamaConfig, layer_idx: int, compression_
         self.kv_cluster.bind_attention(self)
     # =============== New logic end =================
 
+def Mistral_Attention_init(self, config: MistralConfig, layer_idx: int, compression_config: dict):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(
+        config.hidden_size, config.num_attention_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+    )
+    self.k_proj = nn.Linear(
+        config.hidden_size, config.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+    )
+    self.v_proj = nn.Linear(
+        config.hidden_size, config.num_key_value_heads * self.head_dim, bias=getattr(config, "attention_bias", False)
+    )
+    self.o_proj = nn.Linear(
+        config.num_attention_heads * self.head_dim, config.hidden_size, bias=getattr(config, "attention_bias", False)
+    )
+    self.sliding_window = getattr(config, "sliding_window", None)
+    # =============== New logic start ===============
+    self.config.update(compression_config)
+    self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
+        layer_idx=self.layer_idx,
+        model_config=self.config,
+        model_type="mistral",
+        **compression_config["method_config"],
+    )
+    if hasattr(self.kv_cluster, "bind_attention"):
+        self.kv_cluster.bind_attention(self)
+    # =============== New logic end =================
+
 def Qwen3_Attention_init(self, config: Qwen3Config, layer_idx: int, compression_config: dict):
     nn.Module.__init__(self)
     self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
@@ -517,6 +557,137 @@ def Llama_Attention_forward(
         attention_interface,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    if past_key_values is not None and hasattr(self.kv_cluster, "finalize_after_attention"):
+        self.kv_cluster.finalize_after_attention(self, hidden_states, attn_output, layer_cache)
+    return attn_output, attn_weights
+
+def Mistral_Attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = mistral_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        layer_cache = past_key_values.layers[self.layer_idx]
+        # =============== Enable Query Cache ============
+        if not hasattr(layer_cache, "query_cache"):
+            layer_cache.query_cache = None
+
+        if layer_cache.query_cache is None:
+            bsz, n_heads, _, head_dim = query_states.shape
+            layer_cache.query_cache = torch.empty(
+                bsz, n_heads, 0, head_dim
+            )
+            layer_cache.query_cache = query_states[
+                :, :, -self.config.method_config["window_size"] :, :
+            ]
+        else:
+            layer_cache.query_cache = torch.cat(
+                (layer_cache.query_cache, query_states),
+                dim=2,
+            )
+
+            window_size = self.config.method_config["window_size"]
+            if layer_cache.query_cache.shape[-2] > window_size:
+                layer_cache.query_cache = layer_cache.query_cache[
+                    :, :, -window_size:, :
+                ]
+        # =============== Enable Query Cache end =========
+
+        if _kv_cluster_manages_cache(self.kv_cluster):
+            key_states, value_states = self.kv_cluster.update_kv_cache(
+                self,
+                hidden_states,
+                position_embeddings,
+                key_states,
+                query_states,
+                value_states,
+                past_key_values,
+                layer_cache,
+            )
+        else:
+            # =============== decoding-time compression start ===============
+            cached_queries = layer_cache.query_cache
+            if self.config.compression is None or query_states.shape[-2] > 1:
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
+                )
+
+                if self.config.update_kv is True:
+                    past_key_values.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                    )
+                else:
+                    past_key_values.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                    )
+
+            elif self.config.compression is True:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+
+                update_kwargs = {}
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,
+                    value_states,
+                    **update_kwargs,
+                )
+
+                if self.config.update_kv is True:
+                    layer_cache.keys = key_states_compress
+                    layer_cache.values = value_states_compress
+            else:
+                key_states, value_states = past_key_values.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                )
+            # =============== decoding-time compression end ===============
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, mistral_eager_attention_forward
+    )
+
+    attn_output, attn_weights = _attention_with_optional_flatten(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        past_key_values,
+        attention_interface,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
         **kwargs,
     )
 
