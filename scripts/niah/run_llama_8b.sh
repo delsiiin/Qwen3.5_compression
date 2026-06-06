@@ -6,11 +6,12 @@ MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"  # e.g., meta-llama/Llama-3.1-8B-I
 ATTN="flash_attention_2"
 
 EXPERIMENTS=(
-    "FullKV 1024 Qwen3"
-    "snapkv 1024 Qwen3"
-    "criticalkv 1024 Qwen3"
-    "defensivekv 1024 Qwen3"
-    "snapkv_hidden_mix 1024 Qwen3"
+    "FullKV 1024 Llama"
+    "snapkv 1024 Llama"
+    "criticalkv 1024 Llama"
+    "defensivekv 1024 Llama"
+    "snapkv_hidden_mix 1024 Llama"
+    "snapkv_hidden_mix_layer 1024 Llama"
 )
 
 # Each entry is one visible GPU group for a single process.
@@ -54,7 +55,7 @@ for exp in "${EXPERIMENTS[@]}"; do
             --compression
             --compression_mode "${method}"
             --compression_budget "${capacity}"
-            --hidden_mix_profile_path "/home/yangx/new_compression/hidden_mix_profile_llama_8b.json"
+            --hidden_mix_profile_path "/home/yangx/new_compression/hidden_mix_profile/hidden_mix_profile_Llama-3.1-8B-Instruct.json"
         )
         version_args=(--model_version "Llama-3.1-8B-Instruct")
     fi
