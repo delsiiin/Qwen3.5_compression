@@ -11,6 +11,7 @@ from query_window_similarity import (
     SIMILARITY_STATE_HIDDEN_L2_DIFF,
     SUPPORTED_SIMILARITY_STATES,
     build_l2_difference_from_layer_windows,
+    get_adjacent_layer_scores,
     get_query_window_similarity_metric,
 )
 
@@ -35,3 +36,21 @@ def test_hidden_state_l2_diff_builds_pairwise_layer_distance_matrix():
 def test_hidden_state_l2_diff_is_registered_as_query_window_submode():
     assert SIMILARITY_STATE_HIDDEN_L2_DIFF in SUPPORTED_SIMILARITY_STATES
     assert get_query_window_similarity_metric(SIMILARITY_STATE_HIDDEN_L2_DIFF) == SIMILARITY_METRIC_L2_DIFF
+
+
+def test_adjacent_layer_scores_follow_layer_index_order():
+    similarity = np.array(
+        [
+            [1.0, 0.91, 0.20],
+            [0.91, 1.0, 0.83],
+            [0.20, 0.83, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    scores = get_adjacent_layer_scores(similarity, np.asarray([2, 4, 7], dtype=np.int16))
+
+    assert scores == [
+        {"from_layer": 2, "to_layer": 4, "score": float(np.float32(0.91))},
+        {"from_layer": 4, "to_layer": 7, "score": float(np.float32(0.83))},
+    ]

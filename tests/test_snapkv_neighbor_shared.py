@@ -121,6 +121,19 @@ def _write_attn_output_ratio_npz(tmp_path, ratios, layer_indices=None):
     return str(ratio_path)
 
 
+def _write_hidden_state_pca_npz(tmp_path, key_adjacent_angles, layer_indices=None):
+    key_adjacent_angles = np.asarray(key_adjacent_angles, dtype=np.float32)
+    if layer_indices is None:
+        layer_indices = np.arange(key_adjacent_angles.shape[0] + 1, dtype=np.int16)
+    pca_path = tmp_path / "key_value_state_pca.npz"
+    np.savez_compressed(
+        pca_path,
+        key_adjacent_layer_angles_deg=key_adjacent_angles,
+        layer_indices=np.asarray(layer_indices, dtype=np.int16),
+    )
+    return str(pca_path)
+
+
 def test_single_sample_profile_builder_splits_groups_and_normalizes_weights(tmp_path):
     similarity = np.array(
         [
@@ -226,6 +239,47 @@ def test_single_sample_profile_builder_rejects_invalid_npz(tmp_path):
     except ValueError:
         return
     raise AssertionError("Invalid non-square similarity npz was accepted.")
+
+
+def test_single_sample_profile_builder_key_pca_fixed_angle_threshold(tmp_path):
+    similarity = np.ones((4, 4), dtype=np.float32)
+    profile = build_profile_from_npz(
+        _write_similarity_npz(tmp_path, similarity),
+        hidden_state_pca_npz=_write_hidden_state_pca_npz(tmp_path, [5.0, 20.0, 5.0]),
+        group_scheme="key_pca_angle",
+        key_pca_angle_threshold=10.0,
+        key_pca_angle_threshold_mode="fixed",
+        max_group_size=6,
+        temperature=0.1,
+        min_weight=0.0,
+    )
+
+    assert [group["layers"] for group in profile["groups"]] == [[0, 1], [2, 3]]
+    assert profile["key_pca_angle_threshold"] == 10.0
+    assert profile["effective_key_pca_angle_threshold"] == 10.0
+    assert profile["key_pca_angle_threshold_mode"] == "fixed"
+    assert profile["key_pca_angle_threshold_outlier_method"] is None
+
+
+def test_single_sample_profile_builder_key_pca_mean_without_outliers_threshold(tmp_path):
+    similarity = np.ones((7, 7), dtype=np.float32)
+    profile = build_profile_from_npz(
+        _write_similarity_npz(tmp_path, similarity),
+        hidden_state_pca_npz=_write_hidden_state_pca_npz(tmp_path, [10.0, 11.0, 12.0, 13.0, 14.0, 100.0]),
+        group_scheme="key_pca_angle",
+        key_pca_angle_threshold=90.0,
+        key_pca_angle_threshold_mode="mean_without_outliers",
+        max_group_size=7,
+        temperature=0.1,
+        min_weight=0.0,
+    )
+
+    assert [group["layers"] for group in profile["groups"]] == [[0, 1, 2, 3], [4], [5], [6]]
+    assert np.isclose(profile["key_pca_angle_threshold"], 12.0)
+    assert np.isclose(profile["effective_key_pca_angle_threshold"], 12.0)
+    assert profile["key_pca_angle_threshold_mode"] == "mean_without_outliers"
+    assert profile["key_pca_angle_threshold_outlier_method"] == "iqr_1.5"
+    assert np.isclose(profile["mean_adjacent_key_pca_angle_deg"], 25.0)
 
 
 def test_builder_generated_profile_runs_neighbor_shared_runtime(tmp_path):
