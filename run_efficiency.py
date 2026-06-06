@@ -16,6 +16,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Stoppi
 SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "llama",
     "mistral",
+    "qwen2.5",
     "qwen3",
     "qwen3moe",
     "qwen3.5",
@@ -144,12 +145,16 @@ def get_model_family(model_path):
         return "llama"
     if "mistral" in model_path_lower:
         return "mistral"
+    if "qwen2.5" in model_path_lower or "qwen2_5" in model_path_lower:
+        return "qwen2.5"
 
     try:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         model_type = getattr(config, "model_type", "").lower().replace("-", "_")
         if model_type == "mistral":
             return "mistral"
+        if model_type == "qwen2":
+            return "qwen2.5"
         if model_type == "qwen3_moe":
             return "qwen3moe"
         if model_type == "qwen3":
@@ -179,12 +184,14 @@ def apply_compression_setup(model, tokenizer, compression_mode):
 
 
 def apply_compression_monkeypatch(model_family, compression_config):
-    from models.compression.monkeypatch import replace_llama, replace_mistral, replace_qwen3, replace_qwen3_5, replace_qwen3moe
+    from models.compression.monkeypatch import replace_llama, replace_mistral, replace_qwen2_5, replace_qwen3, replace_qwen3_5, replace_qwen3moe
 
     if model_family == "llama":
         replace_llama(compression_config)
     elif model_family == "mistral":
         replace_mistral(compression_config)
+    elif model_family == "qwen2.5":
+        replace_qwen2_5(compression_config)
     elif model_family == "qwen3":
         replace_qwen3(compression_config)
     elif model_family == "qwen3moe":
@@ -229,7 +236,7 @@ def load_model_and_tokenizer(
             raise ValueError("Please provide compression_mode when compression=True.")
         if model_family not in SUPPORTED_COMPRESSION_MODEL_FAMILIES:
             raise ValueError(
-                "Compression currently supports llama, mistral, qwen3, qwen3moe, and qwen3.5 "
+                "Compression currently supports llama, mistral, qwen2.5, qwen3, qwen3moe, and qwen3.5 "
                 f"models, got: {model_path}"
             )
 
