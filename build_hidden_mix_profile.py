@@ -8,6 +8,13 @@ import numpy as np
 GROUP_SCHEME_SIMILARITY = "similarity"
 GROUP_SCHEME_KEY_PCA_ANGLE = "key_pca_angle"
 SUPPORTED_GROUP_SCHEMES = (GROUP_SCHEME_SIMILARITY, GROUP_SCHEME_KEY_PCA_ANGLE)
+KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED = "fixed"
+KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
+SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES = (
+    KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+    KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
+)
+KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
 
 
 def _scalar_from_npz(value, default=None):
@@ -162,6 +169,34 @@ def split_layer_groups_by_key_pca_angle(
     return groups
 
 
+def compute_key_pca_angle_threshold(
+    key_adjacent_angles_deg,
+    angle_threshold=90.0,
+    threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+):
+    if threshold_mode not in SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES:
+        raise ValueError(f"key_pca_angle_threshold_mode must be one of {SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES}.")
+    if threshold_mode == KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED:
+        if angle_threshold < 0.0 or angle_threshold > 180.0:
+            raise ValueError("angle_threshold must be in [0, 180].")
+        return float(angle_threshold), None
+
+    key_adjacent_angles_deg = np.asarray(key_adjacent_angles_deg, dtype=np.float64)
+    finite_angles = key_adjacent_angles_deg[np.isfinite(key_adjacent_angles_deg)]
+    if finite_angles.size == 0:
+        raise ValueError("key_pca_angle_threshold_mode mean_without_outliers requires at least one finite angle.")
+
+    q1 = float(np.percentile(finite_angles, 25.0))
+    q3 = float(np.percentile(finite_angles, 75.0))
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    filtered_angles = finite_angles[(finite_angles >= lower) & (finite_angles <= upper)]
+    if filtered_angles.size == 0:
+        filtered_angles = finite_angles
+    return float(np.mean(filtered_angles)), KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR
+
+
 def build_group_budget_stats(groups, ratio_layer_scores):
     group_scores = []
     for layers in groups:
@@ -232,6 +267,7 @@ def build_profile_from_similarity(
     group_scheme=GROUP_SCHEME_SIMILARITY,
     key_pca_adjacent_angles_deg=None,
     key_pca_angle_threshold=90.0,
+    key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
     temperature=0.1,
     min_weight=0.0,
 ):
@@ -243,14 +279,23 @@ def build_profile_from_similarity(
         raise ValueError("layer_indices must be 1D and match similarity size.")
     if group_scheme not in SUPPORTED_GROUP_SCHEMES:
         raise ValueError(f"group_scheme must be one of {SUPPORTED_GROUP_SCHEMES}.")
+    if key_pca_angle_threshold_mode not in SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES:
+        raise ValueError(f"key_pca_angle_threshold_mode must be one of {SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES}.")
 
+    effective_key_pca_angle_threshold = float(key_pca_angle_threshold)
+    key_pca_angle_threshold_outlier_method = None
     if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
         if key_pca_adjacent_angles_deg is None:
             raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
+        effective_key_pca_angle_threshold, key_pca_angle_threshold_outlier_method = compute_key_pca_angle_threshold(
+            key_pca_adjacent_angles_deg,
+            angle_threshold=key_pca_angle_threshold,
+            threshold_mode=key_pca_angle_threshold_mode,
+        )
         groups = split_layer_groups_by_key_pca_angle(
             layer_indices,
             key_pca_adjacent_angles_deg,
-            angle_threshold=key_pca_angle_threshold,
+            angle_threshold=effective_key_pca_angle_threshold,
             max_group_size=max_group_size,
         )
     else:
@@ -311,7 +356,10 @@ def build_profile_from_similarity(
         "source": "single_sample",
         "group_scheme": str(group_scheme),
         "group_threshold": float(group_threshold),
-        "key_pca_angle_threshold": float(key_pca_angle_threshold),
+        "key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
+        "effective_key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
+        "key_pca_angle_threshold_mode": str(key_pca_angle_threshold_mode),
+        "key_pca_angle_threshold_outlier_method": key_pca_angle_threshold_outlier_method,
         "mix_temperature": float(temperature),
         "mix_min_weight": float(min_weight),
         "max_group_size": int(max_group_size),
@@ -339,6 +387,7 @@ def build_profile_from_npz(
     group_scheme=GROUP_SCHEME_SIMILARITY,
     group_threshold=0.85,
     key_pca_angle_threshold=90.0,
+    key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
     max_group_size=6,
     temperature=0.1,
     min_weight=0.0,
@@ -362,6 +411,7 @@ def build_profile_from_npz(
         similarity_state=similarity_state,
         group_threshold=group_threshold,
         key_pca_angle_threshold=key_pca_angle_threshold,
+        key_pca_angle_threshold_mode=key_pca_angle_threshold_mode,
         max_group_size=max_group_size,
         attn_output_ratio=attn_output_ratio,
         attn_output_ratio_layer_indices=attn_output_ratio_layer_indices,
@@ -394,10 +444,19 @@ def parse_args():
     parser.add_argument("--similarity_npz", required=True, help="Path to one query-window similarity .npz file.")
     parser.add_argument("--attn_output_ratio_npz", default=None, help="Optional attn-output ratio .npz for group budget weights.")
     parser.add_argument("--hidden_state_pca_npz", default=None, help="Hidden-state PCA .npz used by --group_scheme key_pca_angle.")
-    parser.add_argument("--output", required=True, help="Output JSON profile path.")
+    parser.add_argument(
+        "--output",
+        default=os.path.join("hidden_mix_profile", "hidden_mix_profile.json"),
+        help="Output JSON profile path.",
+    )
     parser.add_argument("--group_scheme", choices=SUPPORTED_GROUP_SCHEMES, default=GROUP_SCHEME_SIMILARITY)
     parser.add_argument("--group_threshold", type=float, default=0.85)
     parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
+    parser.add_argument(
+        "--key_pca_angle_threshold_mode",
+        choices=SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES,
+        default=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+    )
     parser.add_argument("--max_group_size", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--min_weight", type=float, default=0.0)
@@ -413,6 +472,7 @@ def main():
         group_scheme=args.group_scheme,
         group_threshold=args.group_threshold,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
+        key_pca_angle_threshold_mode=args.key_pca_angle_threshold_mode,
         max_group_size=args.max_group_size,
         temperature=args.temperature,
         min_weight=args.min_weight,
