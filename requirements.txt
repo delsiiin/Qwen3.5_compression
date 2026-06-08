@@ -14,5 +14,7 @@ matplotlib
 seaborn
 rouge_score
 jieba
+rouge
+fuzzywuzzy
 # causal_conv1d
 # flash-linear-attention
