@@ -15,7 +15,11 @@ from attn_heatmap import (
     is_qwen_attn_heatmap_model,
 )
 from attn_output_ratio import AttnOutputRatioRunWriter
-from hidden_state_pca_observation import HiddenStatePCARunWriter
+from hidden_state_pca_observation import (
+    HiddenStatePCARunWriter,
+    PCA_SUBMODE_KEY_VALUE_STATES,
+    SUPPORTED_HIDDEN_STATE_PCA_SUBMODES,
+)
 from misc import (
     build_output_path,
     load_json,
@@ -473,6 +477,7 @@ def build_hidden_state_pca_run_writer(args, out_file):
         layer_spec=args.hidden_state_pca_layers,
         token_start=args.hidden_state_pca_token_start,
         token_end=args.hidden_state_pca_token_end,
+        submode=args.hidden_state_pca_submode,
     )
 
 
@@ -493,6 +498,11 @@ def validate_args(args):
         raise ValueError("--attn_output_ratio_max_prefill_tokens must be at least 1 when provided.")
     if args.hidden_state_pca_max_prefill_tokens is not None and args.hidden_state_pca_max_prefill_tokens < 1:
         raise ValueError("--hidden_state_pca_max_prefill_tokens must be at least 1 when provided.")
+    if args.hidden_state_pca_submode not in SUPPORTED_HIDDEN_STATE_PCA_SUBMODES:
+        raise ValueError(
+            "--hidden_state_pca_submode must be one of "
+            f"{sorted(SUPPORTED_HIDDEN_STATE_PCA_SUBMODES)}."
+        )
     if (
         args.hidden_state_pca_token_end is not None
         and args.hidden_state_pca_token_start >= 0
@@ -783,7 +793,14 @@ if __name__ == "__main__":
     parser.add_argument("--attn_output_ratio_dir", type=str, default="output_dir/results_longbench/attn_output_ratios")
     parser.add_argument("--attn_output_ratio_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25. Raw npz always stores every captured layer.")
     parser.add_argument("--attn_output_ratio_max_prefill_tokens", type=int, default=None, help="Skip attention-output ratio capture when the prefill token count exceeds this cap.")
-    parser.add_argument("--hidden_state_pca_mode", action="store_true", help="Capture per-layer key/value states for one token span during prefill and plot separate shared-PCA 2D scatters for key and value states.")
+    parser.add_argument("--hidden_state_pca_mode", action="store_true", help="Capture a token span during prefill and plot shared-PCA 2D scatters by layer.")
+    parser.add_argument(
+        "--hidden_state_pca_submode",
+        type=str,
+        choices=sorted(SUPPORTED_HIDDEN_STATE_PCA_SUBMODES),
+        default=PCA_SUBMODE_KEY_VALUE_STATES,
+        help="Submode for hidden-state PCA capture: key_value_states keeps the existing key/value projection plots; hidden_states captures decoder layer outputs and plots one shared-PCA scatter by layer.",
+    )
     parser.add_argument("--hidden_state_pca_dir", type=str, default="output_dir/results_longbench/hidden_state_pca")
     parser.add_argument("--hidden_state_pca_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25.")
     parser.add_argument("--hidden_state_pca_token_start", type=int, default=0, help="Start token index for hidden-state PCA span. Negative values count from the prompt end.")

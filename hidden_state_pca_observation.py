@@ -16,8 +16,15 @@ from query_window_similarity import extract_hidden_tensor, get_decoder_layers, r
 
 PCA_FIT_SCOPE = "shared_layers_tokens"
 PCA_STATE_NAMES = ("key_states", "value_states")
+PCA_HIDDEN_STATE_NAMES = ("hidden_states",)
 PCA_COMPONENT_COUNT = 2
 PCA_TOKEN_SCOPE = "all_tokens"
+PCA_SUBMODE_KEY_VALUE_STATES = "key_value_states"
+PCA_SUBMODE_HIDDEN_STATES = "hidden_states"
+SUPPORTED_HIDDEN_STATE_PCA_SUBMODES = {
+    PCA_SUBMODE_KEY_VALUE_STATES,
+    PCA_SUBMODE_HIDDEN_STATES,
+}
 
 
 def _wrap_hook_without_kwargs(hook):
@@ -452,6 +459,18 @@ def compute_adjacent_layer_angles(centers):
     return angles
 
 
+def build_adjacent_layer_pairs(layer_indices):
+    if len(layer_indices) > 1:
+        return np.asarray(
+            [
+                [int(layer_indices[idx]), int(layer_indices[idx + 1])]
+                for idx in range(len(layer_indices) - 1)
+            ],
+            dtype=np.int16,
+        )
+    return np.empty((0, 2), dtype=np.int16)
+
+
 def plot_hidden_state_pca(pca_points, layer_indices, output_path, title, token_mask=None, empty_label="No tokens"):
     setup_matplotlib_cache()
     import matplotlib
@@ -625,6 +644,7 @@ class HiddenStatePCARunWriter:
         layer_spec="all",
         token_start=0,
         token_end=None,
+        submode=PCA_SUBMODE_KEY_VALUE_STATES,
     ):
         self.root_dir = root_dir
         self.model_name = model_name
@@ -633,6 +653,12 @@ class HiddenStatePCARunWriter:
         self.layer_spec = layer_spec or "all"
         self.token_start = 0 if token_start is None else int(token_start)
         self.token_end = int(token_end) if token_end is not None else None
+        self.submode = submode or PCA_SUBMODE_KEY_VALUE_STATES
+        if self.submode not in SUPPORTED_HIDDEN_STATE_PCA_SUBMODES:
+            raise ValueError(
+                "hidden_state_pca submode must be one of "
+                f"{sorted(SUPPORTED_HIDDEN_STATE_PCA_SUBMODES)}, got: {self.submode}"
+            )
         self.run_dir = build_run_dir(root_dir, out_file)
         self.samples_dir = os.path.join(self.run_dir, "samples")
         self.manifest_path = os.path.join(self.run_dir, "manifest.json")
@@ -668,7 +694,12 @@ class HiddenStatePCARunWriter:
             "model_name": self.model_name,
             "result_path": self.out_file,
             "hidden_state_pca_fit_scope": PCA_FIT_SCOPE,
-            "hidden_state_pca_states": list(PCA_STATE_NAMES),
+            "hidden_state_pca_submode": self.submode,
+            "hidden_state_pca_states": list(
+                PCA_HIDDEN_STATE_NAMES
+                if self.submode == PCA_SUBMODE_HIDDEN_STATES
+                else PCA_STATE_NAMES
+            ),
             "hidden_state_pca_components": PCA_COMPONENT_COUNT,
             "hidden_state_pca_layers": self.layer_spec,
             "hidden_state_pca_token_start": self.token_start,
@@ -713,6 +744,7 @@ class HiddenStatePCASampleWriter:
             "prefill_index": prefill_index,
             "label": label,
             "status": "pending",
+            "submode": self.run_writer.submode,
             "prompt_text": prompt_text,
             "max_prefill_tokens": prefill_cap,
             "token_count": len(input_ids),
@@ -726,16 +758,21 @@ class HiddenStatePCASampleWriter:
             "pca_file": None,
             "key_plot_file": None,
             "value_plot_file": None,
+            "hidden_plot_file": None,
             "key_angle_plot_file": None,
             "value_angle_plot_file": None,
+            "hidden_angle_plot_file": None,
             "key_pca_shape": None,
             "value_pca_shape": None,
+            "hidden_pca_shape": None,
             "layer_indices": [],
             "adjacent_layer_pairs": [],
             "key_adjacent_layer_angles_deg": [],
             "value_adjacent_layer_angles_deg": [],
+            "hidden_adjacent_layer_angles_deg": [],
             "key_explained_variance_ratio": [],
             "value_explained_variance_ratio": [],
+            "hidden_explained_variance_ratio": [],
             "token_scope": PCA_TOKEN_SCOPE,
         }
         self.prefills.append(record)
@@ -748,6 +785,19 @@ class HiddenStatePCASampleWriter:
             return record
 
         try:
+            if self.run_writer.submode == PCA_SUBMODE_HIDDEN_STATES:
+                self._capture_hidden_states_prefill(
+                    record=record,
+                    prefill_index=prefill_index,
+                    label=label,
+                    input_ids=input_ids,
+                    model=model,
+                    tokenizer=tokenizer,
+                    inputs=inputs,
+                )
+                self._write_sample_json()
+                return record
+
             (
                 key_pca_points,
                 value_pca_points,
@@ -783,16 +833,7 @@ class HiddenStatePCASampleWriter:
             value_layer_centers = compute_pca_layer_centers(value_pca_points)
             key_adjacent_angles = compute_adjacent_layer_angles(key_layer_centers)
             value_adjacent_angles = compute_adjacent_layer_angles(value_layer_centers)
-            if len(layer_indices) > 1:
-                adjacent_layer_pairs = np.asarray(
-                    [
-                        [int(layer_indices[idx]), int(layer_indices[idx + 1])]
-                        for idx in range(len(layer_indices) - 1)
-                    ],
-                    dtype=np.int16,
-                )
-            else:
-                adjacent_layer_pairs = np.empty((0, 2), dtype=np.int16)
+            adjacent_layer_pairs = build_adjacent_layer_pairs(layer_indices)
             np.savez_compressed(
                 pca_path,
                 key_pca_points=key_pca_points.astype(np.float32, copy=False),
@@ -814,6 +855,7 @@ class HiddenStatePCASampleWriter:
                 value_pca_components=value_components.astype(np.float32, copy=False),
                 hidden_state_pca_fit_scope=np.asarray(PCA_FIT_SCOPE),
                 hidden_state_pca_states=np.asarray(PCA_STATE_NAMES),
+                hidden_state_pca_submode=np.asarray(self.run_writer.submode),
                 hidden_state_pca_token_scope=np.asarray(PCA_TOKEN_SCOPE),
             )
             record["status"] = "saved"
@@ -877,6 +919,86 @@ class HiddenStatePCASampleWriter:
         self._write_sample_json()
         return record
 
+    def _capture_hidden_states_prefill(self, record, prefill_index, label, input_ids, model, tokenizer, inputs):
+        (
+            pca_points,
+            layer_indices,
+            components,
+            mean,
+            explained,
+            actual_token_start,
+            actual_token_end,
+        ) = compute_hidden_state_pca(
+            model=model,
+            inputs=inputs,
+            layer_spec=self.run_writer.layer_spec,
+            token_start=self.run_writer.token_start,
+            token_end=self.run_writer.token_end,
+        )
+        pca_file_name = f"prefill_{prefill_index:03d}_hidden_state_pca.npz"
+        plot_file_name = f"prefill_{prefill_index:03d}_hidden_state_pca.png"
+        angle_plot_file_name = f"prefill_{prefill_index:03d}_hidden_state_layer_angle.png"
+        pca_path = os.path.join(self.sample_dir, pca_file_name)
+        plot_path = os.path.join(self.sample_dir, plot_file_name)
+        angle_plot_path = os.path.join(self.sample_dir, angle_plot_file_name)
+        token_count = int(pca_points.shape[1])
+        selected_token_ids = input_ids[actual_token_start:actual_token_end]
+        layer_centers = compute_pca_layer_centers(pca_points)
+        adjacent_angles = compute_adjacent_layer_angles(layer_centers)
+        adjacent_layer_pairs = build_adjacent_layer_pairs(layer_indices)
+        np.savez_compressed(
+            pca_path,
+            hidden_pca_points=pca_points.astype(np.float32, copy=False),
+            layer_indices=np.asarray(layer_indices, dtype=np.int16),
+            adjacent_layer_pairs=adjacent_layer_pairs,
+            token_ids=np.asarray(selected_token_ids, dtype=np.int64),
+            token_start=np.asarray(actual_token_start, dtype=np.int64),
+            token_end=np.asarray(actual_token_end, dtype=np.int64),
+            hidden_layer_centers=layer_centers.astype(np.float32, copy=False),
+            hidden_adjacent_layer_angles_deg=adjacent_angles.astype(np.float32, copy=False),
+            hidden_explained_variance_ratio=explained.astype(np.float32, copy=False),
+            hidden_pca_mean=mean.astype(np.float32, copy=False),
+            hidden_pca_components=components.astype(np.float32, copy=False),
+            hidden_state_pca_fit_scope=np.asarray(PCA_FIT_SCOPE),
+            hidden_state_pca_states=np.asarray(PCA_HIDDEN_STATE_NAMES),
+            hidden_state_pca_submode=np.asarray(self.run_writer.submode),
+            hidden_state_pca_token_scope=np.asarray(PCA_TOKEN_SCOPE),
+        )
+        record["status"] = "saved"
+        record["pca_file"] = pca_file_name
+        record["hidden_pca_shape"] = list(pca_points.shape)
+        record["layer_indices"] = [int(layer_idx) for layer_idx in layer_indices]
+        record["adjacent_layer_pairs"] = adjacent_layer_pairs.astype(int).tolist()
+        record["actual_token_start"] = int(actual_token_start)
+        record["actual_token_end"] = int(actual_token_end)
+        record["selected_token_count"] = token_count
+        record["selected_tokens"] = build_token_entries(tokenizer, selected_token_ids)
+        record["hidden_adjacent_layer_angles_deg"] = [
+            None if not np.isfinite(value) else float(value)
+            for value in adjacent_angles.tolist()
+        ]
+        record["hidden_explained_variance_ratio"] = [float(value) for value in explained.tolist()]
+        try:
+            plot_hidden_state_pca(
+                pca_points=pca_points,
+                layer_indices=layer_indices,
+                output_path=plot_path,
+                title=f"{label}: hidden-state PCA",
+                empty_label="No tokens in selected span",
+            )
+            record["hidden_plot_file"] = plot_file_name
+            plot_adjacent_layer_angle_curve(
+                layer_indices=layer_indices,
+                angles_deg=adjacent_angles,
+                output_path=angle_plot_path,
+                title=f"{label}: hidden-state adjacent-layer center-vector angle",
+            )
+            record["hidden_angle_plot_file"] = angle_plot_file_name
+        except Exception as plot_exc:
+            record["status"] = "saved_npz_plot_error"
+            record["plot_error"] = str(plot_exc)
+
+
     def finalize(self, item):
         self.result_summary = extract_result_summary(item)
         self._write_sample_json()
@@ -887,18 +1009,22 @@ class HiddenStatePCASampleWriter:
             "prefill_index",
             "label",
             "status",
+            "submode",
             "token_count",
             "actual_token_start",
             "actual_token_end",
             "selected_token_count",
             "key_pca_shape",
             "value_pca_shape",
+            "hidden_pca_shape",
             "layer_indices",
             "adjacent_layer_pairs",
             "key_adjacent_layer_angles_deg",
             "value_adjacent_layer_angles_deg",
+            "hidden_adjacent_layer_angles_deg",
             "key_explained_variance_ratio",
             "value_explained_variance_ratio",
+            "hidden_explained_variance_ratio",
             "reason",
             "error",
             "plot_error",
