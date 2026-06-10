@@ -9,7 +9,6 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-from datasets import load_dataset
 from tqdm import tqdm
 
 from attn_heatmap import is_qwen_attn_heatmap_model
@@ -37,22 +36,17 @@ LONG_BENCH_DATASETS = [
     "narrativeqa",
     "qasper",
     "multifieldqa_en",
-    "multifieldqa_zh",
     "hotpotqa",
     "2wikimqa",
     "musique",
-    "dureader",
     "gov_report",
     "qmsum",
     "multi_news",
-    "vcsum",
     "trec",
     "triviaqa",
     "samsum",
-    "lsht",
     "passage_count",
     "passage_retrieval_en",
-    "passage_retrieval_zh",
     "lcc",
     "repobench-p",
 ]
@@ -72,6 +66,8 @@ LONG_BENCH_E_DATASETS = [
     "lcc",
     "repobench-p",
 ]
+
+LONG_BENCH_V1_DATA_DIR = os.path.join("data", "LongBench_v1")
 
 
 def seed_everything(seed):
@@ -146,16 +142,29 @@ def load_longbench_v1(datasets, use_longbench_e=False):
     examples = []
     for dataset_name in datasets:
         config_name = f"{dataset_name}_e" if use_longbench_e else dataset_name
-        dataset = load_dataset("THUDM/LongBench", config_name, split="test")
-        for index, item in enumerate(dataset):
-            item = dict(item)
-            item["_id"] = str(item.get("_id") or f"{config_name}:{index}")
-            item["dataset"] = dataset_name
-            item["split"] = "test"
-            item["longbench_e"] = bool(use_longbench_e)
-            if "question" not in item and "input" in item:
-                item["question"] = item["input"]
-            examples.append(item)
+        data_file = os.path.join(LONG_BENCH_V1_DATA_DIR, f"{config_name}.jsonl")
+        if not os.path.exists(data_file):
+            raise FileNotFoundError(f"LongBench v1 data file not found: {data_file}")
+
+        with open(data_file, encoding="utf-8") as fin:
+            for index, line in enumerate(fin):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Malformed JSON in {data_file}:{index + 1}: {exc}"
+                    ) from exc
+
+                item["_id"] = str(item.get("_id") or f"{config_name}:{index}")
+                item["dataset"] = dataset_name
+                item["split"] = "test"
+                item["longbench_e"] = bool(use_longbench_e)
+                if "question" not in item and "input" in item:
+                    item["question"] = item["input"]
+                examples.append(item)
     return examples
 
 
