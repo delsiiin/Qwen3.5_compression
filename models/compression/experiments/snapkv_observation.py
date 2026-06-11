@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -6,7 +7,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from ..utils import compute_attention_scores
 
@@ -17,6 +17,7 @@ class SnapKVObservationConfig:
     window_size: int = 8
     kernel_size: int = 7
     max_prefill_tokens: int | None = None
+    hidden_mix_profile_path: str | None = None
 
     def __post_init__(self):
         if self.budget < 1:
@@ -32,76 +33,27 @@ class SnapKVObservationConfig:
 
 
 @dataclass
-class SnapKVSelection:
-    attn_cache: torch.Tensor
-    indices: torch.Tensor
-
-
-@dataclass
 class CapturedLayer:
     layer_idx: int
     attention: torch.nn.Module
-    hidden_window: torch.Tensor
+    hidden_states: torch.Tensor
+    attn_output: torch.Tensor | None
     query_states: torch.Tensor
     key_states: torch.Tensor
-    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None
 
 
 @dataclass
 class SnapKVObservationResult:
     summary: dict[str, Any]
-    orig_attn_cache: np.ndarray
-    neighbor_avg_attn_cache: np.ndarray
-    orig_indices: np.ndarray
-    neighbor_avg_indices: np.ndarray
-    layer_indices: np.ndarray
+    hidden_mix_attn_cache: np.ndarray
+    hidden_mix_cos_importance_pre_exp: np.ndarray
+    hidden_mix_cos_importance: np.ndarray
+    hidden_mix_mixed_cache: np.ndarray
+    hidden_mix_indices: np.ndarray
+    hidden_mix_layer_indices: np.ndarray
 
 
-def compute_snapkv_selection(
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    budget: int,
-    window_size: int = 8,
-    kernel_size: int = 7,
-) -> SnapKVSelection:
-    bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
-    num_key_value_groups = query_states.shape[1] // num_key_value_heads
-    if kv_cache_len < budget:
-        raise ValueError("kv_cache_len must be at least budget.")
-    if kv_cache_len <= window_size:
-        raise ValueError("kv_cache_len must be greater than window_size.")
-
-    topk = budget - window_size
-    candidate_len = kv_cache_len - window_size
-    if topk > candidate_len:
-        raise ValueError("budget - window_size cannot exceed candidate key count.")
-
-    attn_weights = compute_attention_scores(query_states, key_states)
-
-    attention_mask = torch.ones_like(attn_weights) * float("-inf")
-    attention_mask = torch.triu(attention_mask, diagonal=key_states.shape[-2] - window_size + 1)
-    attn_weights += attention_mask
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_weights = attn_weights[..., :-window_size]
-
-    window_bias = attn_weights[..., -window_size:].sum(dim=-1).mean().item()
-
-    scores = attn_weights.view(
-        bsz, num_key_value_heads, num_key_value_groups, window_size, kv_cache_len - window_size
-    )
-    attn_weights_sum = scores.mean(dim=2).mean(dim=-2)
-
-    attn_cache = F.max_pool1d(
-        attn_weights_sum,
-        kernel_size=kernel_size,
-        padding=kernel_size // 2,
-        stride=1,
-    )
-    indices = attn_cache.topk(topk, dim=-1).indices
-    return SnapKVSelection(attn_cache=attn_cache, indices=indices)
-
-
-def compute_snapkv_neighbor_observation(
+def compute_snapkv_observation(
     model: torch.nn.Module,
     inputs: dict[str, torch.Tensor],
     config: SnapKVObservationConfig,
@@ -110,7 +62,7 @@ def compute_snapkv_neighbor_observation(
     if input_ids is None:
         raise ValueError("inputs must include input_ids.")
     if input_ids.shape[0] != 1:
-        raise ValueError("SnapKV neighbor observation currently supports batch size 1 only.")
+        raise ValueError("SnapKV observation currently supports batch size 1 only.")
 
     token_count = int(input_ids.shape[-1])
     summary = {
@@ -128,125 +80,26 @@ def compute_snapkv_neighbor_observation(
         return _empty_result(summary)
 
     layers = _get_decoder_layers(model)
-    if len(layers) < 3:
+    if not layers:
         summary["status"] = "error"
-        summary["reason"] = "At least three decoder layers are required."
+        summary["reason"] = "No decoder layers were found."
         return _empty_result(summary)
 
     captured = _capture_layers(model, inputs, layers, config.window_size)
-    orig_attn_cache = []
-    neighbor_avg_attn_cache = []
-    orig_indices = []
-    neighbor_avg_indices = []
-    valid_layer_indices = []
-    selections_by_layer = {}
-
-    for layer_idx in range(1, len(layers) - 1):
-        layer_summary = {"layer_idx": layer_idx, "status": "pending"}
-        prev_capture = captured.get(layer_idx - 1)
-        cur_capture = captured.get(layer_idx)
-        next_capture = captured.get(layer_idx + 1)
-        if prev_capture is None or cur_capture is None or next_capture is None:
-            layer_summary["status"] = "skipped_missing_capture"
-            summary["layers"].append(layer_summary)
-            continue
-
-        kv_cache_len = int(cur_capture.key_states.shape[-2])
-        candidate_len = kv_cache_len - config.window_size
-        topk = config.budget - config.window_size
-        layer_summary.update(
-            {
-                "kv_cache_len": kv_cache_len,
-                "candidate_len": candidate_len,
-                "topk": topk,
-            }
-        )
-        if kv_cache_len < config.budget:
-            layer_summary["status"] = "skipped_short_kv_cache"
-            summary["layers"].append(layer_summary)
-            continue
-        if candidate_len < topk or candidate_len < 1:
-            layer_summary["status"] = "skipped_insufficient_candidates"
-            summary["layers"].append(layer_summary)
-            continue
-
-        try:
-            orig_selection = compute_snapkv_selection(
-                cur_capture.query_states,
-                cur_capture.key_states,
-                budget=config.budget,
-                window_size=config.window_size,
-                kernel_size=config.kernel_size,
-            )
-            avg_hidden_window = (
-                prev_capture.hidden_window
-                + cur_capture.hidden_window
-                + next_capture.hidden_window
-            ) / 3.0
-            with torch.inference_mode():
-                neighbor_query = _project_query_window(
-                    cur_capture.attention,
-                    avg_hidden_window,
-                    cur_capture.position_embeddings,
-                )
-            neighbor_query = neighbor_query.detach().to(dtype=torch.float32, device="cpu")
-            neighbor_selection = compute_snapkv_selection(
-                neighbor_query,
-                cur_capture.key_states,
-                budget=config.budget,
-                window_size=config.window_size,
-                kernel_size=config.kernel_size,
-            )
-            selections_by_layer[layer_idx] = {
-                "orig": orig_selection,
-                "neighbor": neighbor_selection,
-            }
-        except Exception as exc:
-            layer_summary["status"] = "error"
-            layer_summary["error"] = str(exc)
-            summary["layers"].append(layer_summary)
-            continue
-
-        summary["layers"].append(layer_summary)
-
-        valid_layer_indices.append(layer_idx)
-        orig_attn_cache.append(_to_numpy(orig_selection.attn_cache.squeeze(0), dtype=np.float32))
-        neighbor_avg_attn_cache.append(
-            _to_numpy(neighbor_selection.attn_cache.squeeze(0), dtype=np.float32)
-        )
-        orig_indices.append(_to_numpy(orig_selection.indices.squeeze(0), dtype=np.int64))
-        neighbor_avg_indices.append(_to_numpy(neighbor_selection.indices.squeeze(0), dtype=np.int64))
-
-    for layer_summary in summary["layers"]:
-        layer_idx = layer_summary["layer_idx"]
-        layer_pair = selections_by_layer.get(layer_idx)
-        if layer_summary.get("status") != "pending" or layer_pair is None:
-            continue
-        prev_pair = selections_by_layer.get(layer_idx - 1)
-        next_pair = selections_by_layer.get(layer_idx + 1)
-        layer_summary.update(
-            _build_layer_metrics(
-                layer_idx=layer_idx,
-                prev_pair=prev_pair,
-                orig_selection=layer_pair["orig"],
-                next_pair=next_pair,
-                neighbor_selection=layer_pair["neighbor"],
-            )
-        )
-
-    summary["valid_layer_indices"] = valid_layer_indices
-    summary["status"] = "saved" if valid_layer_indices else "no_valid_layers"
+    hidden_mix_result = _compute_hidden_mix_observation(captured, config)
+    summary.update(hidden_mix_result["summary"])
     return SnapKVObservationResult(
         summary=summary,
-        orig_attn_cache=_stack_or_empty(orig_attn_cache, np.float32),
-        neighbor_avg_attn_cache=_stack_or_empty(neighbor_avg_attn_cache, np.float32),
-        orig_indices=_stack_or_empty(orig_indices, np.int64),
-        neighbor_avg_indices=_stack_or_empty(neighbor_avg_indices, np.int64),
-        layer_indices=np.asarray(valid_layer_indices, dtype=np.int16),
+        hidden_mix_attn_cache=_stack_or_empty(hidden_mix_result["attn_cache"], np.float32),
+        hidden_mix_cos_importance_pre_exp=_stack_or_empty(hidden_mix_result["cos_importance_pre_exp"], np.float32),
+        hidden_mix_cos_importance=_stack_or_empty(hidden_mix_result["cos_importance"], np.float32),
+        hidden_mix_mixed_cache=_stack_or_empty(hidden_mix_result["mixed_cache"], np.float32),
+        hidden_mix_indices=_stack_or_empty(hidden_mix_result["indices"], np.int64),
+        hidden_mix_layer_indices=np.asarray(hidden_mix_result["layer_indices"], dtype=np.int16),
     )
 
 
-def save_snapkv_neighbor_observation(
+def save_snapkv_observation(
     result: SnapKVObservationResult,
     output_dir: str,
     prefix: str = "snapkv_observation",
@@ -254,7 +107,7 @@ def save_snapkv_neighbor_observation(
     os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, f"{prefix}_summary.json")
     npz_path = os.path.join(output_dir, f"{prefix}.npz")
-    image_paths = plot_snapkv_neighbor_observation(result, output_dir, prefix=prefix)
+    image_paths = plot_snapkv_observation(result, output_dir, prefix=prefix)
     result.summary["image_files"] = {
         name: os.path.basename(path) for name, path in image_paths.items()
     }
@@ -264,21 +117,22 @@ def save_snapkv_neighbor_observation(
 
     np.savez_compressed(
         npz_path,
-        orig_attn_cache=result.orig_attn_cache,
-        neighbor_avg_attn_cache=result.neighbor_avg_attn_cache,
-        orig_indices=result.orig_indices,
-        neighbor_avg_indices=result.neighbor_avg_indices,
-        layer_indices=result.layer_indices,
+        hidden_mix_attn_cache=result.hidden_mix_attn_cache,
+        hidden_mix_cos_importance_pre_exp=result.hidden_mix_cos_importance_pre_exp,
+        hidden_mix_cos_importance=result.hidden_mix_cos_importance,
+        hidden_mix_mixed_cache=result.hidden_mix_mixed_cache,
+        hidden_mix_indices=result.hidden_mix_indices,
+        hidden_mix_layer_indices=result.hidden_mix_layer_indices,
     )
     return {"summary": summary_path, "npz": npz_path, "images": image_paths}
 
 
-def plot_snapkv_neighbor_observation(
+def plot_snapkv_observation(
     result: SnapKVObservationResult,
     output_dir: str,
     prefix: str = "snapkv_observation",
 ) -> dict[str, str]:
-    if result.layer_indices.size == 0:
+    if result.hidden_mix_layer_indices.size == 0:
         return {}
 
     _setup_matplotlib_cache()
@@ -290,14 +144,83 @@ def plot_snapkv_neighbor_observation(
     os.makedirs(output_dir, exist_ok=True)
     image_paths = {}
 
-    image_paths["indices"] = os.path.join(output_dir, f"{prefix}_retained_indices.png")
-    _plot_retained_indices(result, image_paths["indices"], plt)
+    image_paths["hidden_mix_attn_cache_by_token"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_attn_cache_by_token.png",
+    )
+    _plot_hidden_mix_by_token(
+        result.hidden_mix_attn_cache,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_attn_cache_by_token"],
+        title="snapkv_hidden_mix attn_cache by token position",
+        ylabel="attn_cache score",
+        plt=plt,
+    )
 
-    image_paths["overlap"] = os.path.join(output_dir, f"{prefix}_indices_overlap.png")
-    _plot_indices_overlap(result, image_paths["overlap"], plt)
+    image_paths["hidden_mix_cos_importance_pre_exp_distribution"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_cos_importance_pre_exp_distribution.png",
+    )
+    _plot_hidden_mix_distribution(
+        result.hidden_mix_cos_importance_pre_exp,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_cos_importance_pre_exp_distribution"],
+        title="snapkv_hidden_mix cos_importance before exp distribution",
+        xlabel="cosine before exp",
+        plt=plt,
+    )
 
-    image_paths["attn_cache"] = os.path.join(output_dir, f"{prefix}_attn_cache.png")
-    _plot_attn_cache(result, image_paths["attn_cache"], plt)
+    image_paths["hidden_mix_cos_importance_pre_exp_by_token"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_cos_importance_pre_exp_by_token.png",
+    )
+    _plot_hidden_mix_by_token(
+        result.hidden_mix_cos_importance_pre_exp,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_cos_importance_pre_exp_by_token"],
+        title="snapkv_hidden_mix cos_importance before exp by token position",
+        ylabel="cosine before exp",
+        plt=plt,
+    )
+
+    image_paths["hidden_mix_cos_importance_distribution"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_cos_importance_distribution.png",
+    )
+    _plot_hidden_mix_distribution(
+        result.hidden_mix_cos_importance,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_cos_importance_distribution"],
+        title="snapkv_hidden_mix cos_importance distribution",
+        xlabel="cos_importance",
+        plt=plt,
+    )
+
+    image_paths["hidden_mix_cos_importance_by_token"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_cos_importance_by_token.png",
+    )
+    _plot_hidden_mix_by_token(
+        result.hidden_mix_cos_importance,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_cos_importance_by_token"],
+        title="snapkv_hidden_mix cos_importance by token position",
+        ylabel="cos_importance",
+        plt=plt,
+    )
+
+    image_paths["hidden_mix_mixed_cache_by_token"] = os.path.join(
+        output_dir,
+        f"{prefix}_hidden_mix_mixed_cache_by_token.png",
+    )
+    _plot_hidden_mix_by_token(
+        result.hidden_mix_mixed_cache,
+        result.hidden_mix_layer_indices,
+        image_paths["hidden_mix_mixed_cache_by_token"],
+        title="snapkv_hidden_mix mixed_cache by token position",
+        ylabel="mixed_cache score",
+        plt=plt,
+    )
 
     return image_paths
 
@@ -307,7 +230,7 @@ def _capture_layers(model, inputs, layers, window_size):
     handles = []
 
     def make_hook(layer_idx):
-        def hook(module, args, kwargs, _output):
+        def hook(module, args, kwargs, output):
             hidden_states = _get_arg_or_kwarg(args, kwargs, 0, "hidden_states")
             if hidden_states is None or not torch.is_tensor(hidden_states) or hidden_states.ndim != 3:
                 return
@@ -316,16 +239,21 @@ def _capture_layers(model, inputs, layers, window_size):
             if actual_window_size < 1:
                 return
             with torch.inference_mode():
-                hidden_window = hidden_states[:, -actual_window_size:, :].detach()
-                query_states = _project_query_window(module, hidden_window, position_embeddings)
+                query_hidden_states = hidden_states[:, -actual_window_size:, :].detach()
+                query_states = _project_query_window(module, query_hidden_states, position_embeddings)
                 key_states = _project_key_states(module, hidden_states, position_embeddings)
+                attn_output = _extract_attention_output(output)
             captured[layer_idx] = CapturedLayer(
                 layer_idx=layer_idx,
                 attention=module,
-                hidden_window=hidden_window.detach().to(dtype=torch.float32, device="cpu").clone(),
+                hidden_states=hidden_states.detach().to(dtype=torch.float32, device="cpu").clone(),
+                attn_output=(
+                    attn_output.detach().to(dtype=torch.float32, device="cpu").clone()
+                    if torch.is_tensor(attn_output)
+                    else None
+                ),
                 query_states=query_states.detach().to(dtype=torch.float32, device="cpu").clone(),
                 key_states=key_states.detach().to(dtype=torch.float32, device="cpu").clone(),
-                position_embeddings=_detach_position_embeddings(position_embeddings, actual_window_size),
             )
 
         return hook
@@ -347,6 +275,407 @@ def _capture_layers(model, inputs, layers, window_size):
     return captured
 
 
+def _compute_hidden_mix_observation(captured, config):
+    result = {
+        "summary": {
+            "status": "pending",
+            "profile_path": config.hidden_mix_profile_path,
+            "valid_layer_indices": [],
+            "layers": [],
+        },
+        "attn_cache": [],
+        "cos_importance_pre_exp": [],
+        "cos_importance": [],
+        "mixed_cache": [],
+        "indices": [],
+        "layer_indices": [],
+    }
+    try:
+        profile = _load_hidden_mix_profile(config.hidden_mix_profile_path)
+    except Exception as exc:
+        result["summary"]["status"] = "error"
+        result["summary"]["error"] = str(exc)
+        return result
+
+    if profile.get("path") is not None:
+        result["summary"]["profile_path"] = profile["path"]
+        result["summary"]["profile_metric"] = profile.get("metric")
+
+    entries = {}
+    topk = config.budget - config.window_size
+    for layer_idx in sorted(captured):
+        capture = captured[layer_idx]
+        layer_summary = {"layer_idx": int(layer_idx), "status": "pending"}
+        kv_cache_len = int(capture.key_states.shape[-2])
+        candidate_len = kv_cache_len - config.window_size
+        layer_summary.update(
+            {
+                "kv_cache_len": kv_cache_len,
+                "candidate_len": candidate_len,
+                "topk": topk,
+            }
+        )
+        if kv_cache_len < config.budget:
+            layer_summary["status"] = "skipped_short_kv_cache"
+            result["summary"]["layers"].append(layer_summary)
+            continue
+        if candidate_len < topk or candidate_len < 1:
+            layer_summary["status"] = "skipped_insufficient_candidates"
+            result["summary"]["layers"].append(layer_summary)
+            continue
+
+        try:
+            attn_cache = compute_snapkv_hidden_mix_attn_cache(
+                capture.key_states,
+                capture.query_states,
+                window_size=config.window_size,
+                kernel_size=config.kernel_size,
+            )
+            cos_importance_pre_exp, cos_importance = compute_snapkv_hidden_mix_cos_importance(
+                attention=capture.attention,
+                hidden_states=capture.hidden_states,
+                attn_output=capture.attn_output,
+                num_key_value_heads=attn_cache.shape[1],
+                hist_len=attn_cache.shape[-1],
+                return_pre_exp=True,
+            )
+            cos_importance_pre_exp = cos_importance_pre_exp.to(device=attn_cache.device, dtype=attn_cache.dtype)
+            cos_importance = cos_importance.to(device=attn_cache.device, dtype=attn_cache.dtype)
+            if cos_importance.shape != attn_cache.shape:
+                raise ValueError("snapkv_hidden_mix cosine importance must match attn_cache shape.")
+            if cos_importance_pre_exp.shape != attn_cache.shape:
+                raise ValueError("snapkv_hidden_mix pre-exp cosine importance must match attn_cache shape.")
+            entries[int(layer_idx)] = {
+                "attn_cache": attn_cache,
+                "cos_importance_pre_exp": cos_importance_pre_exp,
+                "cos_importance": cos_importance,
+            }
+            layer_summary["status"] = "cached"
+        except Exception as exc:
+            layer_summary["status"] = "error"
+            layer_summary["error"] = str(exc)
+        result["summary"]["layers"].append(layer_summary)
+
+    for layer_summary in result["summary"]["layers"]:
+        layer_idx = int(layer_summary["layer_idx"])
+        if layer_summary.get("status") != "cached":
+            continue
+        try:
+            mix = _hidden_mix_for_layer(profile, layer_idx)
+            mixed_cache = compute_snapkv_hidden_mix_mixed_cache(entries, layer_idx, mix)
+            keep_count = min(topk, mixed_cache.shape[-1])
+            indices = mixed_cache.topk(keep_count, dim=-1).indices
+            entry = entries[layer_idx]
+
+            result["attn_cache"].append(_to_numpy(entry["attn_cache"].squeeze(0), dtype=np.float32))
+            result["cos_importance_pre_exp"].append(
+                _to_numpy(entry["cos_importance_pre_exp"].squeeze(0), dtype=np.float32)
+            )
+            result["cos_importance"].append(_to_numpy(entry["cos_importance"].squeeze(0), dtype=np.float32))
+            result["mixed_cache"].append(_to_numpy(mixed_cache.squeeze(0), dtype=np.float32))
+            result["indices"].append(_to_numpy(indices.squeeze(0), dtype=np.int64))
+            result["layer_indices"].append(layer_idx)
+
+            layer_summary.update(
+                {
+                    "status": "saved",
+                    "mix": _mix_summary(mix),
+                    "attn_cache_shape": list(entry["attn_cache"].shape),
+                    "cos_importance_pre_exp_shape": list(entry["cos_importance_pre_exp"].shape),
+                    "cos_importance_shape": list(entry["cos_importance"].shape),
+                    "mixed_cache_shape": list(mixed_cache.shape),
+                    "indices_shape": list(indices.shape),
+                    "attn_cache": _distribution_stats_by_head(entry["attn_cache"]),
+                    "cos_importance_pre_exp": _distribution_stats_by_head(entry["cos_importance_pre_exp"]),
+                    "cos_importance": _distribution_stats_by_head(entry["cos_importance"]),
+                    "mixed_cache": _distribution_stats_by_head(mixed_cache),
+                }
+            )
+        except Exception as exc:
+            layer_summary["status"] = "error"
+            layer_summary["error"] = str(exc)
+
+    result["summary"]["valid_layer_indices"] = [int(layer_idx) for layer_idx in result["layer_indices"]]
+    result["summary"]["status"] = "saved" if result["layer_indices"] else "no_valid_layers"
+    return result
+
+
+def compute_snapkv_hidden_mix_attn_cache(
+    key_states: torch.Tensor,
+    query_states: torch.Tensor,
+    window_size: int = 8,
+    kernel_size: int = 7,
+) -> torch.Tensor:
+    bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+    num_key_value_groups = query_states.shape[1] // num_key_value_heads
+    query_window = min(int(window_size), int(query_states.shape[-2]))
+    query_states = query_states[:, :, -query_window:, :]
+    if kv_cache_len <= window_size:
+        raise ValueError("kv_cache_len must be greater than window_size.")
+
+    attn_weights = compute_attention_scores(query_states, key_states)
+    attention_mask = torch.ones_like(attn_weights) * float("-inf")
+    attention_mask = torch.triu(attention_mask, diagonal=kv_cache_len - query_window + 1)
+    attn_weights = attn_weights + attention_mask
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = attn_weights[..., :-window_size]
+
+    hist_len = kv_cache_len - window_size
+    scores = attn_weights.view(
+        bsz,
+        num_key_value_heads,
+        num_key_value_groups,
+        query_window,
+        hist_len,
+    )
+    attn_weights_sum = scores.mean(dim=2).mean(dim=-2)
+    return F.max_pool1d(
+        attn_weights_sum,
+        kernel_size=kernel_size,
+        padding=kernel_size // 2,
+        stride=1,
+    )
+
+
+def compute_snapkv_hidden_mix_cos_importance(
+    attention,
+    hidden_states,
+    attn_output,
+    num_key_value_heads,
+    hist_len,
+    importance_epsilon=1e-12,
+    return_pre_exp=False,
+):
+    def maybe_return(pre_exp, importance):
+        if return_pre_exp:
+            return pre_exp, importance
+        return importance
+
+    if (
+        hidden_states is None
+        or attn_output is None
+        or not torch.is_tensor(hidden_states)
+        or not torch.is_tensor(attn_output)
+        or hidden_states.ndim != 3
+        or attn_output.ndim != 3
+        or hist_len < 1
+    ):
+        if torch.is_tensor(hidden_states):
+            device = hidden_states.device
+        elif torch.is_tensor(attn_output):
+            device = attn_output.device
+        else:
+            device = torch.device("cpu")
+        importance = torch.ones(1, int(num_key_value_heads), int(hist_len), device=device)
+        pre_exp = torch.zeros_like(importance)
+        return maybe_return(pre_exp, importance)
+
+    batch_size = hidden_states.shape[0]
+    actual_len = min(int(hidden_states.shape[1]), int(attn_output.shape[1]), int(hist_len))
+    device = hidden_states.device
+    pre_exp = torch.zeros(
+        batch_size,
+        int(num_key_value_heads),
+        int(hist_len),
+        dtype=torch.float32,
+        device=device,
+    )
+    importance = torch.ones(
+        batch_size,
+        int(num_key_value_heads),
+        int(hist_len),
+        dtype=torch.float32,
+        device=device,
+    )
+    if actual_len < 1:
+        return maybe_return(pre_exp, importance)
+
+    input_vectors = hidden_states[:, :actual_len, :].detach().to(dtype=torch.float32)
+    output_vectors = attn_output[:, :actual_len, :].detach().to(device=device, dtype=torch.float32)
+    cosine = _token_cosine(input_vectors, output_vectors, importance_epsilon)
+
+    num_attention_heads = getattr(getattr(attention, "config", None), "num_attention_heads", None)
+    head_dim = getattr(attention, "head_dim", None)
+    hidden_size = input_vectors.shape[-1]
+    if (
+        num_attention_heads is not None
+        and head_dim is not None
+        and int(num_attention_heads) > 0
+        and int(num_key_value_heads) > 0
+        and int(num_attention_heads) % int(num_key_value_heads) == 0
+        and hidden_size == int(num_attention_heads) * int(head_dim)
+        and output_vectors.shape[-1] == hidden_size
+    ):
+        num_attention_heads = int(num_attention_heads)
+        head_dim = int(head_dim)
+        num_key_value_groups = num_attention_heads // int(num_key_value_heads)
+        head_input = input_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+        head_output = output_vectors.view(batch_size, actual_len, num_attention_heads, head_dim)
+        head_cosine = _token_cosine(head_input, head_output, importance_epsilon)
+        cosine = head_cosine.transpose(1, 2).reshape(
+            batch_size,
+            int(num_key_value_heads),
+            num_key_value_groups,
+            actual_len,
+        ).mean(dim=2)
+    else:
+        cosine = cosine[:, None, :].expand(batch_size, int(num_key_value_heads), actual_len)
+
+    cosine = cosine.clamp(min=-1.0, max=1.0)
+    pre_exp[:, :, :actual_len] = cosine
+    importance[:, :, :actual_len] = torch.exp(cosine)
+    return maybe_return(pre_exp, importance)
+
+
+def compute_snapkv_hidden_mix_mixed_cache(entries, target_layer, mix):
+    entry = entries[int(target_layer)]
+    mixed_cache = None
+    for source_layer, weight in zip(mix["sources"], mix["weights"]):
+        source_entry = entries.get(int(source_layer))
+        if source_entry is None:
+            raise ValueError(f"snapkv_hidden_mix profile source layer {source_layer} was not captured.")
+        source_cache = source_entry["attn_cache"].to(
+            device=entry["attn_cache"].device,
+            dtype=entry["attn_cache"].dtype,
+        )
+        if source_cache.shape != entry["attn_cache"].shape:
+            raise ValueError("snapkv_hidden_mix requires matching attn_cache shapes within a layer group.")
+        normalized_cache = _normalize_hidden_mix_attn_cache(source_cache)
+        weighted = normalized_cache * float(weight)
+        mixed_cache = weighted if mixed_cache is None else mixed_cache + weighted
+
+    importance = entry["cos_importance"].to(device=mixed_cache.device, dtype=mixed_cache.dtype)
+    if importance.shape != mixed_cache.shape:
+        raise ValueError("snapkv_hidden_mix cosine importance must match mixed attn_cache shape.")
+    return mixed_cache * importance
+
+
+def _token_cosine(input_vectors, output_vectors, importance_epsilon):
+    dot = (input_vectors * output_vectors).sum(dim=-1)
+    input_norm = input_vectors.square().sum(dim=-1).sqrt()
+    output_norm = output_vectors.square().sum(dim=-1).sqrt()
+    denom = (input_norm * output_norm).clamp_min(float(importance_epsilon))
+    return (dot / denom).clamp(min=-1.0, max=1.0)
+
+
+def _normalize_hidden_mix_attn_cache(attn_cache):
+    rank_cache = attn_cache.to(dtype=torch.float32)
+    mean = rank_cache.mean(dim=-1, keepdim=True)
+    centered = rank_cache - mean
+    std = centered.square().mean(dim=-1, keepdim=True).sqrt()
+    std = std.clamp_min(torch.finfo(rank_cache.dtype).eps)
+    return (centered / std).to(dtype=attn_cache.dtype)
+
+
+def _load_hidden_mix_profile(profile_path):
+    if profile_path is None:
+        return {"metric": None, "groups": {}, "layer_to_group": {}, "path": None}
+
+    profile_path = os.path.abspath(os.path.expanduser(str(profile_path)))
+    with open(profile_path, "r", encoding="utf-8") as handle:
+        raw_profile = json.load(handle)
+    if not isinstance(raw_profile, dict):
+        raise ValueError(f"Hidden mix profile must be a JSON object: {profile_path}")
+    groups = raw_profile.get("groups")
+    if not isinstance(groups, list):
+        raise ValueError("Hidden mix profile requires a list field named 'groups'.")
+
+    layer_to_group = {}
+    group_profiles = {}
+    for group_idx, group_spec in enumerate(groups):
+        if not isinstance(group_spec, dict):
+            raise ValueError(f"Profile group {group_idx} must be an object.")
+        layers = group_spec.get("layers")
+        if not isinstance(layers, list) or not layers:
+            raise ValueError(f"Profile group {group_idx} requires non-empty 'layers'.")
+        layers = tuple(int(layer) for layer in layers)
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"Profile group {group_idx} contains duplicate layers.")
+        for layer in layers:
+            if layer in layer_to_group:
+                raise ValueError(f"Layer {layer} appears in multiple hidden mix groups.")
+            layer_to_group[layer] = layers
+
+        raw_mix = group_spec.get("mix", {})
+        if raw_mix is None:
+            raw_mix = {}
+        if not isinstance(raw_mix, dict):
+            raise ValueError(f"Profile group {group_idx} mix must be an object.")
+        mix = {}
+        for target_text, mix_spec in raw_mix.items():
+            target_layer = int(target_text)
+            if target_layer not in layers:
+                raise ValueError(f"Profile group {group_idx} has mix target outside layers: {target_layer}.")
+            if not isinstance(mix_spec, dict):
+                raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} must be an object.")
+            sources = mix_spec.get("sources")
+            weights = mix_spec.get("weights")
+            if not isinstance(sources, list) or not isinstance(weights, list) or len(sources) != len(weights):
+                raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} needs equal sources/weights lists.")
+            if not sources:
+                raise ValueError(f"Profile group {group_idx} mix for layer {target_layer} must not be empty.")
+            parsed_sources = tuple(int(source) for source in sources)
+            parsed_weights = tuple(float(weight) for weight in weights)
+            if any(source not in layers for source in parsed_sources):
+                raise ValueError(f"Profile group {group_idx} mix source must stay within its group.")
+            weight_sum = float(sum(parsed_weights))
+            if (not math.isfinite(weight_sum)) or weight_sum <= 0.0:
+                raise ValueError(f"Profile group {group_idx} mix weights must have a positive finite sum.")
+            if any((not math.isfinite(weight)) or weight < 0.0 for weight in parsed_weights):
+                raise ValueError(f"Profile group {group_idx} mix weights must be finite and non-negative.")
+            mix[target_layer] = {
+                "sources": parsed_sources,
+                "weights": tuple(weight / weight_sum for weight in parsed_weights),
+            }
+        group_profiles[layers] = {"mix": mix}
+
+    return {
+        "metric": raw_profile.get("metric"),
+        "groups": group_profiles,
+        "layer_to_group": layer_to_group,
+        "path": profile_path,
+    }
+
+
+def _hidden_mix_for_layer(profile, target_layer):
+    target_layer = int(target_layer)
+    group_layers = profile["layer_to_group"].get(target_layer, (target_layer,))
+    group = profile["groups"].get(tuple(group_layers), {})
+    mix = group.get("mix", {}).get(target_layer)
+    if mix is None:
+        return {
+            "sources": (target_layer,),
+            "weights": (1.0,),
+            "group_layers": tuple(group_layers),
+            "fallback_to_self": True,
+        }
+    return {
+        "sources": tuple(int(source) for source in mix["sources"]),
+        "weights": tuple(float(weight) for weight in mix["weights"]),
+        "group_layers": tuple(group_layers),
+        "fallback_to_self": False,
+    }
+
+
+def _mix_summary(mix):
+    return {
+        "sources": [int(source) for source in mix["sources"]],
+        "weights": [float(weight) for weight in mix["weights"]],
+        "group_layers": [int(layer_idx) for layer_idx in mix["group_layers"]],
+        "fallback_to_self": bool(mix["fallback_to_self"]),
+    }
+
+
+def _extract_attention_output(output):
+    if torch.is_tensor(output):
+        return output
+    if isinstance(output, (tuple, list)) and output:
+        first = output[0]
+        if torch.is_tensor(first):
+            return first
+    return None
+
+
 def _setup_matplotlib_cache():
     cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "snapkv_observation_matplotlib_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -354,94 +683,61 @@ def _setup_matplotlib_cache():
     os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
 
 
-def _plot_retained_indices(result, output_path, plt):
-    orig = np.asarray(result.orig_indices)
-    neighbor = np.asarray(result.neighbor_avg_indices)
-    row_labels = _layer_head_labels(result.layer_indices, orig.shape[1])
-    fig_width = _wide_fig_size(orig.shape[-1])
-    fig_height = max(4.0, min(18.0, 0.22 * max(1, len(row_labels)) + 2.0))
+def _plot_hidden_mix_distribution(values, layer_indices, output_path, title, xlabel, plt):
+    values = np.asarray(values, dtype=np.float32)
+    layer_indices = np.asarray(layer_indices)
+    layer_count = values.shape[0]
+    if layer_count == 0:
+        return
+
+    ncols = 2 if layer_count <= 12 else 3
+    nrows = int(np.ceil(layer_count / ncols))
+    fig_width = max(9.0, min(24.0, ncols * 6.2))
+    fig_height = max(4.0, min(28.0, nrows * 3.2))
     fig, axes = plt.subplots(
-        2,
-        1,
+        nrows,
+        ncols,
         figsize=(fig_width, fig_height),
         dpi=160,
-        sharex=True,
-        constrained_layout=True,
+        squeeze=False,
     )
-    arrays = [
-        ("Original SnapKV retained indices", orig.reshape(-1, orig.shape[-1])),
-        ("Neighbor-average query retained indices", neighbor.reshape(-1, neighbor.shape[-1])),
-    ]
-    vmin = float(min(orig.min(), neighbor.min()))
-    vmax = float(max(orig.max(), neighbor.max()))
-    for ax, (title, values) in zip(axes, arrays):
-        image = ax.imshow(values, aspect="auto", interpolation="nearest", cmap="viridis", vmin=vmin, vmax=vmax)
-        ax.set_title(title)
-        ax.set_ylabel("Layer:head")
-        _set_sparse_row_labels(ax, row_labels)
-    axes[-1].set_xlabel("Top-k rank")
-    colorbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02)
-    colorbar.set_label("Retained token index")
+    axes_flat = axes.reshape(-1)
+    for layer_pos, ax in enumerate(axes_flat):
+        if layer_pos >= layer_count:
+            ax.axis("off")
+            continue
+        layer_values = values[layer_pos].reshape(-1)
+        layer_idx = int(layer_indices[layer_pos])
+        if layer_values.size == 0:
+            ax.axis("off")
+            continue
+        lower = float(np.min(layer_values))
+        upper = float(np.max(layer_values))
+        if lower == upper:
+            ax.axvline(lower, color="#3b82f6", linewidth=1.8)
+            ax.set_ylim(0.0, 1.0)
+        else:
+            ax.hist(layer_values, bins=60, density=True, color="#3b82f6", alpha=0.78)
+        ax.set_title(f"Layer {layer_idx}")
+        ax.grid(alpha=0.22, linewidth=0.8)
+        if layer_pos % ncols == 0:
+            ax.set_ylabel("Density")
+        if layer_pos >= (nrows - 1) * ncols:
+            ax.set_xlabel(xlabel)
+
+    fig.suptitle(title, y=0.995)
+    fig.subplots_adjust(top=0.90, hspace=0.35, wspace=0.18)
+    fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
 
 
-def _plot_indices_overlap(result, output_path, plt):
-    import matplotlib
-
-    overlap_panels = [
-        ("Current layer vs merged query", _overlap_matrix_from_summary(result, "overlap")),
-        ("Previous layer vs merged query", _overlap_matrix_from_summary(result, "prev_layer_overlap")),
-        ("Next layer vs merged query", _overlap_matrix_from_summary(result, "next_layer_overlap")),
-    ]
-    first_overlap = overlap_panels[0][1]
-    layer_labels = [str(int(layer_idx)) for layer_idx in result.layer_indices.tolist()]
-    head_labels = [str(head_idx) for head_idx in range(first_overlap.shape[1])]
-    fig_width = max(9.0, min(24.0, 0.42 * first_overlap.shape[1] * len(overlap_panels) + 5.0))
-    fig_height = max(4.0, min(12.0, 0.32 * first_overlap.shape[0] + 2.8))
-    fig, axes = plt.subplots(1, 3, figsize=(fig_width, fig_height), dpi=160, sharey=True)
-    cmap = matplotlib.colormaps["magma"].copy()
-    cmap.set_bad(color="#f2f2f2")
-    image = None
-    for panel_idx, (title, overlap) in enumerate(overlap_panels):
-        ax = axes[panel_idx]
-        image = ax.imshow(overlap, aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=1.0)
-        ax.set_title(title)
-        ax.set_xlabel("KV head")
-        if panel_idx == 0:
-            ax.set_ylabel("Layer")
-            _set_sparse_ticks(ax, axis="y", labels=layer_labels)
-        _set_sparse_ticks(ax, axis="x", labels=head_labels)
-        if overlap.shape[0] * overlap.shape[1] <= 160:
-            for layer_pos in range(overlap.shape[0]):
-                for head_pos in range(overlap.shape[1]):
-                    value = overlap[layer_pos, head_pos]
-                    if np.isnan(value):
-                        continue
-                    ax.text(
-                        head_pos,
-                        layer_pos,
-                        f"{value:.2f}",
-                        ha="center",
-                        va="center",
-                        color="white" if value < 0.65 else "black",
-                        fontsize=7,
-                    )
-    fig.suptitle("Retained-index overlap with merged neighbor query")
-    colorbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.02)
-    colorbar.set_label("Intersection / top-k")
-    fig.subplots_adjust(top=0.86, wspace=0.12)
-    fig.savefig(output_path)
-    plt.close(fig)
-
-
-def _plot_attn_cache(result, output_path, plt):
-    orig = np.asarray(result.orig_attn_cache, dtype=np.float32)
-    neighbor = np.asarray(result.neighbor_avg_attn_cache, dtype=np.float32)
-    orig_curves = orig.mean(axis=1)
-    neighbor_curves = neighbor.mean(axis=1)
-    token_positions = np.arange(orig_curves.shape[-1])
-    layer_count = orig_curves.shape[0]
+def _plot_hidden_mix_by_token(values, layer_indices, output_path, title, ylabel, plt, max_points=4096):
+    values = np.asarray(values, dtype=np.float32)
+    layer_indices = np.asarray(layer_indices)
+    layer_count = values.shape[0]
+    if layer_count == 0:
+        return
 
     ncols = 2 if layer_count <= 12 else 3
     nrows = int(np.ceil(layer_count / ncols))
@@ -453,7 +749,6 @@ def _plot_attn_cache(result, output_path, plt):
         figsize=(fig_width, fig_height),
         dpi=160,
         sharex=True,
-        sharey=True,
         squeeze=False,
     )
     axes_flat = axes.reshape(-1)
@@ -461,82 +756,49 @@ def _plot_attn_cache(result, output_path, plt):
         if layer_pos >= layer_count:
             ax.axis("off")
             continue
-        layer_idx = int(result.layer_indices[layer_pos])
-        ax.plot(token_positions, orig_curves[layer_pos], label="Original SnapKV", linewidth=1.4)
-        ax.plot(token_positions, neighbor_curves[layer_pos], label="Neighbor-average query", linewidth=1.4)
+        layer_values = values[layer_pos]
+        layer_idx = int(layer_indices[layer_pos])
+        if layer_values.size == 0 or layer_values.ndim != 2:
+            ax.axis("off")
+            continue
+
+        token_positions = np.arange(layer_values.shape[-1])
+        mean = layer_values.mean(axis=0)
+        q25 = np.quantile(layer_values, 0.25, axis=0)
+        q75 = np.quantile(layer_values, 0.75, axis=0)
+        lower = layer_values.min(axis=0)
+        upper = layer_values.max(axis=0)
+        keep = _plot_sample_indices(layer_values.shape[-1], max_points=max_points)
+
+        x = token_positions[keep]
+        ax.fill_between(x, lower[keep], upper[keep], color="#93c5fd", alpha=0.16, linewidth=0.0, label="min-max")
+        ax.fill_between(x, q25[keep], q75[keep], color="#60a5fa", alpha=0.28, linewidth=0.0, label="25-75%")
+        ax.plot(x, mean[keep], color="#1d4ed8", linewidth=1.2, label="mean")
         ax.set_title(f"Layer {layer_idx}")
-        ax.grid(alpha=0.25, linewidth=0.8)
+        ax.grid(alpha=0.22, linewidth=0.8)
         if layer_pos % ncols == 0:
-            ax.set_ylabel("Score")
+            ax.set_ylabel(ylabel)
         if layer_pos >= (nrows - 1) * ncols:
-            ax.set_xlabel("Token index")
+            ax.set_xlabel("Historical token index")
 
     handles, labels = axes_flat[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2)
-    fig.suptitle("attn_cache score by token position", y=0.995)
-    fig.subplots_adjust(top=0.90, hspace=0.35, wspace=0.16)
+    if handles:
+        fig.legend(handles, labels, loc="upper center", ncol=3)
+    fig.suptitle(title, y=0.995)
+    fig.subplots_adjust(top=0.90, hspace=0.35, wspace=0.18)
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
 
 
-def _compute_overlap_matrix(orig_indices, neighbor_indices):
-    orig = np.asarray(orig_indices)
-    neighbor = np.asarray(neighbor_indices)
-    overlap = np.zeros(orig.shape[:2], dtype=np.float32)
-    topk = orig.shape[-1]
-    if topk < 1:
-        return overlap
-    for layer_pos in range(orig.shape[0]):
-        for head_pos in range(orig.shape[1]):
-            orig_set = set(orig[layer_pos, head_pos].tolist())
-            neighbor_set = set(neighbor[layer_pos, head_pos].tolist())
-            overlap[layer_pos, head_pos] = len(orig_set & neighbor_set) / topk
-    return overlap
-
-
-def _overlap_matrix_from_summary(result, summary_key):
-    saved_layers = [layer for layer in result.summary.get("layers", []) if layer.get("status") == "saved"]
-    head_count = result.orig_indices.shape[1]
-    matrix = np.full((len(saved_layers), head_count), np.nan, dtype=np.float32)
-    for layer_pos, layer in enumerate(saved_layers):
-        values = layer.get(summary_key, {}).get("per_head", [])
-        if values:
-            matrix[layer_pos, : min(head_count, len(values))] = np.asarray(values[:head_count], dtype=np.float32)
-    return matrix
-
-
-def _layer_head_labels(layer_indices, head_count):
-    labels = []
-    for layer_idx in layer_indices.tolist():
-        for head_idx in range(head_count):
-            labels.append(f"{int(layer_idx)}:{head_idx}")
-    return labels
-
-
-def _wide_fig_size(width_count):
-    return max(8.0, min(24.0, 0.018 * max(1, width_count) + 6.0))
-
-
-def _set_sparse_row_labels(ax, labels):
-    _set_sparse_ticks(ax, axis="y", labels=labels)
-
-
-def _set_sparse_ticks(ax, axis, labels):
-    count = len(labels)
-    if count == 0:
-        return
-    tick_step = max(1, count // 16)
-    positions = np.arange(0, count, tick_step)
-    tick_labels = [labels[pos] for pos in positions]
-    if axis == "x":
-        ax.set_xticks(positions)
-        ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-    elif axis == "y":
-        ax.set_yticks(positions)
-        ax.set_yticklabels(tick_labels)
-    else:
-        raise ValueError(f"Unsupported axis: {axis}")
+def _plot_sample_indices(width_count, max_points=4096):
+    width_count = int(width_count)
+    max_points = int(max_points)
+    if width_count <= 0:
+        return np.asarray([], dtype=np.int64)
+    if max_points < 1 or width_count <= max_points:
+        return np.arange(width_count, dtype=np.int64)
+    return np.unique(np.linspace(0, width_count - 1, num=max_points, dtype=np.int64))
 
 
 def _wrap_hook_without_kwargs(hook):
@@ -561,13 +823,13 @@ def _run_observation_forward(model, inputs):
             return model(**forward_kwargs)
 
 
-def _project_query_window(attention, hidden_window, position_embeddings):
+def _project_query_window(attention, hidden_states_window, position_embeddings):
     device = _module_device(attention)
     dtype = _module_dtype(attention)
-    hidden_window = hidden_window.to(device=device, dtype=dtype)
+    hidden_states_window = hidden_states_window.to(device=device, dtype=dtype)
     head_dim = _get_head_dim(attention)
-    input_shape = hidden_window.shape[:-1]
-    q_proj = attention.q_proj(hidden_window)
+    input_shape = hidden_states_window.shape[:-1]
+    q_proj = attention.q_proj(hidden_states_window)
     num_attention_heads = _get_num_attention_heads(attention, q_proj.shape[-1], head_dim)
 
     if _uses_gated_query_projection(attention, q_proj.shape[-1], num_attention_heads, head_dim):
@@ -640,15 +902,6 @@ def _slice_position_embedding(position_embedding, seq_len):
     if position_embedding.ndim >= 3:
         return position_embedding[:, -seq_len:, :]
     return position_embedding
-
-
-def _detach_position_embeddings(position_embeddings, window_size):
-    if position_embeddings is None:
-        return None
-    cos, sin = position_embeddings
-    cos = _slice_position_embedding(cos.detach(), window_size).to(dtype=torch.float32, device="cpu").clone()
-    sin = _slice_position_embedding(sin.detach(), window_size).to(dtype=torch.float32, device="cpu").clone()
-    return cos, sin
 
 
 def _position_embeddings_to_device(position_embeddings, device):
@@ -745,103 +998,6 @@ def _module_dtype(module):
         return torch.float32
 
 
-def _build_layer_metrics(layer_idx, prev_pair, orig_selection, next_pair, neighbor_selection):
-    orig_cache = orig_selection.attn_cache.detach().to(dtype=torch.float32, device="cpu")
-    neighbor_cache = neighbor_selection.attn_cache.detach().to(dtype=torch.float32, device="cpu")
-    orig_idx = orig_selection.indices.detach().to(device="cpu")
-    neighbor_idx = neighbor_selection.indices.detach().to(device="cpu")
-
-    per_head_cosine = []
-    per_head_l1 = []
-    per_head_l2 = []
-    for head_idx in range(orig_cache.shape[1]):
-        orig_vec = orig_cache[0, head_idx].reshape(-1)
-        neighbor_vec = neighbor_cache[0, head_idx].reshape(-1)
-        per_head_cosine.append(float(F.cosine_similarity(orig_vec, neighbor_vec, dim=0).item()))
-        diff = orig_vec - neighbor_vec
-        per_head_l1.append(float(diff.abs().mean().item()))
-        per_head_l2.append(float(torch.sqrt((diff * diff).mean()).item()))
-
-    histogram_l1 = _histogram_l1(orig_cache.numpy(), neighbor_cache.numpy())
-    return {
-        "status": "saved",
-        "attn_cache_shape": list(orig_cache.shape),
-        "indices_shape": list(orig_idx.shape),
-        "overlap": _summarize_index_overlap(orig_idx, neighbor_idx),
-        "jaccard": _summarize_index_jaccard(orig_idx, neighbor_idx),
-        "prev_layer_overlap": _summarize_layer_pair_overlap(prev_pair),
-        "prev_layer_jaccard": _summarize_layer_pair_jaccard(prev_pair),
-        "next_layer_overlap": _summarize_layer_pair_overlap(next_pair),
-        "next_layer_jaccard": _summarize_layer_pair_jaccard(next_pair),
-        "attn_cache_cosine": _summarize_values(per_head_cosine, include_per_head=True),
-        "attn_cache_l1_diff": _summarize_values(per_head_l1, include_per_head=True),
-        "attn_cache_l2_diff": _summarize_values(per_head_l2, include_per_head=True),
-        "orig_attn_cache": _distribution_stats(orig_cache.numpy()),
-        "neighbor_avg_attn_cache": _distribution_stats(neighbor_cache.numpy()),
-        "histogram_l1": histogram_l1,
-    }
-
-
-def _summarize_layer_pair_overlap(layer_pair):
-    if layer_pair is None:
-        return _missing_pair_summary()
-    return _summarize_index_overlap(layer_pair["orig"].indices, layer_pair["neighbor"].indices)
-
-
-def _summarize_layer_pair_jaccard(layer_pair):
-    if layer_pair is None:
-        return _missing_pair_summary()
-    return _summarize_index_jaccard(layer_pair["orig"].indices, layer_pair["neighbor"].indices)
-
-
-def _missing_pair_summary():
-    return {
-        "status": "skipped_boundary",
-        "mean": None,
-        "min": None,
-        "max": None,
-        "per_head": [],
-    }
-
-
-def _summarize_index_overlap(left_indices, right_indices):
-    overlap, _jaccard = _compute_pairwise_index_overlap(left_indices, right_indices)
-    return _summarize_values(overlap, include_per_head=True)
-
-
-def _summarize_index_jaccard(left_indices, right_indices):
-    _overlap, jaccard = _compute_pairwise_index_overlap(left_indices, right_indices)
-    return _summarize_values(jaccard, include_per_head=True)
-
-
-def _compute_pairwise_index_overlap(left_indices, right_indices):
-    left = left_indices.detach().to(device="cpu") if torch.is_tensor(left_indices) else torch.as_tensor(left_indices)
-    right = right_indices.detach().to(device="cpu") if torch.is_tensor(right_indices) else torch.as_tensor(right_indices)
-    topk = int(left.shape[-1])
-    overlap = []
-    jaccard = []
-    for head_idx in range(left.shape[1]):
-        left_set = set(left[0, head_idx].tolist())
-        right_set = set(right[0, head_idx].tolist())
-        intersection = len(left_set & right_set)
-        union = len(left_set | right_set)
-        overlap.append(float(intersection / topk if topk else 0.0))
-        jaccard.append(float(intersection / union if union else 0.0))
-    return overlap, jaccard
-
-
-def _summarize_values(values, include_per_head=False):
-    array = np.asarray(values, dtype=np.float64)
-    summary = {
-        "mean": float(array.mean()) if array.size else 0.0,
-        "min": float(array.min()) if array.size else 0.0,
-        "max": float(array.max()) if array.size else 0.0,
-    }
-    if include_per_head:
-        summary["per_head"] = [float(value) for value in array.tolist()]
-    return summary
-
-
 def _distribution_stats(values):
     array = np.asarray(values, dtype=np.float64).reshape(-1)
     if array.size == 0:
@@ -867,19 +1023,15 @@ def _distribution_stats(values):
     }
 
 
-def _histogram_l1(orig_values, neighbor_values, bins=50):
-    orig = np.asarray(orig_values, dtype=np.float64).reshape(-1)
-    neighbor = np.asarray(neighbor_values, dtype=np.float64).reshape(-1)
-    if orig.size == 0 or neighbor.size == 0:
-        return 0.0
-    lower = float(min(orig.min(), neighbor.min()))
-    upper = float(max(orig.max(), neighbor.max()))
-    if lower == upper:
-        return 0.0
-    orig_hist, bin_edges = np.histogram(orig, bins=bins, range=(lower, upper), density=True)
-    neighbor_hist, _ = np.histogram(neighbor, bins=bin_edges, density=True)
-    bin_widths = np.diff(bin_edges)
-    return float(np.sum(np.abs(orig_hist - neighbor_hist) * bin_widths))
+def _distribution_stats_by_head(values):
+    array = _to_numpy(values, dtype=np.float32) if torch.is_tensor(values) else np.asarray(values, dtype=np.float32)
+    summary = _distribution_stats(array)
+    if array.ndim >= 3:
+        per_head = []
+        for head_idx in range(array.shape[1]):
+            per_head.append(_distribution_stats(array[:, head_idx, ...]))
+        summary["per_head"] = per_head
+    return summary
 
 
 def _to_numpy(tensor, dtype):
@@ -895,9 +1047,10 @@ def _stack_or_empty(items, dtype):
 def _empty_result(summary):
     return SnapKVObservationResult(
         summary=summary,
-        orig_attn_cache=np.asarray([], dtype=np.float32),
-        neighbor_avg_attn_cache=np.asarray([], dtype=np.float32),
-        orig_indices=np.asarray([], dtype=np.int64),
-        neighbor_avg_indices=np.asarray([], dtype=np.int64),
-        layer_indices=np.asarray([], dtype=np.int16),
+        hidden_mix_attn_cache=np.asarray([], dtype=np.float32),
+        hidden_mix_cos_importance_pre_exp=np.asarray([], dtype=np.float32),
+        hidden_mix_cos_importance=np.asarray([], dtype=np.float32),
+        hidden_mix_mixed_cache=np.asarray([], dtype=np.float32),
+        hidden_mix_indices=np.asarray([], dtype=np.int64),
+        hidden_mix_layer_indices=np.asarray([], dtype=np.int16),
     )

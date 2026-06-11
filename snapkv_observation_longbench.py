@@ -9,8 +9,8 @@ from attn_heatmap import (
 )
 from models.compression.experiments.snapkv_observation import (
     SnapKVObservationConfig,
-    compute_snapkv_neighbor_observation,
-    save_snapkv_neighbor_observation,
+    compute_snapkv_observation,
+    save_snapkv_observation,
 )
 
 
@@ -59,6 +59,7 @@ class SnapKVObservationRunWriter:
                 "window_size": self.config.window_size,
                 "kernel_size": self.config.kernel_size,
                 "max_prefill_tokens": self.config.max_prefill_tokens,
+                "hidden_mix_profile_path": self.config.hidden_mix_profile_path,
             },
             "sample_count": len(self.samples),
             "samples": self.samples,
@@ -105,13 +106,13 @@ class SnapKVObservationSampleWriter:
         self._write_sample_json()
 
         try:
-            result = compute_snapkv_neighbor_observation(
+            result = compute_snapkv_observation(
                 model=model,
                 inputs=inputs,
                 config=self.run_writer.config,
             )
             artifact_prefix = f"prefill_{prefill_index:03d}_snapkv_observation"
-            paths = save_snapkv_neighbor_observation(
+            paths = save_snapkv_observation(
                 result=result,
                 output_dir=self.sample_dir,
                 prefix=artifact_prefix,
@@ -176,6 +177,7 @@ def build_snapkv_observation_run_writer(args, out_file):
         window_size=args.snapkv_observation_window_size,
         kernel_size=args.snapkv_observation_kernel_size,
         max_prefill_tokens=args.snapkv_observation_max_prefill_tokens,
+        hidden_mix_profile_path=getattr(args, "hidden_mix_profile_path", None),
     )
     return SnapKVObservationRunWriter(
         root_dir=args.snapkv_observation_dir,
