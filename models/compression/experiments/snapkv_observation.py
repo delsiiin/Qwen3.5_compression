@@ -53,6 +53,14 @@ class SnapKVObservationResult:
     hidden_mix_layer_indices: np.ndarray
 
 
+@dataclass
+class SnapKVTopKOverlapResult:
+    summary: dict[str, Any]
+    snapkv_topk_indices: np.ndarray
+    snapkv_topk_overlap: np.ndarray
+    snapkv_topk_layer_indices: np.ndarray
+
+
 def compute_snapkv_observation(
     model: torch.nn.Module,
     inputs: dict[str, torch.Tensor],
@@ -99,6 +107,54 @@ def compute_snapkv_observation(
     )
 
 
+def compute_snapkv_topk_overlap_observation(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    config: SnapKVObservationConfig,
+) -> SnapKVTopKOverlapResult:
+    input_ids = inputs.get("input_ids")
+    if input_ids is None:
+        raise ValueError("inputs must include input_ids.")
+    if input_ids.shape[0] != 1:
+        raise ValueError("SnapKV topk overlap observation currently supports batch size 1 only.")
+
+    token_count = int(input_ids.shape[-1])
+    summary = {
+        "status": "pending",
+        "config": asdict(config),
+        "token_count": token_count,
+        "valid_layer_indices": [],
+        "layers": [],
+        "overlap_metric": "mean_head_intersection_over_topk",
+    }
+    if config.max_prefill_tokens is not None and token_count > config.max_prefill_tokens:
+        summary["status"] = "skipped_over_cap"
+        summary["reason"] = (
+            f"Prompt token count {token_count} exceeds cap {config.max_prefill_tokens}."
+        )
+        return _empty_topk_overlap_result(summary)
+
+    layers = _get_decoder_layers(model)
+    if not layers:
+        summary["status"] = "error"
+        summary["reason"] = "No decoder layers were found."
+        return _empty_topk_overlap_result(summary)
+
+    captured = _capture_layers(model, inputs, layers, config.window_size)
+    topk_result = _compute_snapkv_topk_overlap(captured, config)
+    summary.update(topk_result["summary"])
+    topk_indices = _stack_or_empty(topk_result["indices"], np.int64)
+    overlap = compute_snapkv_topk_overlap_matrix(topk_indices)
+    summary["topk_indices_shape"] = list(topk_indices.shape)
+    summary["overlap_shape"] = list(overlap.shape)
+    return SnapKVTopKOverlapResult(
+        summary=summary,
+        snapkv_topk_indices=topk_indices,
+        snapkv_topk_overlap=overlap,
+        snapkv_topk_layer_indices=np.asarray(topk_result["layer_indices"], dtype=np.int16),
+    )
+
+
 def save_snapkv_observation(
     result: SnapKVObservationResult,
     output_dir: str,
@@ -123,6 +179,31 @@ def save_snapkv_observation(
         hidden_mix_mixed_cache=result.hidden_mix_mixed_cache,
         hidden_mix_indices=result.hidden_mix_indices,
         hidden_mix_layer_indices=result.hidden_mix_layer_indices,
+    )
+    return {"summary": summary_path, "npz": npz_path, "images": image_paths}
+
+
+def save_snapkv_topk_overlap_observation(
+    result: SnapKVTopKOverlapResult,
+    output_dir: str,
+    prefix: str = "snapkv_topk_overlap",
+) -> dict[str, Any]:
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, f"{prefix}_summary.json")
+    npz_path = os.path.join(output_dir, f"{prefix}.npz")
+    image_paths = plot_snapkv_topk_overlap_observation(result, output_dir, prefix=prefix)
+    result.summary["image_files"] = {
+        name: os.path.basename(path) for name, path in image_paths.items()
+    }
+
+    with open(summary_path, "w", encoding="utf-8") as fout:
+        json.dump(result.summary, fout, ensure_ascii=False, indent=2)
+
+    np.savez_compressed(
+        npz_path,
+        snapkv_topk_indices=result.snapkv_topk_indices,
+        snapkv_topk_overlap=result.snapkv_topk_overlap,
+        snapkv_topk_layer_indices=result.snapkv_topk_layer_indices,
     )
     return {"summary": summary_path, "npz": npz_path, "images": image_paths}
 
@@ -222,6 +303,36 @@ def plot_snapkv_observation(
         plt=plt,
     )
 
+    return image_paths
+
+
+def plot_snapkv_topk_overlap_observation(
+    result: SnapKVTopKOverlapResult,
+    output_dir: str,
+    prefix: str = "snapkv_topk_overlap",
+) -> dict[str, str]:
+    if result.snapkv_topk_layer_indices.size == 0 or result.snapkv_topk_overlap.size == 0:
+        return {}
+
+    _setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+    image_paths = {
+        "snapkv_topk_overlap_heatmap": os.path.join(
+            output_dir,
+            f"{prefix}_heatmap.png",
+        )
+    }
+    _plot_snapkv_topk_overlap_heatmap(
+        result.snapkv_topk_overlap,
+        result.snapkv_topk_layer_indices,
+        image_paths["snapkv_topk_overlap_heatmap"],
+        plt=plt,
+    )
     return image_paths
 
 
@@ -398,6 +509,91 @@ def _compute_hidden_mix_observation(captured, config):
     result["summary"]["valid_layer_indices"] = [int(layer_idx) for layer_idx in result["layer_indices"]]
     result["summary"]["status"] = "saved" if result["layer_indices"] else "no_valid_layers"
     return result
+
+
+def _compute_snapkv_topk_overlap(captured, config):
+    result = {
+        "summary": {
+            "status": "pending",
+            "valid_layer_indices": [],
+            "layers": [],
+            "overlap_metric": "mean_head_intersection_over_topk",
+        },
+        "indices": [],
+        "layer_indices": [],
+    }
+    topk = config.budget - config.window_size
+    for layer_idx in sorted(captured):
+        capture = captured[layer_idx]
+        layer_summary = {"layer_idx": int(layer_idx), "status": "pending"}
+        kv_cache_len = int(capture.key_states.shape[-2])
+        candidate_len = kv_cache_len - config.window_size
+        layer_summary.update(
+            {
+                "kv_cache_len": kv_cache_len,
+                "candidate_len": candidate_len,
+                "topk": topk,
+            }
+        )
+        if kv_cache_len < config.budget:
+            layer_summary["status"] = "skipped_short_kv_cache"
+            result["summary"]["layers"].append(layer_summary)
+            continue
+        if candidate_len < topk or candidate_len < 1:
+            layer_summary["status"] = "skipped_insufficient_candidates"
+            result["summary"]["layers"].append(layer_summary)
+            continue
+
+        try:
+            attn_cache = compute_snapkv_hidden_mix_attn_cache(
+                capture.key_states,
+                capture.query_states,
+                window_size=config.window_size,
+                kernel_size=config.kernel_size,
+            )
+            keep_count = min(topk, attn_cache.shape[-1])
+            indices = attn_cache.topk(keep_count, dim=-1).indices
+            result["indices"].append(_to_numpy(indices.squeeze(0), dtype=np.int64))
+            result["layer_indices"].append(int(layer_idx))
+            layer_summary.update(
+                {
+                    "status": "saved",
+                    "attn_cache_shape": list(attn_cache.shape),
+                    "indices_shape": list(indices.shape),
+                }
+            )
+        except Exception as exc:
+            layer_summary["status"] = "error"
+            layer_summary["error"] = str(exc)
+        result["summary"]["layers"].append(layer_summary)
+
+    result["summary"]["valid_layer_indices"] = [int(layer_idx) for layer_idx in result["layer_indices"]]
+    result["summary"]["status"] = "saved" if result["layer_indices"] else "no_valid_layers"
+    return result
+
+
+def compute_snapkv_topk_overlap_matrix(topk_indices):
+    topk_indices = np.asarray(topk_indices)
+    if topk_indices.size == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    if topk_indices.ndim != 3:
+        raise ValueError("topk_indices must have shape [layer, kv_head, topk].")
+
+    layer_count, head_count, topk = topk_indices.shape
+    overlap = np.zeros((layer_count, layer_count), dtype=np.float32)
+    if layer_count == 0 or head_count == 0 or topk == 0:
+        return overlap
+
+    for src_layer in range(layer_count):
+        for dst_layer in range(layer_count):
+            head_scores = []
+            for head_idx in range(head_count):
+                src_indices = topk_indices[src_layer, head_idx]
+                dst_indices = topk_indices[dst_layer, head_idx]
+                intersection = np.intersect1d(src_indices, dst_indices, assume_unique=False).size
+                head_scores.append(float(intersection) / float(topk))
+            overlap[src_layer, dst_layer] = float(np.mean(head_scores))
+    return overlap
 
 
 def compute_snapkv_hidden_mix_attn_cache(
@@ -791,6 +987,41 @@ def _plot_hidden_mix_by_token(values, layer_indices, output_path, title, ylabel,
     plt.close(fig)
 
 
+def _plot_snapkv_topk_overlap_heatmap(overlap, layer_indices, output_path, plt):
+    overlap = np.asarray(overlap, dtype=np.float32)
+    layer_indices = np.asarray(layer_indices)
+    layer_count = overlap.shape[0]
+    if layer_count == 0:
+        return
+
+    fig_size = max(5.0, 0.28 * layer_count + 3.0)
+    tick_fontsize = max(4.0, min(10.0, 180.0 / max(layer_count, 1)))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=180)
+    image = ax.imshow(overlap, cmap="viridis", vmin=0.0, vmax=1.0, origin="upper")
+    ax.set_title("SnapKV topk index overlap by layer")
+    ax.set_xlabel("Layer id")
+    ax.set_ylabel("Layer id")
+
+    tick_positions = np.arange(layer_count, dtype=np.int64)
+    ax.set_xticks(tick_positions)
+    ax.set_yticks(tick_positions)
+    ax.set_xticklabels(
+        [str(int(layer_indices[idx])) for idx in tick_positions],
+        rotation=90,
+        ha="center",
+        fontsize=tick_fontsize,
+    )
+    ax.set_yticklabels(
+        [str(int(layer_indices[idx])) for idx in tick_positions],
+        fontsize=tick_fontsize,
+    )
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Mean per-head overlap")
+    ax.grid(False)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
 def _plot_sample_indices(width_count, max_points=4096):
     width_count = int(width_count)
     max_points = int(max_points)
@@ -1053,4 +1284,13 @@ def _empty_result(summary):
         hidden_mix_mixed_cache=np.asarray([], dtype=np.float32),
         hidden_mix_indices=np.asarray([], dtype=np.int64),
         hidden_mix_layer_indices=np.asarray([], dtype=np.int16),
+    )
+
+
+def _empty_topk_overlap_result(summary):
+    return SnapKVTopKOverlapResult(
+        summary=summary,
+        snapkv_topk_indices=np.asarray([], dtype=np.int64),
+        snapkv_topk_overlap=np.zeros((0, 0), dtype=np.float32),
+        snapkv_topk_layer_indices=np.asarray([], dtype=np.int16),
     )

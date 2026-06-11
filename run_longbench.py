@@ -37,6 +37,7 @@ from query_window_similarity import (
 from snapkv_observation_longbench import (
     add_snapkv_observation_args,
     build_snapkv_observation_run_writer,
+    build_snapkv_topk_overlap_run_writer,
     validate_snapkv_observation_args,
 )
 
@@ -336,6 +337,7 @@ def query_llm(
     attn_output_ratio_sample_writer=None,
     query_window_sample_writer=None,
     snapkv_observation_sample_writer=None,
+    snapkv_topk_overlap_sample_writer=None,
     hidden_state_pca_sample_writer=None,
     prefill_label="response",
 ):
@@ -372,6 +374,14 @@ def query_llm(
         )
     if snapkv_observation_sample_writer is not None:
         snapkv_observation_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
+    if snapkv_topk_overlap_sample_writer is not None:
+        snapkv_topk_overlap_sample_writer.capture_prefill(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt,
@@ -542,6 +552,7 @@ def get_pred(data, args, fout, out_file):
     query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
     attn_output_ratio_run_writer = build_attn_output_ratio_run_writer(args, out_file)
     snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
+    snapkv_topk_overlap_run_writer = build_snapkv_topk_overlap_run_writer(args, out_file)
     hidden_state_pca_run_writer = build_hidden_state_pca_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
@@ -559,6 +570,11 @@ def get_pred(data, args, fout, out_file):
         snapkv_observation_sample_writer = (
             snapkv_observation_run_writer.new_sample(item)
             if snapkv_observation_run_writer is not None
+            else None
+        )
+        snapkv_topk_overlap_sample_writer = (
+            snapkv_topk_overlap_run_writer.new_sample(item)
+            if snapkv_topk_overlap_run_writer is not None
             else None
         )
         hidden_state_pca_sample_writer = (
@@ -594,6 +610,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="cot_reasoning",
                 )
@@ -611,6 +628,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="response",
                 )
@@ -633,6 +651,7 @@ def get_pred(data, args, fout, out_file):
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
+                    snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
                     prefill_label="cot_answer_extraction",
                 )
@@ -664,6 +683,12 @@ def get_pred(data, args, fout, out_file):
                     snapkv_observation_sample_writer.sample_dir,
                     start=args.snapkv_observation_dir,
                 )
+            if snapkv_topk_overlap_sample_writer is not None:
+                item["snapkv_topk_overlap_status"] = snapkv_topk_overlap_sample_writer.build_capture_status()
+                item["snapkv_topk_overlap_artifact"] = os.path.relpath(
+                    snapkv_topk_overlap_sample_writer.sample_dir,
+                    start=args.snapkv_observation_dir,
+                )
             if hidden_state_pca_sample_writer is not None:
                 item["hidden_state_pca_status"] = hidden_state_pca_sample_writer.build_capture_status()
                 item["hidden_state_pca_artifact"] = os.path.relpath(
@@ -678,6 +703,8 @@ def get_pred(data, args, fout, out_file):
                 attn_output_ratio_sample_writer.finalize(item)
             if snapkv_observation_sample_writer is not None:
                 snapkv_observation_sample_writer.finalize(item)
+            if snapkv_topk_overlap_sample_writer is not None:
+                snapkv_topk_overlap_sample_writer.finalize(item)
             if hidden_state_pca_sample_writer is not None:
                 hidden_state_pca_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
@@ -715,6 +742,14 @@ def get_pred(data, args, fout, out_file):
                     start=args.snapkv_observation_dir,
                 )
                 snapkv_observation_sample_writer.finalize(item)
+            if snapkv_topk_overlap_sample_writer is not None:
+                item["error"] = str(exc)
+                item["snapkv_topk_overlap_status"] = snapkv_topk_overlap_sample_writer.build_capture_status()
+                item["snapkv_topk_overlap_artifact"] = os.path.relpath(
+                    snapkv_topk_overlap_sample_writer.sample_dir,
+                    start=args.snapkv_observation_dir,
+                )
+                snapkv_topk_overlap_sample_writer.finalize(item)
             if hidden_state_pca_sample_writer is not None:
                 item["error"] = str(exc)
                 item["hidden_state_pca_status"] = hidden_state_pca_sample_writer.build_capture_status()
