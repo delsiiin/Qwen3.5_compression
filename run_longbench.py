@@ -834,7 +834,7 @@ if __name__ == "__main__":
         type=str,
         choices=sorted(SUPPORTED_HIDDEN_STATE_PCA_SUBMODES),
         default=PCA_SUBMODE_KEY_VALUE_STATES,
-        help="Submode for hidden-state PCA capture: key_value_states keeps the existing key/value projection plots; hidden_states captures decoder layer outputs and plots one shared-PCA scatter by layer.",
+        help="Submode for hidden-state PCA capture: key_value_states keeps existing layer-wise key/value plots; key_value_heads plots per-layer key/value head PCA distributions; hidden_states captures decoder layer outputs.",
     )
     parser.add_argument("--hidden_state_pca_dir", type=str, default="output_dir/results_longbench/hidden_state_pca")
     parser.add_argument("--hidden_state_pca_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25.")

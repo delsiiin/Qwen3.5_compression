@@ -15,13 +15,16 @@ from query_window_similarity import extract_hidden_tensor, get_decoder_layers, r
 
 
 PCA_FIT_SCOPE = "shared_layers_tokens"
+PCA_HEAD_FIT_SCOPE = "shared_heads_tokens_per_layer"
 PCA_STATE_NAMES = ("key_states", "value_states")
 PCA_HIDDEN_STATE_NAMES = ("hidden_states",)
 PCA_COMPONENT_COUNT = 2
 PCA_TOKEN_SCOPE = "all_tokens"
 PCA_SUBMODE_KEY_VALUE_STATES = "key_value_states"
+PCA_SUBMODE_KEY_VALUE_HEADS = "key_value_heads"
 PCA_SUBMODE_HIDDEN_STATES = "hidden_states"
 SUPPORTED_HIDDEN_STATE_PCA_SUBMODES = {
+    PCA_SUBMODE_KEY_VALUE_HEADS,
     PCA_SUBMODE_KEY_VALUE_STATES,
     PCA_SUBMODE_HIDDEN_STATES,
 }
@@ -418,6 +421,73 @@ def compute_key_value_state_pca(
     )
 
 
+def compute_key_value_head_state_pca(
+    model,
+    inputs,
+    layer_spec="all",
+    token_start=0,
+    token_end=None,
+):
+    captured, layer_indices, actual_token_start, actual_token_end = collect_layer_key_value_states(
+        model=model,
+        inputs=inputs,
+        layer_spec=layer_spec,
+        token_start=token_start,
+        token_end=token_end,
+    )
+    min_key_heads = min(int(captured[layer_idx]["key_states"].shape[1]) for layer_idx in layer_indices)
+    min_value_heads = min(int(captured[layer_idx]["value_states"].shape[1]) for layer_idx in layer_indices)
+    min_key_dim = min(int(captured[layer_idx]["key_states"].shape[-1]) for layer_idx in layer_indices)
+    min_value_dim = min(int(captured[layer_idx]["value_states"].shape[-1]) for layer_idx in layer_indices)
+
+    key_pca_points = []
+    value_pca_points = []
+    key_components = []
+    value_components = []
+    key_means = []
+    value_means = []
+    key_explained = []
+    value_explained = []
+    for layer_idx in layer_indices:
+        layer_capture = captured[int(layer_idx)]
+        key_states = (
+            layer_capture["key_states"][0, :min_key_heads, actual_token_start:actual_token_end, :min_key_dim]
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        value_states = (
+            layer_capture["value_states"][0, :min_value_heads, actual_token_start:actual_token_end, :min_value_dim]
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        cur_key_points, cur_key_components, cur_key_mean, cur_key_explained = compute_shared_pca(key_states)
+        cur_value_points, cur_value_components, cur_value_mean, cur_value_explained = compute_shared_pca(value_states)
+        key_pca_points.append(cur_key_points)
+        value_pca_points.append(cur_value_points)
+        key_components.append(cur_key_components)
+        value_components.append(cur_value_components)
+        key_means.append(cur_key_mean)
+        value_means.append(cur_value_mean)
+        key_explained.append(cur_key_explained)
+        value_explained.append(cur_value_explained)
+
+    return (
+        np.stack(key_pca_points, axis=0).astype(np.float32, copy=False),
+        np.stack(value_pca_points, axis=0).astype(np.float32, copy=False),
+        layer_indices,
+        list(range(min_key_heads)),
+        list(range(min_value_heads)),
+        np.stack(key_components, axis=0).astype(np.float32, copy=False),
+        np.stack(value_components, axis=0).astype(np.float32, copy=False),
+        np.stack(key_means, axis=0).astype(np.float32, copy=False),
+        np.stack(value_means, axis=0).astype(np.float32, copy=False),
+        np.stack(key_explained, axis=0).astype(np.float32, copy=False),
+        np.stack(value_explained, axis=0).astype(np.float32, copy=False),
+        actual_token_start,
+        actual_token_end,
+    )
+
+
 def compute_pca_layer_centers(pca_points, token_mask=None):
     pca_points = np.asarray(pca_points, dtype=np.float32)
     if pca_points.ndim != 3 or pca_points.shape[-1] != 2:
@@ -569,6 +639,83 @@ def plot_hidden_state_pca(pca_points, layer_indices, output_path, title, token_m
     plt.close(fig)
 
 
+def plot_head_pca_layer(pca_points, head_indices, output_path, title, empty_label="No tokens"):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    pca_points = np.asarray(pca_points, dtype=np.float32)
+    head_indices = [int(head_idx) for head_idx in head_indices]
+    if pca_points.ndim != 3 or pca_points.shape[-1] != 2:
+        raise ValueError("pca_points must have shape [head, token, 2].")
+    if len(head_indices) != pca_points.shape[0]:
+        raise ValueError("head_indices must match the first dimension of pca_points.")
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.2), dpi=180)
+    cmap = plt.get_cmap("turbo")
+    denom = max(1, len(head_indices) - 1)
+    plotted_any = False
+    for head_pos, head_idx in enumerate(head_indices):
+        points = pca_points[head_pos]
+        if points.shape[0] < 1:
+            continue
+        plotted_any = True
+        color = cmap(head_pos / denom)
+        ax.scatter(
+            points[:, 0],
+            points[:, 1],
+            s=9,
+            alpha=0.52,
+            color=color,
+            linewidths=0,
+            label=f"Head {head_idx}" if len(head_indices) <= 16 else None,
+            rasterized=True,
+        )
+        center = points.mean(axis=0)
+        ax.scatter(
+            center[0],
+            center[1],
+            s=42,
+            color=color,
+            edgecolors="#202020",
+            linewidths=0.7,
+            marker="o",
+            zorder=3,
+        )
+
+    if not plotted_any:
+        ax.text(
+            0.5,
+            0.5,
+            empty_label,
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=13,
+            fontweight="bold",
+        )
+
+    norm = matplotlib.colors.Normalize(
+        vmin=min(head_indices) if head_indices else 0,
+        vmax=max(head_indices) if head_indices else 1,
+    )
+    scalar_map = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+    scalar_map.set_array([])
+    colorbar = fig.colorbar(scalar_map, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Head")
+    if len(head_indices) <= 16:
+        ax.legend(loc="best", frameon=True, fontsize=8, markerscale=1.4)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    ax.set_xlabel("PC 1")
+    ax.set_ylabel("PC 2")
+    ax.grid(alpha=0.2, linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 def plot_adjacent_layer_angle_curve(layer_indices, angles_deg, output_path, title):
     setup_matplotlib_cache()
     import matplotlib
@@ -689,11 +836,12 @@ class HiddenStatePCARunWriter:
         self._write_manifest()
 
     def _write_manifest(self):
+        fit_scope = PCA_HEAD_FIT_SCOPE if self.submode == PCA_SUBMODE_KEY_VALUE_HEADS else PCA_FIT_SCOPE
         manifest = {
             "run_dir": self.run_dir,
             "model_name": self.model_name,
             "result_path": self.out_file,
-            "hidden_state_pca_fit_scope": PCA_FIT_SCOPE,
+            "hidden_state_pca_fit_scope": fit_scope,
             "hidden_state_pca_submode": self.submode,
             "hidden_state_pca_states": list(
                 PCA_HIDDEN_STATE_NAMES
@@ -762,10 +910,16 @@ class HiddenStatePCASampleWriter:
             "key_angle_plot_file": None,
             "value_angle_plot_file": None,
             "hidden_angle_plot_file": None,
+            "key_head_plot_files": [],
+            "value_head_plot_files": [],
             "key_pca_shape": None,
             "value_pca_shape": None,
             "hidden_pca_shape": None,
+            "key_head_pca_shape": None,
+            "value_head_pca_shape": None,
             "layer_indices": [],
+            "key_head_indices": [],
+            "value_head_indices": [],
             "adjacent_layer_pairs": [],
             "key_adjacent_layer_angles_deg": [],
             "value_adjacent_layer_angles_deg": [],
@@ -773,6 +927,8 @@ class HiddenStatePCASampleWriter:
             "key_explained_variance_ratio": [],
             "value_explained_variance_ratio": [],
             "hidden_explained_variance_ratio": [],
+            "key_head_explained_variance_ratio": [],
+            "value_head_explained_variance_ratio": [],
             "token_scope": PCA_TOKEN_SCOPE,
         }
         self.prefills.append(record)
@@ -787,6 +943,19 @@ class HiddenStatePCASampleWriter:
         try:
             if self.run_writer.submode == PCA_SUBMODE_HIDDEN_STATES:
                 self._capture_hidden_states_prefill(
+                    record=record,
+                    prefill_index=prefill_index,
+                    label=label,
+                    input_ids=input_ids,
+                    model=model,
+                    tokenizer=tokenizer,
+                    inputs=inputs,
+                )
+                self._write_sample_json()
+                return record
+
+            if self.run_writer.submode == PCA_SUBMODE_KEY_VALUE_HEADS:
+                self._capture_key_value_heads_prefill(
                     record=record,
                     prefill_index=prefill_index,
                     label=label,
@@ -919,6 +1088,91 @@ class HiddenStatePCASampleWriter:
         self._write_sample_json()
         return record
 
+    def _capture_key_value_heads_prefill(self, record, prefill_index, label, input_ids, model, tokenizer, inputs):
+        (
+            key_pca_points,
+            value_pca_points,
+            layer_indices,
+            key_head_indices,
+            value_head_indices,
+            key_components,
+            value_components,
+            key_mean,
+            value_mean,
+            key_explained,
+            value_explained,
+            actual_token_start,
+            actual_token_end,
+        ) = compute_key_value_head_state_pca(
+            model=model,
+            inputs=inputs,
+            layer_spec=self.run_writer.layer_spec,
+            token_start=self.run_writer.token_start,
+            token_end=self.run_writer.token_end,
+        )
+        pca_file_name = f"prefill_{prefill_index:03d}_key_value_head_state_pca.npz"
+        pca_path = os.path.join(self.sample_dir, pca_file_name)
+        selected_token_ids = input_ids[actual_token_start:actual_token_end]
+        np.savez_compressed(
+            pca_path,
+            key_head_pca_points=key_pca_points.astype(np.float32, copy=False),
+            value_head_pca_points=value_pca_points.astype(np.float32, copy=False),
+            layer_indices=np.asarray(layer_indices, dtype=np.int16),
+            key_head_indices=np.asarray(key_head_indices, dtype=np.int16),
+            value_head_indices=np.asarray(value_head_indices, dtype=np.int16),
+            token_ids=np.asarray(selected_token_ids, dtype=np.int64),
+            token_start=np.asarray(actual_token_start, dtype=np.int64),
+            token_end=np.asarray(actual_token_end, dtype=np.int64),
+            key_head_explained_variance_ratio=key_explained.astype(np.float32, copy=False),
+            value_head_explained_variance_ratio=value_explained.astype(np.float32, copy=False),
+            key_head_pca_mean=key_mean.astype(np.float32, copy=False),
+            value_head_pca_mean=value_mean.astype(np.float32, copy=False),
+            key_head_pca_components=key_components.astype(np.float32, copy=False),
+            value_head_pca_components=value_components.astype(np.float32, copy=False),
+            hidden_state_pca_fit_scope=np.asarray(PCA_HEAD_FIT_SCOPE),
+            hidden_state_pca_states=np.asarray(PCA_STATE_NAMES),
+            hidden_state_pca_submode=np.asarray(self.run_writer.submode),
+            hidden_state_pca_token_scope=np.asarray(PCA_TOKEN_SCOPE),
+        )
+        record["status"] = "saved"
+        record["pca_file"] = pca_file_name
+        record["key_head_pca_shape"] = list(key_pca_points.shape)
+        record["value_head_pca_shape"] = list(value_pca_points.shape)
+        record["layer_indices"] = [int(layer_idx) for layer_idx in layer_indices]
+        record["key_head_indices"] = [int(head_idx) for head_idx in key_head_indices]
+        record["value_head_indices"] = [int(head_idx) for head_idx in value_head_indices]
+        record["actual_token_start"] = int(actual_token_start)
+        record["actual_token_end"] = int(actual_token_end)
+        record["selected_token_count"] = int(key_pca_points.shape[2])
+        record["selected_tokens"] = build_token_entries(tokenizer, selected_token_ids)
+        record["key_head_explained_variance_ratio"] = key_explained.astype(float).tolist()
+        record["value_head_explained_variance_ratio"] = value_explained.astype(float).tolist()
+        try:
+            for layer_pos, layer_idx in enumerate(layer_indices):
+                key_plot_file_name = f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_key_head_pca.png"
+                value_plot_file_name = f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_value_head_pca.png"
+                key_plot_path = os.path.join(self.sample_dir, key_plot_file_name)
+                value_plot_path = os.path.join(self.sample_dir, value_plot_file_name)
+                plot_head_pca_layer(
+                    pca_points=key_pca_points[layer_pos],
+                    head_indices=key_head_indices,
+                    output_path=key_plot_path,
+                    title=f"{label}: layer {int(layer_idx)} key heads PCA",
+                    empty_label="No tokens in selected span",
+                )
+                plot_head_pca_layer(
+                    pca_points=value_pca_points[layer_pos],
+                    head_indices=value_head_indices,
+                    output_path=value_plot_path,
+                    title=f"{label}: layer {int(layer_idx)} value heads PCA",
+                    empty_label="No tokens in selected span",
+                )
+                record["key_head_plot_files"].append(key_plot_file_name)
+                record["value_head_plot_files"].append(value_plot_file_name)
+        except Exception as plot_exc:
+            record["status"] = "saved_npz_plot_error"
+            record["plot_error"] = str(plot_exc)
+
     def _capture_hidden_states_prefill(self, record, prefill_index, label, input_ids, model, tokenizer, inputs):
         (
             pca_points,
@@ -1017,7 +1271,11 @@ class HiddenStatePCASampleWriter:
             "key_pca_shape",
             "value_pca_shape",
             "hidden_pca_shape",
+            "key_head_pca_shape",
+            "value_head_pca_shape",
             "layer_indices",
+            "key_head_indices",
+            "value_head_indices",
             "adjacent_layer_pairs",
             "key_adjacent_layer_angles_deg",
             "value_adjacent_layer_angles_deg",
@@ -1025,6 +1283,10 @@ class HiddenStatePCASampleWriter:
             "key_explained_variance_ratio",
             "value_explained_variance_ratio",
             "hidden_explained_variance_ratio",
+            "key_head_explained_variance_ratio",
+            "value_head_explained_variance_ratio",
+            "key_head_plot_files",
+            "value_head_plot_files",
             "reason",
             "error",
             "plot_error",
