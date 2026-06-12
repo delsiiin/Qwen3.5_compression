@@ -6,6 +6,7 @@ from .snapkv_neighbor_shared import SnapKVNeighborShared
 from .snapkv_hidden_mix import SnapKVHiddenMix
 from .snapkv_hidden_mix_ada import SnapKVHiddenMix as SnapKVAdaHiddenMixAda
 from .snapkv_hidden_mix_layer import SnapKVHiddenMix as SnapKVHiddenMixLayer
+from .snapkv_hidden_wo_mix import SnapKVHiddenMix as SnapKVHiddenWoMix
 from .streamingllm import StreamingLLM
 from .h2o import H2O
 from .criticalkv import CriticalKV
@@ -19,6 +20,7 @@ __all__ = [
     "SnapKVHiddenMix",
     "SnapKVAdaHiddenMixAda",
     "SnapKVHiddenMixLayer",
+    "SnapKVHiddenWoMix",
     "StreamingLLM",
     "H2O",
     "CriticalKV",
