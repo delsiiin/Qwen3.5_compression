@@ -824,7 +824,7 @@ if __name__ == "__main__":
         help="Submode for query-window layer analysis: hidden_states/query_states use cosine similarity; hidden_states_l2_diff computes pairwise L2 norms of hidden-state differences.",
     )
     parser.add_argument("--query_window_max_prefill_tokens", type=int, default=None, help="Skip query window similarity capture when the prefill token count exceeds this cap.")
-    parser.add_argument("--attn_output_ratio_mode", action="store_true", help="Capture per-layer per-token ||attn_output||_2 / ||hidden_states||_2 ratios during prefill and plot density curves.")
+    parser.add_argument("--attn_output_ratio_mode", action="store_true", help="Capture per-layer per-token/GQA-group ||attn_output||_2 / ||hidden_states||_2 ratios during prefill and plot density/distribution curves.")
     parser.add_argument("--attn_output_ratio_dir", type=str, default="output_dir/results_longbench/attn_output_ratios")
     parser.add_argument("--attn_output_ratio_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25. Raw npz always stores every captured layer.")
     parser.add_argument("--attn_output_ratio_max_prefill_tokens", type=int, default=None, help="Skip attention-output ratio capture when the prefill token count exceeds this cap.")

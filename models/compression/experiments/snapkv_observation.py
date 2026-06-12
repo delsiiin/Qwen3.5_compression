@@ -58,6 +58,7 @@ class SnapKVTopKOverlapResult:
     summary: dict[str, Any]
     snapkv_topk_indices: np.ndarray
     snapkv_topk_overlap: np.ndarray
+    snapkv_topk_head_overlap: np.ndarray
     snapkv_topk_layer_indices: np.ndarray
 
 
@@ -145,12 +146,15 @@ def compute_snapkv_topk_overlap_observation(
     summary.update(topk_result["summary"])
     topk_indices = _stack_or_empty(topk_result["indices"], np.int64)
     overlap = compute_snapkv_topk_overlap_matrix(topk_indices)
+    head_overlap = compute_snapkv_topk_head_overlap_matrices(topk_indices)
     summary["topk_indices_shape"] = list(topk_indices.shape)
     summary["overlap_shape"] = list(overlap.shape)
+    summary["head_overlap_shape"] = list(head_overlap.shape)
     return SnapKVTopKOverlapResult(
         summary=summary,
         snapkv_topk_indices=topk_indices,
         snapkv_topk_overlap=overlap,
+        snapkv_topk_head_overlap=head_overlap,
         snapkv_topk_layer_indices=np.asarray(topk_result["layer_indices"], dtype=np.int16),
     )
 
@@ -203,6 +207,7 @@ def save_snapkv_topk_overlap_observation(
         npz_path,
         snapkv_topk_indices=result.snapkv_topk_indices,
         snapkv_topk_overlap=result.snapkv_topk_overlap,
+        snapkv_topk_head_overlap=result.snapkv_topk_head_overlap,
         snapkv_topk_layer_indices=result.snapkv_topk_layer_indices,
     )
     return {"summary": summary_path, "npz": npz_path, "images": image_paths}
@@ -311,7 +316,7 @@ def plot_snapkv_topk_overlap_observation(
     output_dir: str,
     prefix: str = "snapkv_topk_overlap",
 ) -> dict[str, str]:
-    if result.snapkv_topk_layer_indices.size == 0 or result.snapkv_topk_overlap.size == 0:
+    if result.snapkv_topk_layer_indices.size == 0:
         return {}
 
     _setup_matplotlib_cache()
@@ -321,18 +326,31 @@ def plot_snapkv_topk_overlap_observation(
     import matplotlib.pyplot as plt
 
     os.makedirs(output_dir, exist_ok=True)
-    image_paths = {
-        "snapkv_topk_overlap_heatmap": os.path.join(
+    image_paths = {}
+    if result.snapkv_topk_overlap.size != 0:
+        image_paths["snapkv_topk_overlap_heatmap"] = os.path.join(
             output_dir,
             f"{prefix}_heatmap.png",
         )
-    }
-    _plot_snapkv_topk_overlap_heatmap(
-        result.snapkv_topk_overlap,
-        result.snapkv_topk_layer_indices,
-        image_paths["snapkv_topk_overlap_heatmap"],
-        plt=plt,
-    )
+        _plot_snapkv_topk_overlap_heatmap(
+            result.snapkv_topk_overlap,
+            result.snapkv_topk_layer_indices,
+            image_paths["snapkv_topk_overlap_heatmap"],
+            plt=plt,
+        )
+    if result.snapkv_topk_head_overlap.size != 0:
+        for layer_pos, layer_idx in enumerate(result.snapkv_topk_layer_indices):
+            image_key = f"snapkv_topk_head_overlap_layer_{int(layer_idx):03d}"
+            image_paths[image_key] = os.path.join(
+                output_dir,
+                f"{prefix}_head_overlap_layer_{int(layer_idx):03d}.png",
+            )
+            _plot_snapkv_topk_head_overlap_heatmap(
+                result.snapkv_topk_head_overlap[layer_pos],
+                int(layer_idx),
+                image_paths[image_key],
+                plt=plt,
+            )
     return image_paths
 
 
@@ -593,6 +611,28 @@ def compute_snapkv_topk_overlap_matrix(topk_indices):
                 intersection = np.intersect1d(src_indices, dst_indices, assume_unique=False).size
                 head_scores.append(float(intersection) / float(topk))
             overlap[src_layer, dst_layer] = float(np.mean(head_scores))
+    return overlap
+
+
+def compute_snapkv_topk_head_overlap_matrices(topk_indices):
+    topk_indices = np.asarray(topk_indices)
+    if topk_indices.size == 0:
+        return np.zeros((0, 0, 0), dtype=np.float32)
+    if topk_indices.ndim != 3:
+        raise ValueError("topk_indices must have shape [layer, kv_head, topk].")
+
+    layer_count, head_count, topk = topk_indices.shape
+    overlap = np.zeros((layer_count, head_count, head_count), dtype=np.float32)
+    if layer_count == 0 or head_count == 0 or topk == 0:
+        return overlap
+
+    for layer_idx in range(layer_count):
+        for src_head in range(head_count):
+            src_indices = topk_indices[layer_idx, src_head]
+            for dst_head in range(head_count):
+                dst_indices = topk_indices[layer_idx, dst_head]
+                intersection = np.intersect1d(src_indices, dst_indices, assume_unique=False).size
+                overlap[layer_idx, src_head, dst_head] = float(intersection) / float(topk)
     return overlap
 
 
@@ -1022,6 +1062,42 @@ def _plot_snapkv_topk_overlap_heatmap(overlap, layer_indices, output_path, plt):
     fig.savefig(output_path)
     plt.close(fig)
 
+
+def _plot_snapkv_topk_head_overlap_heatmap(overlap, layer_idx, output_path, plt):
+    overlap = np.asarray(overlap, dtype=np.float32)
+    head_count = overlap.shape[0]
+    if head_count == 0:
+        return
+
+    fig_size = max(4.0, 0.32 * head_count + 2.5)
+    tick_fontsize = max(4.0, min(10.0, 160.0 / max(head_count, 1)))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=180)
+    image = ax.imshow(overlap, cmap="viridis", vmin=0.0, vmax=1.0, origin="upper")
+    ax.set_title(f"SnapKV topk head overlap, layer {int(layer_idx)}")
+    ax.set_xlabel("Head id")
+    ax.set_ylabel("Head id")
+
+    tick_positions = np.arange(head_count, dtype=np.int64)
+    ax.set_xticks(tick_positions)
+    ax.set_yticks(tick_positions)
+    ax.set_xticklabels(
+        [str(int(idx)) for idx in tick_positions],
+        rotation=90,
+        ha="center",
+        fontsize=tick_fontsize,
+    )
+    ax.set_yticklabels(
+        [str(int(idx)) for idx in tick_positions],
+        fontsize=tick_fontsize,
+    )
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Topk overlap")
+    ax.grid(False)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 def _plot_sample_indices(width_count, max_points=4096):
     width_count = int(width_count)
     max_points = int(max_points)
@@ -1292,5 +1368,6 @@ def _empty_topk_overlap_result(summary):
         summary=summary,
         snapkv_topk_indices=np.asarray([], dtype=np.int64),
         snapkv_topk_overlap=np.zeros((0, 0), dtype=np.float32),
+        snapkv_topk_head_overlap=np.zeros((0, 0, 0), dtype=np.float32),
         snapkv_topk_layer_indices=np.asarray([], dtype=np.int16),
     )

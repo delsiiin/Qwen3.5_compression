@@ -31,6 +31,47 @@ def find_layer_token_mixer(layer):
     return None, None
 
 
+def find_token_mixer_output_projection(token_mixer):
+    for projection_name in ("o_proj", "out_proj"):
+        projection = getattr(token_mixer, projection_name, None)
+        if projection is None or not hasattr(projection, "weight"):
+            continue
+        in_features = int(projection.weight.shape[1])
+        head_count = None
+        for attr_name in ("num_attention_heads", "num_v_heads", "num_heads"):
+            attr_value = getattr(token_mixer, attr_name, None)
+            if attr_value is not None:
+                head_count = int(attr_value)
+                break
+        if head_count is None:
+            for attr_name in ("head_dim", "head_v_dim"):
+                attr_value = getattr(token_mixer, attr_name, None)
+                if attr_value is not None and int(attr_value) > 0 and in_features % int(attr_value) == 0:
+                    head_count = in_features // int(attr_value)
+                    break
+        if head_count is None or head_count < 1 or in_features % head_count != 0:
+            continue
+        group_count = None
+        config = getattr(token_mixer, "config", None)
+        for attr_name in ("num_key_value_heads", "num_k_heads"):
+            attr_value = getattr(token_mixer, attr_name, None)
+            if attr_value is None and config is not None:
+                attr_value = getattr(config, attr_name, None)
+            if attr_value is not None:
+                group_count = int(attr_value)
+                break
+        if group_count is None and projection_name == "out_proj":
+            attr_value = getattr(token_mixer, "num_k_heads", None)
+            if attr_value is not None:
+                group_count = int(attr_value)
+        if group_count is None:
+            group_count = head_count
+        if group_count < 1 or group_count > head_count or head_count % group_count != 0:
+            group_count = head_count
+        return projection_name, projection, head_count, group_count
+    return None, None, None, None
+
+
 def parse_layer_spec(layer_spec, available_layers):
     available_layers = [int(layer_idx) for layer_idx in available_layers]
     if layer_spec is None:
@@ -104,6 +145,55 @@ def compute_parallel_orthogonal_components(input_hidden_states, attn_output, eps
     }
 
 
+def compute_gqa_grouped_output_components(
+    input_hidden_states,
+    projection_input,
+    output_projection,
+    head_count,
+    group_count,
+    eps=1e-12,
+):
+    input_vectors = input_hidden_states.detach().to(dtype=torch.float32)
+    projection_vectors = projection_input.detach().to(dtype=torch.float32)
+    if input_vectors.ndim != 2 or projection_vectors.ndim != 2:
+        return None
+    actual_len = min(int(input_vectors.shape[0]), int(projection_vectors.shape[0]))
+    if actual_len < 1:
+        return None
+
+    input_vectors = input_vectors[:actual_len]
+    projection_vectors = projection_vectors[:actual_len]
+    projected_width = int(projection_vectors.shape[-1])
+    head_count = int(head_count)
+    group_count = int(group_count)
+    if head_count < 1 or projected_width % head_count != 0:
+        return None
+    if group_count < 1 or group_count > head_count or head_count % group_count != 0:
+        group_count = head_count
+    if int(output_projection.weight.shape[1]) != projected_width:
+        return None
+
+    input_l2_norms = torch.linalg.vector_norm(input_vectors, ord=2, dim=-1)
+    safe_input_l2_norms = torch.clamp(input_l2_norms, min=float(eps)).to(device=projection_vectors.device)
+    weight = output_projection.weight.detach().to(device=projection_vectors.device, dtype=torch.float32)
+    head_dim = projected_width // head_count
+    heads_per_group = head_count // group_count
+    group_l2_norm_values = []
+    group_ratios = []
+    for group_idx in range(group_count):
+        start = group_idx * heads_per_group * head_dim
+        end = start + heads_per_group * head_dim
+        group_contribution = torch.matmul(projection_vectors[:, start:end], weight[:, start:end].t())
+        group_l2_norm = torch.linalg.vector_norm(group_contribution, ord=2, dim=-1)
+        group_l2_norm_values.append(group_l2_norm)
+        group_ratios.append(group_l2_norm / safe_input_l2_norms)
+
+    return {
+        "gqa_group_attn_output_l2_norms": torch.stack(group_l2_norm_values, dim=0),
+        "gqa_group_ratios": torch.stack(group_ratios, dim=0),
+    }
+
+
 def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
     layers = get_decoder_layers(model)
     if not layers:
@@ -111,6 +201,7 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
 
     captured = {}
     pending_inputs = {}
+    pending_projection_inputs = {}
     token_mixer_names = {}
     handles = []
 
@@ -120,6 +211,18 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
             if hidden_states is None or not torch.is_tensor(hidden_states) or hidden_states.ndim < 3:
                 return
             pending_inputs[layer_idx] = hidden_states[0].detach()
+
+        return hook
+
+    def make_projection_pre_hook(layer_idx):
+        def hook(_module, args, kwargs):
+            projection_input = extract_attention_arg(args, kwargs, "input", 0)
+            if projection_input is None or not torch.is_tensor(projection_input) or projection_input.ndim < 2:
+                return
+            if projection_input.ndim == 3:
+                pending_projection_inputs[layer_idx] = projection_input[0].detach()
+            elif projection_input.ndim == 2:
+                pending_projection_inputs[layer_idx] = projection_input.detach()
 
         return hook
 
@@ -138,10 +241,30 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
             )
             if component_values is None:
                 return
+            _projection_name, output_projection, head_count, group_count = find_token_mixer_output_projection(_module)
+            projection_input = pending_projection_inputs.pop(layer_idx, None)
+            if output_projection is not None and projection_input is not None:
+                group_component_values = compute_gqa_grouped_output_components(
+                    input_hidden_states=input_vectors,
+                    projection_input=projection_input,
+                    output_projection=output_projection,
+                    head_count=head_count,
+                    group_count=group_count,
+                    eps=eps,
+                )
+                if group_component_values is not None:
+                    component_values.update(group_component_values)
+                    component_values["head_count"] = int(head_count)
+                    component_values["gqa_group_count"] = int(group_count)
             captured[layer_idx] = {
                 key: value.cpu().numpy().astype(np.float32, copy=False)
                 for key, value in component_values.items()
+                if torch.is_tensor(value)
             }
+            if "head_count" in component_values:
+                captured[layer_idx]["head_count"] = int(component_values["head_count"])
+            if "gqa_group_count" in component_values:
+                captured[layer_idx]["gqa_group_count"] = int(component_values["gqa_group_count"])
             token_mixer_names[layer_idx] = token_mixer_name
 
         return hook
@@ -151,6 +274,9 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
             token_mixer_name, token_mixer = find_layer_token_mixer(layer)
             if token_mixer is None:
                 continue
+            _projection_name, output_projection, _head_count, _group_count = find_token_mixer_output_projection(token_mixer)
+            if output_projection is not None:
+                handles.append(output_projection.register_forward_pre_hook(make_projection_pre_hook(layer_idx), with_kwargs=True))
             handles.append(token_mixer.register_forward_pre_hook(make_pre_hook(layer_idx), with_kwargs=True))
             handles.append(token_mixer.register_forward_hook(make_post_hook(layer_idx, token_mixer_name), with_kwargs=True))
         run_observation_forward(model, inputs, output_hidden_states=False)
@@ -178,6 +304,23 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
     parallel_ratios = stack_metric("parallel_ratios")
     perpendicular_ratios = stack_metric("perpendicular_ratios")
     signed_parallel_ratios = stack_metric("signed_parallel_ratios")
+    layer_head_counts = [int(captured[layer_idx].get("head_count", 0)) for layer_idx in layer_indices]
+    layer_gqa_group_counts = [int(captured[layer_idx].get("gqa_group_count", 0)) for layer_idx in layer_indices]
+    max_group_count = max(layer_gqa_group_counts) if layer_gqa_group_counts else 0
+    gqa_group_ratios = np.full((len(layer_indices), max_group_count, token_count), np.nan, dtype=np.float32)
+    gqa_group_attn_output_l2_norms = np.full(
+        (len(layer_indices), max_group_count, token_count),
+        np.nan,
+        dtype=np.float32,
+    )
+    for layer_pos, layer_idx in enumerate(layer_indices):
+        group_count = layer_gqa_group_counts[layer_pos]
+        if group_count < 1:
+            continue
+        gqa_group_ratios[layer_pos, :group_count] = captured[layer_idx]["gqa_group_ratios"][:, :token_count]
+        gqa_group_attn_output_l2_norms[layer_pos, :group_count] = (
+            captured[layer_idx]["gqa_group_attn_output_l2_norms"][:, :token_count]
+        )
     mixer_names = [token_mixer_names.get(layer_idx, "unknown") for layer_idx in layer_indices]
     return (
         ratios,
@@ -188,6 +331,10 @@ def compute_attn_output_hidden_state_ratios(model, inputs, eps=1e-12):
         parallel_ratios,
         perpendicular_ratios,
         signed_parallel_ratios,
+        gqa_group_ratios,
+        gqa_group_attn_output_l2_norms,
+        layer_head_counts,
+        layer_gqa_group_counts,
         layer_indices,
         mixer_names,
     )
@@ -510,6 +657,144 @@ def plot_attn_output_decomposition_layer_curves(
     return output_files
 
 
+def plot_attn_output_gqa_group_ratio_density(
+    gqa_group_ratios,
+    layer_indices,
+    layer_head_counts,
+    layer_gqa_group_counts,
+    output_dir,
+    file_prefix,
+    title_prefix,
+):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    values = np.asarray(gqa_group_ratios, dtype=np.float32)
+    if values.ndim != 3:
+        raise ValueError(f"gqa_group_ratios must be 3D, got shape {values.shape}.")
+    if values.shape[0] != len(layer_indices):
+        raise ValueError(
+            "Layer count mismatch for GQA-group ratio plots: "
+            f"{values.shape[0]} rows vs {len(layer_indices)} layer indices."
+        )
+    if len(layer_head_counts) != len(layer_indices):
+        raise ValueError(
+            "Head-count mismatch for GQA-group ratio plots: "
+            f"{len(layer_head_counts)} counts vs {len(layer_indices)} layer indices."
+        )
+    if len(layer_gqa_group_counts) != len(layer_indices):
+        raise ValueError(
+            "GQA-group-count mismatch for GQA-group ratio plots: "
+            f"{len(layer_gqa_group_counts)} counts vs {len(layer_indices)} layer indices."
+        )
+
+    output_files = []
+    for layer_pos, layer_idx in enumerate(layer_indices):
+        head_count = int(layer_head_counts[layer_pos])
+        group_count = int(layer_gqa_group_counts[layer_pos])
+        if group_count < 1:
+            continue
+        layer_values = values[layer_pos, :group_count]
+        finite_values = layer_values[np.isfinite(layer_values)]
+        if finite_values.size == 0:
+            continue
+
+        if group_count <= 8:
+            colors = ["#7faa3d", "#4dae6b", "#355f83", "#3c145b", "#d07c2c", "#b64b6a", "#5d8792", "#6b5b95"]
+        else:
+            cmap = plt.get_cmap("viridis")
+            colors = [cmap(idx / max(1, group_count - 1)) for idx in range(group_count)]
+
+        fig, (density_ax, sum_ax) = plt.subplots(
+            2,
+            1,
+            figsize=(7.4, 5.9),
+            dpi=180,
+            gridspec_kw={"height_ratios": [3.0, 1.1]},
+        )
+        group_sums = []
+        for group_idx in range(group_count):
+            group_values = layer_values[group_idx]
+            group_values = group_values[np.isfinite(group_values)]
+            if group_values.size == 0:
+                group_sums.append(0.0)
+                continue
+            group_sums.append(float(np.sum(group_values)))
+            label = f"GQA {group_idx}"
+            color = colors[group_idx]
+            if group_values.shape[0] >= 3 and np.std(group_values) > 0:
+                sns.kdeplot(
+                    x=group_values,
+                    ax=density_ax,
+                    label=label,
+                    color=color,
+                    linewidth=1.8,
+                    fill=True,
+                    alpha=0.18,
+                    warn_singular=False,
+                )
+            else:
+                density_ax.hist(
+                    group_values,
+                    bins=min(10, max(1, group_values.shape[0])),
+                    density=True,
+                    label=label,
+                    color=color,
+                    alpha=0.22,
+                )
+                density_ax.axvline(float(np.mean(group_values)), color=color, linewidth=1.7)
+            density_ax.axvline(float(np.mean(group_values)), color=color, linewidth=1.2, linestyle="--", alpha=0.9)
+
+        heads_per_group = head_count // group_count if group_count > 0 and head_count % group_count == 0 else 1
+        density_ax.set_title(
+            f"{title_prefix} Layer {layer_idx} GQA Groups ({head_count} heads -> {group_count} groups, {heads_per_group}/group)",
+            fontsize=12,
+            fontweight="bold",
+        )
+        density_ax.set_xlabel(
+            r"$\Vert\Delta_{\mathrm{gqa}}\Vert_2 / \Vert x_{\mathrm{in}}\Vert_2$",
+            fontsize=11,
+            fontweight="bold",
+        )
+        density_ax.set_ylabel("Density", fontsize=11, fontweight="bold")
+        density_ax.legend(loc="upper right", frameon=True, fontsize=8)
+        density_ax.grid(False)
+
+        x_positions = np.arange(group_count)
+        sum_ax.bar(x_positions, group_sums, color=colors[:group_count], alpha=0.82, width=0.68)
+        sum_ax.plot(x_positions, group_sums, color="#2f2f2f", linewidth=1.1, marker="o", markersize=3.2)
+        sum_ax.set_xticks(x_positions)
+        sum_ax.set_xticklabels([str(group_idx) for group_idx in range(group_count)])
+        sum_ax.set_xlabel("GQA group", fontsize=11, fontweight="bold")
+        sum_ax.set_ylabel("Token ratio sum", fontsize=10, fontweight="bold")
+        sum_ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+        if group_count <= 16:
+            max_sum = max(group_sums) if group_sums else 0.0
+            offset = max_sum * 0.015 if max_sum > 0 else 0.01
+            for x_pos, ratio_sum in zip(x_positions, group_sums):
+                sum_ax.text(
+                    x_pos,
+                    ratio_sum + offset,
+                    f"{ratio_sum:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+        file_name = f"{file_prefix}_layer_{int(layer_idx):03d}_attn_output_gqa_group_ratio_density.png"
+        output_path = os.path.join(output_dir, file_name)
+        fig.tight_layout()
+        fig.savefig(output_path)
+        plt.close(fig)
+        output_files.append(file_name)
+
+    return output_files
+
+
 
 class AttnOutputRatioRunWriter:
     def __init__(
@@ -609,8 +894,12 @@ class AttnOutputRatioSampleWriter:
             "density_plot_file": None,
             "attn_output_l2_layer_plot_files": [],
             "attn_output_decomposition_layer_plot_files": [],
+            "attn_output_gqa_group_density_plot_files": [],
             "ratio_shape": None,
+            "gqa_group_ratio_shape": None,
             "layer_indices": [],
+            "layer_head_counts": [],
+            "layer_gqa_group_counts": [],
             "token_mixer_names": [],
             "layer_stats": [],
         }
@@ -633,6 +922,10 @@ class AttnOutputRatioSampleWriter:
                 parallel_ratios,
                 perpendicular_ratios,
                 signed_parallel_ratios,
+                gqa_group_ratios,
+                gqa_group_attn_output_l2_norms,
+                layer_head_counts,
+                layer_gqa_group_counts,
                 layer_indices,
                 mixer_names,
             ) = compute_attn_output_hidden_state_ratios(model=model, inputs=inputs)
@@ -651,7 +944,11 @@ class AttnOutputRatioSampleWriter:
                 parallel_ratios=parallel_ratios.astype(np.float32, copy=False),
                 perpendicular_ratios=perpendicular_ratios.astype(np.float32, copy=False),
                 signed_parallel_ratios=signed_parallel_ratios.astype(np.float32, copy=False),
+                gqa_group_ratios=gqa_group_ratios.astype(np.float32, copy=False),
+                gqa_group_attn_output_l2_norms=gqa_group_attn_output_l2_norms.astype(np.float32, copy=False),
                 layer_indices=np.asarray(layer_indices, dtype=np.int16),
+                layer_head_counts=np.asarray(layer_head_counts, dtype=np.int16),
+                layer_gqa_group_counts=np.asarray(layer_gqa_group_counts, dtype=np.int16),
                 token_ids=np.asarray(token_ids, dtype=np.int64),
                 token_mixer_names=np.asarray(mixer_names),
                 ratio_metric=np.asarray(ATTN_OUTPUT_RATIO_METRIC),
@@ -660,7 +957,10 @@ class AttnOutputRatioSampleWriter:
             record["status"] = "saved"
             record["ratio_file"] = ratio_file_name
             record["ratio_shape"] = list(ratios.shape)
+            record["gqa_group_ratio_shape"] = list(gqa_group_ratios.shape)
             record["layer_indices"] = [int(layer_idx) for layer_idx in layer_indices]
+            record["layer_head_counts"] = [int(head_count) for head_count in layer_head_counts]
+            record["layer_gqa_group_counts"] = [int(group_count) for group_count in layer_gqa_group_counts]
             record["token_mixer_names"] = mixer_names
             record["layer_stats"] = build_layer_stats(
                 ratios,
@@ -698,6 +998,17 @@ class AttnOutputRatioSampleWriter:
                         title_prefix=f"Random Sample {self.sample_index + 1} Attention Output Decomposition",
                     )
                 )
+                record["attn_output_gqa_group_density_plot_files"] = (
+                    plot_attn_output_gqa_group_ratio_density(
+                        gqa_group_ratios=gqa_group_ratios,
+                        layer_indices=layer_indices,
+                        layer_head_counts=layer_head_counts,
+                        layer_gqa_group_counts=layer_gqa_group_counts,
+                        output_dir=self.sample_dir,
+                        file_prefix=f"prefill_{prefill_index:03d}",
+                        title_prefix=f"Random Sample {self.sample_index + 1} Attention Output",
+                    )
+                )
             except Exception as plot_exc:
                 record["status"] = "saved_npz_plot_error"
                 record["plot_error"] = str(plot_exc)
@@ -720,7 +1031,10 @@ class AttnOutputRatioSampleWriter:
             "status",
             "token_count",
             "ratio_shape",
+            "gqa_group_ratio_shape",
             "layer_indices",
+            "layer_head_counts",
+            "layer_gqa_group_counts",
             "reason",
             "error",
             "plot_error",
