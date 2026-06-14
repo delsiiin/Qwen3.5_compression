@@ -529,12 +529,65 @@ def compute_adjacent_layer_angles(centers):
     return angles
 
 
+def compute_center_distance_matrix(centers):
+    centers = np.asarray(centers, dtype=np.float32)
+    if centers.ndim != 2 or centers.shape[-1] != 2:
+        raise ValueError("centers must have shape [item, 2].")
+    diff = centers[:, None, :] - centers[None, :, :]
+    distances = np.linalg.norm(diff, axis=-1).astype(np.float32, copy=False)
+    invalid = ~np.isfinite(centers).all(axis=-1)
+    if invalid.any():
+        distances[invalid, :] = np.nan
+        distances[:, invalid] = np.nan
+    return distances
+
+
+def compute_adjacent_center_distances(centers):
+    centers = np.asarray(centers, dtype=np.float32)
+    if centers.ndim != 2 or centers.shape[-1] != 2:
+        raise ValueError("centers must have shape [item, 2].")
+    if centers.shape[0] < 2:
+        return np.empty((0,), dtype=np.float32)
+
+    distances = np.full((centers.shape[0] - 1,), np.nan, dtype=np.float32)
+    for item_pos in range(centers.shape[0] - 1):
+        first = centers[item_pos]
+        second = centers[item_pos + 1]
+        if np.all(np.isfinite(first)) and np.all(np.isfinite(second)):
+            distances[item_pos] = float(np.linalg.norm(second - first))
+    return distances
+
+
+def compute_pca_head_centers(pca_points):
+    pca_points = np.asarray(pca_points, dtype=np.float32)
+    if pca_points.ndim != 3 or pca_points.shape[-1] != 2:
+        raise ValueError("pca_points must have shape [head, token, 2].")
+    centers = np.full((pca_points.shape[0], 2), np.nan, dtype=np.float32)
+    for head_pos in range(pca_points.shape[0]):
+        points = pca_points[head_pos]
+        if points.shape[0] > 0:
+            centers[head_pos] = points.mean(axis=0)
+    return centers
+
+
 def build_adjacent_layer_pairs(layer_indices):
     if len(layer_indices) > 1:
         return np.asarray(
             [
                 [int(layer_indices[idx]), int(layer_indices[idx + 1])]
                 for idx in range(len(layer_indices) - 1)
+            ],
+            dtype=np.int16,
+        )
+    return np.empty((0, 2), dtype=np.int16)
+
+
+def build_adjacent_item_pairs(item_indices):
+    if len(item_indices) > 1:
+        return np.asarray(
+            [
+                [int(item_indices[idx]), int(item_indices[idx + 1])]
+                for idx in range(len(item_indices) - 1)
             ],
             dtype=np.int16,
         )
@@ -781,6 +834,125 @@ def plot_adjacent_layer_angle_curve(layer_indices, angles_deg, output_path, titl
     plt.close(fig)
 
 
+def plot_center_distance_heatmap(item_indices, distance_matrix, output_path, title, axis_label):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    item_indices = [int(item_idx) for item_idx in item_indices]
+    distance_matrix = np.asarray(distance_matrix, dtype=np.float32)
+    expected_shape = (len(item_indices), len(item_indices))
+    if distance_matrix.shape != expected_shape:
+        raise ValueError("distance_matrix must have shape [item_count, item_count].")
+
+    fig_size = max(5.4, min(14.0, 0.42 * max(1, len(item_indices)) + 3.2))
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size), dpi=180)
+    finite = np.isfinite(distance_matrix)
+    if distance_matrix.size > 0 and finite.any():
+        image = ax.imshow(distance_matrix, cmap="viridis", interpolation="nearest")
+        colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        colorbar.set_label("Center distance")
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No valid center distances",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+            fontweight="bold",
+        )
+
+    positions = np.arange(len(item_indices), dtype=np.int64)
+    labels = [str(item_idx) for item_idx in item_indices]
+    ax.set_xticks(positions)
+    ax.set_yticks(positions)
+    if len(item_indices) <= 32:
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_yticklabels(labels)
+    else:
+        sparse_step = max(1, len(item_indices) // 24)
+        sparse_labels = [
+            labels[idx] if idx % sparse_step == 0 or idx == len(labels) - 1 else ""
+            for idx in range(len(labels))
+        ]
+        ax.set_xticklabels(sparse_labels, rotation=45, ha="right")
+        ax.set_yticklabels(sparse_labels)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel(axis_label)
+    ax.set_ylabel(axis_label)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_adjacent_center_distance_curve(item_indices, distances, output_path, title, item_label):
+    setup_matplotlib_cache()
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    item_indices = [int(item_idx) for item_idx in item_indices]
+    distances = np.asarray(distances, dtype=np.float32)
+    expected_count = max(0, len(item_indices) - 1)
+    if distances.shape != (expected_count,):
+        raise ValueError("distances must have shape [item_count - 1].")
+
+    if expected_count > 0:
+        x_values = np.arange(expected_count, dtype=np.int64)
+        pair_labels = [f"{item_indices[idx]}-{item_indices[idx + 1]}" for idx in range(expected_count)]
+    else:
+        x_values = np.empty((0,), dtype=np.int64)
+        pair_labels = []
+
+    fig_width = max(7.2, min(18.0, 0.38 * max(1, expected_count) + 4.0))
+    fig, ax = plt.subplots(figsize=(fig_width, 4.8), dpi=180)
+    finite = np.isfinite(distances)
+    if expected_count > 0 and finite.any():
+        ax.plot(
+            x_values,
+            distances,
+            color="#0f766e",
+            linewidth=1.6,
+            marker="o",
+            markersize=4.2,
+        )
+        ax.scatter(x_values[finite], distances[finite], color="#115e59", s=22, zorder=3)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            f"No valid adjacent-{item_label.lower()} distances",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=12,
+            fontweight="bold",
+        )
+
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel(f"{item_label} pair")
+    ax.set_ylabel("Center distance")
+    ax.set_xticks(x_values)
+    if expected_count <= 30:
+        ax.set_xticklabels(pair_labels, rotation=45, ha="right")
+    else:
+        sparse_step = max(1, expected_count // 18)
+        sparse_labels = [
+            pair_labels[idx] if idx % sparse_step == 0 or idx == expected_count - 1 else ""
+            for idx in range(expected_count)
+        ]
+        ax.set_xticklabels(sparse_labels, rotation=45, ha="right")
+    ax.grid(alpha=0.24, linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
 class HiddenStatePCARunWriter:
     def __init__(
         self,
@@ -910,8 +1082,18 @@ class HiddenStatePCASampleWriter:
             "key_angle_plot_file": None,
             "value_angle_plot_file": None,
             "hidden_angle_plot_file": None,
+            "key_distance_heatmap_file": None,
+            "value_distance_heatmap_file": None,
+            "hidden_distance_heatmap_file": None,
+            "key_distance_plot_file": None,
+            "value_distance_plot_file": None,
+            "hidden_distance_plot_file": None,
             "key_head_plot_files": [],
             "value_head_plot_files": [],
+            "key_head_distance_heatmap_files": [],
+            "value_head_distance_heatmap_files": [],
+            "key_head_distance_plot_files": [],
+            "value_head_distance_plot_files": [],
             "key_pca_shape": None,
             "value_pca_shape": None,
             "hidden_pca_shape": None,
@@ -921,9 +1103,16 @@ class HiddenStatePCASampleWriter:
             "key_head_indices": [],
             "value_head_indices": [],
             "adjacent_layer_pairs": [],
+            "key_adjacent_head_pairs": [],
+            "value_adjacent_head_pairs": [],
             "key_adjacent_layer_angles_deg": [],
             "value_adjacent_layer_angles_deg": [],
             "hidden_adjacent_layer_angles_deg": [],
+            "key_adjacent_layer_distances": [],
+            "value_adjacent_layer_distances": [],
+            "hidden_adjacent_layer_distances": [],
+            "key_adjacent_head_distances": [],
+            "value_adjacent_head_distances": [],
             "key_explained_variance_ratio": [],
             "value_explained_variance_ratio": [],
             "hidden_explained_variance_ratio": [],
@@ -991,17 +1180,29 @@ class HiddenStatePCASampleWriter:
             value_plot_file_name = f"prefill_{prefill_index:03d}_value_state_pca.png"
             key_angle_plot_file_name = f"prefill_{prefill_index:03d}_key_state_layer_angle.png"
             value_angle_plot_file_name = f"prefill_{prefill_index:03d}_value_state_layer_angle.png"
+            key_distance_heatmap_file_name = f"prefill_{prefill_index:03d}_key_state_layer_center_distance_heatmap.png"
+            value_distance_heatmap_file_name = f"prefill_{prefill_index:03d}_value_state_layer_center_distance_heatmap.png"
+            key_distance_plot_file_name = f"prefill_{prefill_index:03d}_key_state_adjacent_layer_distance.png"
+            value_distance_plot_file_name = f"prefill_{prefill_index:03d}_value_state_adjacent_layer_distance.png"
             pca_path = os.path.join(self.sample_dir, pca_file_name)
             key_plot_path = os.path.join(self.sample_dir, key_plot_file_name)
             value_plot_path = os.path.join(self.sample_dir, value_plot_file_name)
             key_angle_plot_path = os.path.join(self.sample_dir, key_angle_plot_file_name)
             value_angle_plot_path = os.path.join(self.sample_dir, value_angle_plot_file_name)
+            key_distance_heatmap_path = os.path.join(self.sample_dir, key_distance_heatmap_file_name)
+            value_distance_heatmap_path = os.path.join(self.sample_dir, value_distance_heatmap_file_name)
+            key_distance_plot_path = os.path.join(self.sample_dir, key_distance_plot_file_name)
+            value_distance_plot_path = os.path.join(self.sample_dir, value_distance_plot_file_name)
             token_count = int(key_pca_points.shape[1])
             selected_token_ids = input_ids[actual_token_start:actual_token_end]
             key_layer_centers = compute_pca_layer_centers(key_pca_points)
             value_layer_centers = compute_pca_layer_centers(value_pca_points)
             key_adjacent_angles = compute_adjacent_layer_angles(key_layer_centers)
             value_adjacent_angles = compute_adjacent_layer_angles(value_layer_centers)
+            key_layer_center_distances = compute_center_distance_matrix(key_layer_centers)
+            value_layer_center_distances = compute_center_distance_matrix(value_layer_centers)
+            key_adjacent_distances = compute_adjacent_center_distances(key_layer_centers)
+            value_adjacent_distances = compute_adjacent_center_distances(value_layer_centers)
             adjacent_layer_pairs = build_adjacent_layer_pairs(layer_indices)
             np.savez_compressed(
                 pca_path,
@@ -1016,6 +1217,10 @@ class HiddenStatePCASampleWriter:
                 value_layer_centers=value_layer_centers.astype(np.float32, copy=False),
                 key_adjacent_layer_angles_deg=key_adjacent_angles.astype(np.float32, copy=False),
                 value_adjacent_layer_angles_deg=value_adjacent_angles.astype(np.float32, copy=False),
+                key_layer_center_distances=key_layer_center_distances.astype(np.float32, copy=False),
+                value_layer_center_distances=value_layer_center_distances.astype(np.float32, copy=False),
+                key_adjacent_layer_distances=key_adjacent_distances.astype(np.float32, copy=False),
+                value_adjacent_layer_distances=value_adjacent_distances.astype(np.float32, copy=False),
                 key_explained_variance_ratio=key_explained.astype(np.float32, copy=False),
                 value_explained_variance_ratio=value_explained.astype(np.float32, copy=False),
                 key_pca_mean=key_mean.astype(np.float32, copy=False),
@@ -1044,6 +1249,14 @@ class HiddenStatePCASampleWriter:
             record["value_adjacent_layer_angles_deg"] = [
                 None if not np.isfinite(value) else float(value)
                 for value in value_adjacent_angles.tolist()
+            ]
+            record["key_adjacent_layer_distances"] = [
+                None if not np.isfinite(value) else float(value)
+                for value in key_adjacent_distances.tolist()
+            ]
+            record["value_adjacent_layer_distances"] = [
+                None if not np.isfinite(value) else float(value)
+                for value in value_adjacent_distances.tolist()
             ]
             record["key_explained_variance_ratio"] = [float(value) for value in key_explained.tolist()]
             record["value_explained_variance_ratio"] = [float(value) for value in value_explained.tolist()]
@@ -1078,6 +1291,38 @@ class HiddenStatePCASampleWriter:
                     title=f"{label}: value-state adjacent-layer center-vector angle",
                 )
                 record["value_angle_plot_file"] = value_angle_plot_file_name
+                plot_center_distance_heatmap(
+                    item_indices=layer_indices,
+                    distance_matrix=key_layer_center_distances,
+                    output_path=key_distance_heatmap_path,
+                    title=f"{label}: key-state layer-center distances",
+                    axis_label="Layer",
+                )
+                record["key_distance_heatmap_file"] = key_distance_heatmap_file_name
+                plot_center_distance_heatmap(
+                    item_indices=layer_indices,
+                    distance_matrix=value_layer_center_distances,
+                    output_path=value_distance_heatmap_path,
+                    title=f"{label}: value-state layer-center distances",
+                    axis_label="Layer",
+                )
+                record["value_distance_heatmap_file"] = value_distance_heatmap_file_name
+                plot_adjacent_center_distance_curve(
+                    item_indices=layer_indices,
+                    distances=key_adjacent_distances,
+                    output_path=key_distance_plot_path,
+                    title=f"{label}: key-state adjacent-layer center distance",
+                    item_label="Layer",
+                )
+                record["key_distance_plot_file"] = key_distance_plot_file_name
+                plot_adjacent_center_distance_curve(
+                    item_indices=layer_indices,
+                    distances=value_adjacent_distances,
+                    output_path=value_distance_plot_path,
+                    title=f"{label}: value-state adjacent-layer center distance",
+                    item_label="Layer",
+                )
+                record["value_distance_plot_file"] = value_distance_plot_file_name
             except Exception as plot_exc:
                 record["status"] = "saved_npz_plot_error"
                 record["plot_error"] = str(plot_exc)
@@ -1113,6 +1358,41 @@ class HiddenStatePCASampleWriter:
         pca_file_name = f"prefill_{prefill_index:03d}_key_value_head_state_pca.npz"
         pca_path = os.path.join(self.sample_dir, pca_file_name)
         selected_token_ids = input_ids[actual_token_start:actual_token_end]
+        key_head_centers = np.stack(
+            [compute_pca_head_centers(key_pca_points[layer_pos]) for layer_pos in range(key_pca_points.shape[0])],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        value_head_centers = np.stack(
+            [compute_pca_head_centers(value_pca_points[layer_pos]) for layer_pos in range(value_pca_points.shape[0])],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        key_head_center_distances = np.stack(
+            [compute_center_distance_matrix(key_head_centers[layer_pos]) for layer_pos in range(key_head_centers.shape[0])],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        value_head_center_distances = np.stack(
+            [
+                compute_center_distance_matrix(value_head_centers[layer_pos])
+                for layer_pos in range(value_head_centers.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        key_adjacent_head_distances = np.stack(
+            [
+                compute_adjacent_center_distances(key_head_centers[layer_pos])
+                for layer_pos in range(key_head_centers.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        value_adjacent_head_distances = np.stack(
+            [
+                compute_adjacent_center_distances(value_head_centers[layer_pos])
+                for layer_pos in range(value_head_centers.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        key_adjacent_head_pairs = build_adjacent_item_pairs(key_head_indices)
+        value_adjacent_head_pairs = build_adjacent_item_pairs(value_head_indices)
         np.savez_compressed(
             pca_path,
             key_head_pca_points=key_pca_points.astype(np.float32, copy=False),
@@ -1120,9 +1400,17 @@ class HiddenStatePCASampleWriter:
             layer_indices=np.asarray(layer_indices, dtype=np.int16),
             key_head_indices=np.asarray(key_head_indices, dtype=np.int16),
             value_head_indices=np.asarray(value_head_indices, dtype=np.int16),
+            key_adjacent_head_pairs=key_adjacent_head_pairs,
+            value_adjacent_head_pairs=value_adjacent_head_pairs,
             token_ids=np.asarray(selected_token_ids, dtype=np.int64),
             token_start=np.asarray(actual_token_start, dtype=np.int64),
             token_end=np.asarray(actual_token_end, dtype=np.int64),
+            key_head_centers=key_head_centers,
+            value_head_centers=value_head_centers,
+            key_head_center_distances=key_head_center_distances,
+            value_head_center_distances=value_head_center_distances,
+            key_adjacent_head_distances=key_adjacent_head_distances,
+            value_adjacent_head_distances=value_adjacent_head_distances,
             key_head_explained_variance_ratio=key_explained.astype(np.float32, copy=False),
             value_head_explained_variance_ratio=value_explained.astype(np.float32, copy=False),
             key_head_pca_mean=key_mean.astype(np.float32, copy=False),
@@ -1141,18 +1429,44 @@ class HiddenStatePCASampleWriter:
         record["layer_indices"] = [int(layer_idx) for layer_idx in layer_indices]
         record["key_head_indices"] = [int(head_idx) for head_idx in key_head_indices]
         record["value_head_indices"] = [int(head_idx) for head_idx in value_head_indices]
+        record["key_adjacent_head_pairs"] = key_adjacent_head_pairs.astype(int).tolist()
+        record["value_adjacent_head_pairs"] = value_adjacent_head_pairs.astype(int).tolist()
         record["actual_token_start"] = int(actual_token_start)
         record["actual_token_end"] = int(actual_token_end)
         record["selected_token_count"] = int(key_pca_points.shape[2])
         record["selected_tokens"] = build_token_entries(tokenizer, selected_token_ids)
+        record["key_adjacent_head_distances"] = [
+            [None if not np.isfinite(value) else float(value) for value in row]
+            for row in key_adjacent_head_distances.tolist()
+        ]
+        record["value_adjacent_head_distances"] = [
+            [None if not np.isfinite(value) else float(value) for value in row]
+            for row in value_adjacent_head_distances.tolist()
+        ]
         record["key_head_explained_variance_ratio"] = key_explained.astype(float).tolist()
         record["value_head_explained_variance_ratio"] = value_explained.astype(float).tolist()
         try:
             for layer_pos, layer_idx in enumerate(layer_indices):
                 key_plot_file_name = f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_key_head_pca.png"
                 value_plot_file_name = f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_value_head_pca.png"
+                key_distance_heatmap_file_name = (
+                    f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_key_head_center_distance_heatmap.png"
+                )
+                value_distance_heatmap_file_name = (
+                    f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_value_head_center_distance_heatmap.png"
+                )
+                key_distance_plot_file_name = (
+                    f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_key_adjacent_head_distance.png"
+                )
+                value_distance_plot_file_name = (
+                    f"prefill_{prefill_index:03d}_layer_{int(layer_idx):03d}_value_adjacent_head_distance.png"
+                )
                 key_plot_path = os.path.join(self.sample_dir, key_plot_file_name)
                 value_plot_path = os.path.join(self.sample_dir, value_plot_file_name)
+                key_distance_heatmap_path = os.path.join(self.sample_dir, key_distance_heatmap_file_name)
+                value_distance_heatmap_path = os.path.join(self.sample_dir, value_distance_heatmap_file_name)
+                key_distance_plot_path = os.path.join(self.sample_dir, key_distance_plot_file_name)
+                value_distance_plot_path = os.path.join(self.sample_dir, value_distance_plot_file_name)
                 plot_head_pca_layer(
                     pca_points=key_pca_points[layer_pos],
                     head_indices=key_head_indices,
@@ -1169,6 +1483,38 @@ class HiddenStatePCASampleWriter:
                 )
                 record["key_head_plot_files"].append(key_plot_file_name)
                 record["value_head_plot_files"].append(value_plot_file_name)
+                plot_center_distance_heatmap(
+                    item_indices=key_head_indices,
+                    distance_matrix=key_head_center_distances[layer_pos],
+                    output_path=key_distance_heatmap_path,
+                    title=f"{label}: layer {int(layer_idx)} key-head center distances",
+                    axis_label="Head",
+                )
+                record["key_head_distance_heatmap_files"].append(key_distance_heatmap_file_name)
+                plot_center_distance_heatmap(
+                    item_indices=value_head_indices,
+                    distance_matrix=value_head_center_distances[layer_pos],
+                    output_path=value_distance_heatmap_path,
+                    title=f"{label}: layer {int(layer_idx)} value-head center distances",
+                    axis_label="Head",
+                )
+                record["value_head_distance_heatmap_files"].append(value_distance_heatmap_file_name)
+                plot_adjacent_center_distance_curve(
+                    item_indices=key_head_indices,
+                    distances=key_adjacent_head_distances[layer_pos],
+                    output_path=key_distance_plot_path,
+                    title=f"{label}: layer {int(layer_idx)} key adjacent-head center distance",
+                    item_label="Head",
+                )
+                record["key_head_distance_plot_files"].append(key_distance_plot_file_name)
+                plot_adjacent_center_distance_curve(
+                    item_indices=value_head_indices,
+                    distances=value_adjacent_head_distances[layer_pos],
+                    output_path=value_distance_plot_path,
+                    title=f"{label}: layer {int(layer_idx)} value adjacent-head center distance",
+                    item_label="Head",
+                )
+                record["value_head_distance_plot_files"].append(value_distance_plot_file_name)
         except Exception as plot_exc:
             record["status"] = "saved_npz_plot_error"
             record["plot_error"] = str(plot_exc)
@@ -1192,13 +1538,19 @@ class HiddenStatePCASampleWriter:
         pca_file_name = f"prefill_{prefill_index:03d}_hidden_state_pca.npz"
         plot_file_name = f"prefill_{prefill_index:03d}_hidden_state_pca.png"
         angle_plot_file_name = f"prefill_{prefill_index:03d}_hidden_state_layer_angle.png"
+        distance_heatmap_file_name = f"prefill_{prefill_index:03d}_hidden_state_layer_center_distance_heatmap.png"
+        distance_plot_file_name = f"prefill_{prefill_index:03d}_hidden_state_adjacent_layer_distance.png"
         pca_path = os.path.join(self.sample_dir, pca_file_name)
         plot_path = os.path.join(self.sample_dir, plot_file_name)
         angle_plot_path = os.path.join(self.sample_dir, angle_plot_file_name)
+        distance_heatmap_path = os.path.join(self.sample_dir, distance_heatmap_file_name)
+        distance_plot_path = os.path.join(self.sample_dir, distance_plot_file_name)
         token_count = int(pca_points.shape[1])
         selected_token_ids = input_ids[actual_token_start:actual_token_end]
         layer_centers = compute_pca_layer_centers(pca_points)
         adjacent_angles = compute_adjacent_layer_angles(layer_centers)
+        layer_center_distances = compute_center_distance_matrix(layer_centers)
+        adjacent_distances = compute_adjacent_center_distances(layer_centers)
         adjacent_layer_pairs = build_adjacent_layer_pairs(layer_indices)
         np.savez_compressed(
             pca_path,
@@ -1210,6 +1562,8 @@ class HiddenStatePCASampleWriter:
             token_end=np.asarray(actual_token_end, dtype=np.int64),
             hidden_layer_centers=layer_centers.astype(np.float32, copy=False),
             hidden_adjacent_layer_angles_deg=adjacent_angles.astype(np.float32, copy=False),
+            hidden_layer_center_distances=layer_center_distances.astype(np.float32, copy=False),
+            hidden_adjacent_layer_distances=adjacent_distances.astype(np.float32, copy=False),
             hidden_explained_variance_ratio=explained.astype(np.float32, copy=False),
             hidden_pca_mean=mean.astype(np.float32, copy=False),
             hidden_pca_components=components.astype(np.float32, copy=False),
@@ -1231,6 +1585,10 @@ class HiddenStatePCASampleWriter:
             None if not np.isfinite(value) else float(value)
             for value in adjacent_angles.tolist()
         ]
+        record["hidden_adjacent_layer_distances"] = [
+            None if not np.isfinite(value) else float(value)
+            for value in adjacent_distances.tolist()
+        ]
         record["hidden_explained_variance_ratio"] = [float(value) for value in explained.tolist()]
         try:
             plot_hidden_state_pca(
@@ -1248,6 +1606,22 @@ class HiddenStatePCASampleWriter:
                 title=f"{label}: hidden-state adjacent-layer center-vector angle",
             )
             record["hidden_angle_plot_file"] = angle_plot_file_name
+            plot_center_distance_heatmap(
+                item_indices=layer_indices,
+                distance_matrix=layer_center_distances,
+                output_path=distance_heatmap_path,
+                title=f"{label}: hidden-state layer-center distances",
+                axis_label="Layer",
+            )
+            record["hidden_distance_heatmap_file"] = distance_heatmap_file_name
+            plot_adjacent_center_distance_curve(
+                item_indices=layer_indices,
+                distances=adjacent_distances,
+                output_path=distance_plot_path,
+                title=f"{label}: hidden-state adjacent-layer center distance",
+                item_label="Layer",
+            )
+            record["hidden_distance_plot_file"] = distance_plot_file_name
         except Exception as plot_exc:
             record["status"] = "saved_npz_plot_error"
             record["plot_error"] = str(plot_exc)
@@ -1277,16 +1651,33 @@ class HiddenStatePCASampleWriter:
             "key_head_indices",
             "value_head_indices",
             "adjacent_layer_pairs",
+            "key_adjacent_head_pairs",
+            "value_adjacent_head_pairs",
             "key_adjacent_layer_angles_deg",
             "value_adjacent_layer_angles_deg",
             "hidden_adjacent_layer_angles_deg",
+            "key_adjacent_layer_distances",
+            "value_adjacent_layer_distances",
+            "hidden_adjacent_layer_distances",
+            "key_adjacent_head_distances",
+            "value_adjacent_head_distances",
             "key_explained_variance_ratio",
             "value_explained_variance_ratio",
             "hidden_explained_variance_ratio",
             "key_head_explained_variance_ratio",
             "value_head_explained_variance_ratio",
+            "key_distance_heatmap_file",
+            "value_distance_heatmap_file",
+            "hidden_distance_heatmap_file",
+            "key_distance_plot_file",
+            "value_distance_plot_file",
+            "hidden_distance_plot_file",
             "key_head_plot_files",
             "value_head_plot_files",
+            "key_head_distance_heatmap_files",
+            "value_head_distance_heatmap_files",
+            "key_head_distance_plot_files",
+            "value_head_distance_plot_files",
             "reason",
             "error",
             "plot_error",

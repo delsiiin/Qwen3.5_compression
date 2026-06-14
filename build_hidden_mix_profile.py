@@ -7,14 +7,26 @@ import numpy as np
 
 GROUP_SCHEME_SIMILARITY = "similarity"
 GROUP_SCHEME_KEY_PCA_ANGLE = "key_pca_angle"
-SUPPORTED_GROUP_SCHEMES = (GROUP_SCHEME_SIMILARITY, GROUP_SCHEME_KEY_PCA_ANGLE)
+GROUP_SCHEME_KEY_PCA_DISTANCE = "key_pca_distance"
+SUPPORTED_GROUP_SCHEMES = (
+    GROUP_SCHEME_SIMILARITY,
+    GROUP_SCHEME_KEY_PCA_ANGLE,
+    GROUP_SCHEME_KEY_PCA_DISTANCE,
+)
 KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED = "fixed"
 KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
 SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES = (
     KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
     KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
 )
+KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED = "fixed"
+KEY_PCA_DISTANCE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
+SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES = (
+    KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
+    KEY_PCA_DISTANCE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
+)
 KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
+KEY_PCA_DISTANCE_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
 
 
 def _scalar_from_npz(value, default=None):
@@ -95,6 +107,34 @@ def compute_adjacent_angles_from_centers(centers):
     return angles
 
 
+def compute_adjacent_distances_from_centers(centers):
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[-1] != 2:
+        raise ValueError("key_layer_centers must have shape [layer, 2].")
+    if centers.shape[0] < 2:
+        return np.empty((0,), dtype=np.float64)
+
+    distances = np.full((centers.shape[0] - 1,), np.nan, dtype=np.float64)
+    for pos in range(centers.shape[0] - 1):
+        first = centers[pos]
+        second = centers[pos + 1]
+        if np.all(np.isfinite(first)) and np.all(np.isfinite(second)):
+            distances[pos] = float(np.linalg.norm(second - first))
+    return distances
+
+
+def compute_adjacent_distances_from_distance_matrix(distance_matrix):
+    distance_matrix = np.asarray(distance_matrix, dtype=np.float64)
+    if distance_matrix.ndim != 2 or distance_matrix.shape[0] != distance_matrix.shape[1]:
+        raise ValueError("key_layer_center_distances must be a square matrix.")
+    if distance_matrix.shape[0] < 2:
+        return np.empty((0,), dtype=np.float64)
+    return np.asarray(
+        [distance_matrix[pos, pos + 1] for pos in range(distance_matrix.shape[0] - 1)],
+        dtype=np.float64,
+    )
+
+
 def load_hidden_state_pca_npz(path):
     with np.load(path, allow_pickle=False) as data:
         if "layer_indices" not in data:
@@ -105,19 +145,30 @@ def load_hidden_state_pca_npz(path):
         elif "key_layer_centers" in data:
             key_adjacent_angles = compute_adjacent_angles_from_centers(data["key_layer_centers"])
         else:
-            raise ValueError(
-                "hidden-state PCA npz must contain 'key_adjacent_layer_angles_deg' "
-                "or 'key_layer_centers'."
-            )
+            key_adjacent_angles = None
+        if "key_adjacent_layer_distances" in data:
+            key_adjacent_distances = np.asarray(data["key_adjacent_layer_distances"], dtype=np.float64)
+        elif "key_layer_center_distances" in data:
+            key_adjacent_distances = compute_adjacent_distances_from_distance_matrix(data["key_layer_center_distances"])
+        elif "key_layer_centers" in data:
+            key_adjacent_distances = compute_adjacent_distances_from_centers(data["key_layer_centers"])
+        else:
+            key_adjacent_distances = None
 
     if layer_indices.ndim != 1:
         raise ValueError("PCA layer_indices must be 1D.")
     if len(set(int(layer) for layer in layer_indices.tolist())) != layer_indices.shape[0]:
         raise ValueError("PCA layer_indices contains duplicate layers.")
     expected_angle_count = max(0, layer_indices.shape[0] - 1)
-    if key_adjacent_angles.shape != (expected_angle_count,):
+    if key_adjacent_angles is not None and key_adjacent_angles.shape != (expected_angle_count,):
         raise ValueError("key_adjacent_layer_angles_deg must have shape [layer_count - 1].")
-    return layer_indices.astype(np.int64, copy=False), key_adjacent_angles.astype(np.float64, copy=False)
+    if key_adjacent_distances is not None and key_adjacent_distances.shape != (expected_angle_count,):
+        raise ValueError("key_adjacent_layer_distances must have shape [layer_count - 1].")
+    return (
+        layer_indices.astype(np.int64, copy=False),
+        None if key_adjacent_angles is None else key_adjacent_angles.astype(np.float64, copy=False),
+        None if key_adjacent_distances is None else key_adjacent_distances.astype(np.float64, copy=False),
+    )
 
 
 def split_layer_groups(similarity, layer_indices, group_threshold=0.85, max_group_size=6):
@@ -169,6 +220,55 @@ def split_layer_groups_by_key_pca_angle(
     return groups
 
 
+def split_layer_groups_by_key_pca_distance(
+    layer_indices,
+    key_adjacent_distances,
+    distance_threshold=1.0,
+    max_group_size=6,
+):
+    if max_group_size < 1:
+        raise ValueError("max_group_size must be at least 1.")
+    if distance_threshold < 0.0:
+        raise ValueError("distance_threshold must be non-negative.")
+
+    layer_indices = np.asarray(layer_indices, dtype=np.int64)
+    key_adjacent_distances = np.asarray(key_adjacent_distances, dtype=np.float64)
+    expected_distance_count = max(0, layer_indices.shape[0] - 1)
+    if key_adjacent_distances.shape != (expected_distance_count,):
+        raise ValueError("key_adjacent_distances must have shape [layer_count - 1].")
+
+    groups = []
+    current = [int(layer_indices[0])]
+    for pos in range(1, len(layer_indices)):
+        distance = float(key_adjacent_distances[pos - 1])
+        should_split = len(current) >= max_group_size
+        if np.isfinite(distance) and distance > float(distance_threshold):
+            should_split = True
+        if should_split:
+            groups.append(current)
+            current = []
+        current.append(int(layer_indices[pos]))
+    groups.append(current)
+    return groups
+
+
+def _compute_mean_without_iqr_outliers(values, metric_name):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise ValueError(f"{metric_name} mean_without_outliers requires at least one finite value.")
+
+    q1 = float(np.percentile(finite_values, 25.0))
+    q3 = float(np.percentile(finite_values, 75.0))
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    filtered_values = finite_values[(finite_values >= lower) & (finite_values <= upper)]
+    if filtered_values.size == 0:
+        filtered_values = finite_values
+    return float(np.mean(filtered_values))
+
+
 def compute_key_pca_angle_threshold(
     key_adjacent_angles_deg,
     angle_threshold=90.0,
@@ -181,20 +281,36 @@ def compute_key_pca_angle_threshold(
             raise ValueError("angle_threshold must be in [0, 180].")
         return float(angle_threshold), None
 
-    key_adjacent_angles_deg = np.asarray(key_adjacent_angles_deg, dtype=np.float64)
-    finite_angles = key_adjacent_angles_deg[np.isfinite(key_adjacent_angles_deg)]
-    if finite_angles.size == 0:
-        raise ValueError("key_pca_angle_threshold_mode mean_without_outliers requires at least one finite angle.")
+    return (
+        _compute_mean_without_iqr_outliers(
+            key_adjacent_angles_deg,
+            "key_pca_angle_threshold_mode",
+        ),
+        KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR,
+    )
 
-    q1 = float(np.percentile(finite_angles, 25.0))
-    q3 = float(np.percentile(finite_angles, 75.0))
-    iqr = q3 - q1
-    lower = q1 - 1.5 * iqr
-    upper = q3 + 1.5 * iqr
-    filtered_angles = finite_angles[(finite_angles >= lower) & (finite_angles <= upper)]
-    if filtered_angles.size == 0:
-        filtered_angles = finite_angles
-    return float(np.mean(filtered_angles)), KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR
+
+def compute_key_pca_distance_threshold(
+    key_adjacent_distances,
+    distance_threshold=1.0,
+    threshold_mode=KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
+):
+    if threshold_mode not in SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES:
+        raise ValueError(
+            f"key_pca_distance_threshold_mode must be one of {SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES}."
+        )
+    if threshold_mode == KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED:
+        if distance_threshold < 0.0:
+            raise ValueError("distance_threshold must be non-negative.")
+        return float(distance_threshold), None
+
+    return (
+        _compute_mean_without_iqr_outliers(
+            key_adjacent_distances,
+            "key_pca_distance_threshold_mode",
+        ),
+        KEY_PCA_DISTANCE_THRESHOLD_OUTLIER_METHOD_IQR,
+    )
 
 
 def build_group_budget_stats(groups, ratio_layer_scores):
@@ -266,8 +382,11 @@ def build_profile_from_similarity(
     attn_output_ratio_layer_indices=None,
     group_scheme=GROUP_SCHEME_SIMILARITY,
     key_pca_adjacent_angles_deg=None,
+    key_pca_adjacent_distances=None,
     key_pca_angle_threshold=90.0,
     key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+    key_pca_distance_threshold=1.0,
+    key_pca_distance_threshold_mode=KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
     temperature=0.1,
     min_weight=0.0,
 ):
@@ -281,9 +400,15 @@ def build_profile_from_similarity(
         raise ValueError(f"group_scheme must be one of {SUPPORTED_GROUP_SCHEMES}.")
     if key_pca_angle_threshold_mode not in SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES:
         raise ValueError(f"key_pca_angle_threshold_mode must be one of {SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES}.")
+    if key_pca_distance_threshold_mode not in SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES:
+        raise ValueError(
+            f"key_pca_distance_threshold_mode must be one of {SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES}."
+        )
 
     effective_key_pca_angle_threshold = float(key_pca_angle_threshold)
     key_pca_angle_threshold_outlier_method = None
+    effective_key_pca_distance_threshold = float(key_pca_distance_threshold)
+    key_pca_distance_threshold_outlier_method = None
     if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
         if key_pca_adjacent_angles_deg is None:
             raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
@@ -296,6 +421,23 @@ def build_profile_from_similarity(
             layer_indices,
             key_pca_adjacent_angles_deg,
             angle_threshold=effective_key_pca_angle_threshold,
+            max_group_size=max_group_size,
+        )
+    elif group_scheme == GROUP_SCHEME_KEY_PCA_DISTANCE:
+        if key_pca_adjacent_distances is None:
+            raise ValueError("key_pca_adjacent_distances is required for key_pca_distance grouping.")
+        (
+            effective_key_pca_distance_threshold,
+            key_pca_distance_threshold_outlier_method,
+        ) = compute_key_pca_distance_threshold(
+            key_pca_adjacent_distances,
+            distance_threshold=key_pca_distance_threshold,
+            threshold_mode=key_pca_distance_threshold_mode,
+        )
+        groups = split_layer_groups_by_key_pca_distance(
+            layer_indices,
+            key_pca_adjacent_distances,
+            distance_threshold=effective_key_pca_distance_threshold,
             max_group_size=max_group_size,
         )
     else:
@@ -350,6 +492,10 @@ def build_profile_from_similarity(
     if key_pca_adjacent_angles_deg is not None:
         key_pca_adjacent_angles = np.asarray(key_pca_adjacent_angles_deg, dtype=np.float64)
         finite_key_pca_angles = key_pca_adjacent_angles[np.isfinite(key_pca_adjacent_angles)]
+    finite_key_pca_distances = None
+    if key_pca_adjacent_distances is not None:
+        key_pca_adjacent_distances = np.asarray(key_pca_adjacent_distances, dtype=np.float64)
+        finite_key_pca_distances = key_pca_adjacent_distances[np.isfinite(key_pca_adjacent_distances)]
     profile = {
         "metric": "cosine",
         "similarity_state": str(similarity_state),
@@ -360,6 +506,10 @@ def build_profile_from_similarity(
         "effective_key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
         "key_pca_angle_threshold_mode": str(key_pca_angle_threshold_mode),
         "key_pca_angle_threshold_outlier_method": key_pca_angle_threshold_outlier_method,
+        "key_pca_distance_threshold": float(effective_key_pca_distance_threshold),
+        "effective_key_pca_distance_threshold": float(effective_key_pca_distance_threshold),
+        "key_pca_distance_threshold_mode": str(key_pca_distance_threshold_mode),
+        "key_pca_distance_threshold_outlier_method": key_pca_distance_threshold_outlier_method,
         "mix_temperature": float(temperature),
         "mix_min_weight": float(min_weight),
         "max_group_size": int(max_group_size),
@@ -371,6 +521,11 @@ def build_profile_from_similarity(
             None
             if finite_key_pca_angles is None or finite_key_pca_angles.size == 0
             else float(np.mean(finite_key_pca_angles))
+        ),
+        "mean_adjacent_key_pca_distance": (
+            None
+            if finite_key_pca_distances is None or finite_key_pca_distances.size == 0
+            else float(np.mean(finite_key_pca_distances))
         ),
         "groups": profile_groups,
     }
@@ -388,6 +543,8 @@ def build_profile_from_npz(
     group_threshold=0.85,
     key_pca_angle_threshold=90.0,
     key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+    key_pca_distance_threshold=1.0,
+    key_pca_distance_threshold_mode=KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
     max_group_size=6,
     temperature=0.1,
     min_weight=0.0,
@@ -398,12 +555,25 @@ def build_profile_from_npz(
     if attn_output_ratio_npz is not None:
         attn_output_ratio, attn_output_ratio_layer_indices = load_attn_output_ratio_npz(attn_output_ratio_npz)
     key_pca_adjacent_angles_deg = None
-    if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
+    key_pca_adjacent_distances = None
+    if group_scheme in (GROUP_SCHEME_KEY_PCA_ANGLE, GROUP_SCHEME_KEY_PCA_DISTANCE):
         if hidden_state_pca_npz is None:
-            raise ValueError("--hidden_state_pca_npz is required when --group_scheme key_pca_angle.")
-        pca_layer_indices, key_pca_adjacent_angles_deg = load_hidden_state_pca_npz(hidden_state_pca_npz)
+            raise ValueError(f"--hidden_state_pca_npz is required when --group_scheme {group_scheme}.")
+        pca_layer_indices, key_pca_adjacent_angles_deg, key_pca_adjacent_distances = load_hidden_state_pca_npz(
+            hidden_state_pca_npz
+        )
         if not np.array_equal(layer_indices, pca_layer_indices):
             raise ValueError("hidden-state PCA layer_indices must exactly match similarity layer_indices.")
+        if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE and key_pca_adjacent_angles_deg is None:
+            raise ValueError(
+                "hidden-state PCA npz must contain 'key_adjacent_layer_angles_deg' "
+                "or 'key_layer_centers' when --group_scheme key_pca_angle."
+            )
+        if group_scheme == GROUP_SCHEME_KEY_PCA_DISTANCE and key_pca_adjacent_distances is None:
+            raise ValueError(
+                "hidden-state PCA npz must contain 'key_adjacent_layer_distances', "
+                "'key_layer_center_distances', or 'key_layer_centers' when --group_scheme key_pca_distance."
+            )
     profile = build_profile_from_similarity(
         similarity=similarity,
         layer_indices=layer_indices,
@@ -412,11 +582,14 @@ def build_profile_from_npz(
         group_threshold=group_threshold,
         key_pca_angle_threshold=key_pca_angle_threshold,
         key_pca_angle_threshold_mode=key_pca_angle_threshold_mode,
+        key_pca_distance_threshold=key_pca_distance_threshold,
+        key_pca_distance_threshold_mode=key_pca_distance_threshold_mode,
         max_group_size=max_group_size,
         attn_output_ratio=attn_output_ratio,
         attn_output_ratio_layer_indices=attn_output_ratio_layer_indices,
         group_scheme=group_scheme,
         key_pca_adjacent_angles_deg=key_pca_adjacent_angles_deg,
+        key_pca_adjacent_distances=key_pca_adjacent_distances,
         temperature=temperature,
         min_weight=min_weight,
     )
@@ -443,7 +616,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build a single-sample hidden-mix profile for snapkv_neighbor_shared.")
     parser.add_argument("--similarity_npz", required=True, help="Path to one query-window similarity .npz file.")
     parser.add_argument("--attn_output_ratio_npz", default=None, help="Optional attn-output ratio .npz for group budget weights.")
-    parser.add_argument("--hidden_state_pca_npz", default=None, help="Hidden-state PCA .npz used by --group_scheme key_pca_angle.")
+    parser.add_argument(
+        "--hidden_state_pca_npz",
+        default=None,
+        help="Hidden-state PCA .npz used by PCA-based group schemes.",
+    )
     parser.add_argument(
         "--output",
         default=os.path.join("hidden_mix_profile", "hidden_mix_profile.json"),
@@ -456,6 +633,12 @@ def parse_args():
         "--key_pca_angle_threshold_mode",
         choices=SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES,
         default=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
+    )
+    parser.add_argument("--key_pca_distance_threshold", type=float, default=1.0)
+    parser.add_argument(
+        "--key_pca_distance_threshold_mode",
+        choices=SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES,
+        default=KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
     )
     parser.add_argument("--max_group_size", type=int, default=6)
     parser.add_argument("--temperature", type=float, default=0.1)
@@ -473,6 +656,8 @@ def main():
         group_threshold=args.group_threshold,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
         key_pca_angle_threshold_mode=args.key_pca_angle_threshold_mode,
+        key_pca_distance_threshold=args.key_pca_distance_threshold,
+        key_pca_distance_threshold_mode=args.key_pca_distance_threshold_mode,
         max_group_size=args.max_group_size,
         temperature=args.temperature,
         min_weight=args.min_weight,

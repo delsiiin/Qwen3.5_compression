@@ -828,7 +828,7 @@ if __name__ == "__main__":
     parser.add_argument("--attn_output_ratio_dir", type=str, default="output_dir/results_longbench/attn_output_ratios")
     parser.add_argument("--attn_output_ratio_layers", type=str, default="all", help="Layers to visualize: all, auto, comma-separated ids, or ranges like 5,10,20-25. Raw npz always stores every captured layer.")
     parser.add_argument("--attn_output_ratio_max_prefill_tokens", type=int, default=None, help="Skip attention-output ratio capture when the prefill token count exceeds this cap.")
-    parser.add_argument("--hidden_state_pca_mode", action="store_true", help="Capture a token span during prefill and plot shared-PCA 2D scatters by layer.")
+    parser.add_argument("--hidden_state_pca_mode", action="store_true", help="Capture a token span during prefill and plot shared-PCA scatters plus center-distance heatmaps/curves.")
     parser.add_argument(
         "--hidden_state_pca_submode",
         type=str,
