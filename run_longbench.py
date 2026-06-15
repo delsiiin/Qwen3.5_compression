@@ -870,7 +870,15 @@ if __name__ == "__main__":
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="output_dir/results_longbench/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
-    parser.add_argument("--attn_layer_similarity_mode", action="store_true", help="Capture standard self-attention layer distributions during prefill and plot a layer-id x layer-id cosine similarity heatmap.")
+    parser.add_argument(
+        "--attn_layer_similarity_mode",
+        action="store_true",
+        help=(
+            "Capture standard self-attention layer distributions during prefill and plot a layer-id x layer-id "
+            "cosine similarity heatmap. The saved .npz can be used by build_hidden_mix_profile.py with "
+            "--group_scheme attn_layer_similarity."
+        ),
+    )
     parser.add_argument("--attn_layer_similarity_dir", type=str, default="output_dir/results_longbench/attn_layer_similarity")
     parser.add_argument("--attn_layer_similarity_max_prefill_tokens", type=int, default=None, help="Skip attention layer similarity capture when the prefill token count exceeds this cap.")
     parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for the attention layer similarity heatmap color scale.")

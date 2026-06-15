@@ -6,12 +6,22 @@ import numpy as np
 
 
 GROUP_SCHEME_SIMILARITY = "similarity"
+GROUP_SCHEME_ATTN_LAYER_SIMILARITY = "attn_layer_similarity"
 GROUP_SCHEME_KEY_PCA_ANGLE = "key_pca_angle"
 GROUP_SCHEME_KEY_PCA_DISTANCE = "key_pca_distance"
 SUPPORTED_GROUP_SCHEMES = (
     GROUP_SCHEME_SIMILARITY,
+    GROUP_SCHEME_ATTN_LAYER_SIMILARITY,
     GROUP_SCHEME_KEY_PCA_ANGLE,
     GROUP_SCHEME_KEY_PCA_DISTANCE,
+)
+SIMILARITY_SOURCE_QUERY_WINDOW = "query_window_similarity"
+SIMILARITY_SOURCE_ATTN_LAYER = "attn_layer_similarity"
+GROUP_THRESHOLD_MODE_FIXED = "fixed"
+GROUP_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
+SUPPORTED_GROUP_THRESHOLD_MODES = (
+    GROUP_THRESHOLD_MODE_FIXED,
+    GROUP_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
 )
 KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED = "fixed"
 KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
@@ -25,6 +35,7 @@ SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES = (
     KEY_PCA_DISTANCE_THRESHOLD_MODE_FIXED,
     KEY_PCA_DISTANCE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
 )
+GROUP_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
 KEY_PCA_ANGLE_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
 KEY_PCA_DISTANCE_THRESHOLD_OUTLIER_METHOD_IQR = "iqr_1.5"
 
@@ -40,6 +51,15 @@ def _scalar_from_npz(value, default=None):
     return default
 
 
+def _string_from_npz(value, default=None):
+    scalar = _scalar_from_npz(value, default)
+    if scalar is None:
+        return default
+    if isinstance(scalar, bytes):
+        return scalar.decode("utf-8")
+    return str(scalar)
+
+
 def load_similarity_npz(path):
     with np.load(path, allow_pickle=False) as data:
         if "similarity" not in data or "layer_indices" not in data:
@@ -47,7 +67,19 @@ def load_similarity_npz(path):
         similarity = np.asarray(data["similarity"], dtype=np.float64)
         layer_indices = np.asarray(data["layer_indices"], dtype=np.int64)
         actual_window_size = _scalar_from_npz(data.get("actual_window_size"))
-        similarity_state = _scalar_from_npz(data.get("query_window_similarity_state"), "hidden_states")
+        if "attn_layer_similarity_metric" in data or "attn_layer_similarity_reduction" in data:
+            similarity_source = SIMILARITY_SOURCE_ATTN_LAYER
+            similarity_state = SIMILARITY_SOURCE_ATTN_LAYER
+            similarity_metric = _string_from_npz(data.get("attn_layer_similarity_metric"), "cosine_similarity")
+            similarity_reduction = _string_from_npz(
+                data.get("attn_layer_similarity_reduction"),
+                "mean_heads_flatten_attention",
+            )
+        else:
+            similarity_source = SIMILARITY_SOURCE_QUERY_WINDOW
+            similarity_state = _string_from_npz(data.get("query_window_similarity_state"), "hidden_states")
+            similarity_metric = _string_from_npz(data.get("query_window_similarity_metric"), "cosine_similarity")
+            similarity_reduction = _string_from_npz(data.get("similarity_reduction"), "flatten_window")
 
     if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
         raise ValueError("similarity must be a square matrix.")
@@ -60,7 +92,15 @@ def load_similarity_npz(path):
     if len(set(int(layer) for layer in layer_indices.tolist())) != layer_indices.shape[0]:
         raise ValueError("layer_indices contains duplicate layers.")
 
-    return similarity, layer_indices.astype(np.int64, copy=False), actual_window_size, str(similarity_state)
+    return (
+        similarity,
+        layer_indices.astype(np.int64, copy=False),
+        actual_window_size,
+        str(similarity_state),
+        str(similarity_source),
+        str(similarity_metric),
+        str(similarity_reduction),
+    )
 
 
 def load_attn_output_ratio_npz(path):
@@ -269,6 +309,37 @@ def _compute_mean_without_iqr_outliers(values, metric_name):
     return float(np.mean(filtered_values))
 
 
+def get_adjacent_similarity_scores(similarity):
+    similarity = np.asarray(similarity, dtype=np.float64)
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError("similarity must be a square matrix.")
+    if similarity.shape[0] < 2:
+        return np.empty((0,), dtype=np.float64)
+    return np.asarray(
+        [similarity[pos, pos + 1] for pos in range(similarity.shape[0] - 1)],
+        dtype=np.float64,
+    )
+
+
+def compute_group_threshold(
+    adjacent_similarity,
+    group_threshold=0.85,
+    threshold_mode=GROUP_THRESHOLD_MODE_FIXED,
+):
+    if threshold_mode not in SUPPORTED_GROUP_THRESHOLD_MODES:
+        raise ValueError(f"group_threshold_mode must be one of {SUPPORTED_GROUP_THRESHOLD_MODES}.")
+    if threshold_mode == GROUP_THRESHOLD_MODE_FIXED:
+        return float(group_threshold), None
+
+    return (
+        _compute_mean_without_iqr_outliers(
+            adjacent_similarity,
+            "group_threshold_mode",
+        ),
+        GROUP_THRESHOLD_OUTLIER_METHOD_IQR,
+    )
+
+
 def compute_key_pca_angle_threshold(
     key_adjacent_angles_deg,
     angle_threshold=90.0,
@@ -376,7 +447,11 @@ def build_profile_from_similarity(
     layer_indices,
     actual_window_size=None,
     similarity_state="hidden_states",
+    similarity_source=SIMILARITY_SOURCE_QUERY_WINDOW,
+    similarity_metric="cosine_similarity",
+    similarity_reduction="flatten_window",
     group_threshold=0.85,
+    group_threshold_mode=GROUP_THRESHOLD_MODE_FIXED,
     max_group_size=6,
     attn_output_ratio=None,
     attn_output_ratio_layer_indices=None,
@@ -398,6 +473,8 @@ def build_profile_from_similarity(
         raise ValueError("layer_indices must be 1D and match similarity size.")
     if group_scheme not in SUPPORTED_GROUP_SCHEMES:
         raise ValueError(f"group_scheme must be one of {SUPPORTED_GROUP_SCHEMES}.")
+    if group_threshold_mode not in SUPPORTED_GROUP_THRESHOLD_MODES:
+        raise ValueError(f"group_threshold_mode must be one of {SUPPORTED_GROUP_THRESHOLD_MODES}.")
     if key_pca_angle_threshold_mode not in SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES:
         raise ValueError(f"key_pca_angle_threshold_mode must be one of {SUPPORTED_KEY_PCA_ANGLE_THRESHOLD_MODES}.")
     if key_pca_distance_threshold_mode not in SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES:
@@ -405,11 +482,26 @@ def build_profile_from_similarity(
             f"key_pca_distance_threshold_mode must be one of {SUPPORTED_KEY_PCA_DISTANCE_THRESHOLD_MODES}."
         )
 
+    adjacent_similarity = get_adjacent_similarity_scores(similarity)
+    effective_group_threshold = float(group_threshold)
+    group_threshold_outlier_method = None
     effective_key_pca_angle_threshold = float(key_pca_angle_threshold)
     key_pca_angle_threshold_outlier_method = None
     effective_key_pca_distance_threshold = float(key_pca_distance_threshold)
     key_pca_distance_threshold_outlier_method = None
-    if group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
+    if group_scheme == GROUP_SCHEME_ATTN_LAYER_SIMILARITY:
+        if similarity_source != SIMILARITY_SOURCE_ATTN_LAYER:
+            raise ValueError(
+                "attn_layer_similarity grouping requires an attention-layer similarity npz "
+                "produced by --attn_layer_similarity_mode."
+            )
+        effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
+            adjacent_similarity,
+            group_threshold=group_threshold,
+            threshold_mode=group_threshold_mode,
+        )
+        groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
+    elif group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
         if key_pca_adjacent_angles_deg is None:
             raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
         effective_key_pca_angle_threshold, key_pca_angle_threshold_outlier_method = compute_key_pca_angle_threshold(
@@ -441,7 +533,12 @@ def build_profile_from_similarity(
             max_group_size=max_group_size,
         )
     else:
-        groups = split_layer_groups(similarity, layer_indices, group_threshold, max_group_size)
+        effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
+            adjacent_similarity,
+            group_threshold=group_threshold,
+            threshold_mode=group_threshold_mode,
+        )
+        groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
     group_ratio_sums = None
     group_budget_weights = None
     ratio_layer_sums = None
@@ -486,7 +583,6 @@ def build_profile_from_similarity(
             group_profile["budget_weight"] = float(group_budget_weights[group_idx])
         profile_groups.append(group_profile)
 
-    adjacent = [float(similarity[pos, pos + 1]) for pos in range(max(0, len(layer_indices) - 1))]
     key_pca_adjacent_angles = None
     finite_key_pca_angles = None
     if key_pca_adjacent_angles_deg is not None:
@@ -498,10 +594,16 @@ def build_profile_from_similarity(
         finite_key_pca_distances = key_pca_adjacent_distances[np.isfinite(key_pca_adjacent_distances)]
     profile = {
         "metric": "cosine",
+        "similarity_metric": str(similarity_metric),
+        "similarity_reduction": str(similarity_reduction),
         "similarity_state": str(similarity_state),
+        "similarity_source": str(similarity_source),
         "source": "single_sample",
         "group_scheme": str(group_scheme),
-        "group_threshold": float(group_threshold),
+        "group_threshold": float(effective_group_threshold),
+        "effective_group_threshold": float(effective_group_threshold),
+        "group_threshold_mode": str(group_threshold_mode),
+        "group_threshold_outlier_method": group_threshold_outlier_method,
         "key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
         "effective_key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
         "key_pca_angle_threshold_mode": str(key_pca_angle_threshold_mode),
@@ -516,7 +618,9 @@ def build_profile_from_similarity(
         "actual_window_size": None if actual_window_size is None else int(actual_window_size),
         "layer_count": int(len(layer_indices)),
         "group_sizes": [len(group) for group in groups],
-        "mean_adjacent_similarity": None if not adjacent else float(np.mean(adjacent)),
+        "mean_adjacent_similarity": (
+            None if adjacent_similarity.size == 0 else float(np.mean(adjacent_similarity))
+        ),
         "mean_adjacent_key_pca_angle_deg": (
             None
             if finite_key_pca_angles is None or finite_key_pca_angles.size == 0
@@ -541,6 +645,7 @@ def build_profile_from_npz(
     hidden_state_pca_npz=None,
     group_scheme=GROUP_SCHEME_SIMILARITY,
     group_threshold=0.85,
+    group_threshold_mode=GROUP_THRESHOLD_MODE_FIXED,
     key_pca_angle_threshold=90.0,
     key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
     key_pca_distance_threshold=1.0,
@@ -549,7 +654,15 @@ def build_profile_from_npz(
     temperature=0.1,
     min_weight=0.0,
 ):
-    similarity, layer_indices, actual_window_size, similarity_state = load_similarity_npz(similarity_npz)
+    (
+        similarity,
+        layer_indices,
+        actual_window_size,
+        similarity_state,
+        similarity_source,
+        similarity_metric,
+        similarity_reduction,
+    ) = load_similarity_npz(similarity_npz)
     attn_output_ratio = None
     attn_output_ratio_layer_indices = None
     if attn_output_ratio_npz is not None:
@@ -579,7 +692,11 @@ def build_profile_from_npz(
         layer_indices=layer_indices,
         actual_window_size=actual_window_size,
         similarity_state=similarity_state,
+        similarity_source=similarity_source,
+        similarity_metric=similarity_metric,
+        similarity_reduction=similarity_reduction,
         group_threshold=group_threshold,
+        group_threshold_mode=group_threshold_mode,
         key_pca_angle_threshold=key_pca_angle_threshold,
         key_pca_angle_threshold_mode=key_pca_angle_threshold_mode,
         key_pca_distance_threshold=key_pca_distance_threshold,
@@ -614,7 +731,11 @@ def write_profile(profile, output_path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Build a single-sample hidden-mix profile for snapkv_neighbor_shared.")
-    parser.add_argument("--similarity_npz", required=True, help="Path to one query-window similarity .npz file.")
+    parser.add_argument(
+        "--similarity_npz",
+        required=True,
+        help="Path to one query-window similarity or attention-layer similarity .npz file.",
+    )
     parser.add_argument("--attn_output_ratio_npz", default=None, help="Optional attn-output ratio .npz for group budget weights.")
     parser.add_argument(
         "--hidden_state_pca_npz",
@@ -628,6 +749,11 @@ def parse_args():
     )
     parser.add_argument("--group_scheme", choices=SUPPORTED_GROUP_SCHEMES, default=GROUP_SCHEME_SIMILARITY)
     parser.add_argument("--group_threshold", type=float, default=0.85)
+    parser.add_argument(
+        "--group_threshold_mode",
+        choices=SUPPORTED_GROUP_THRESHOLD_MODES,
+        default=GROUP_THRESHOLD_MODE_FIXED,
+    )
     parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
     parser.add_argument(
         "--key_pca_angle_threshold_mode",
@@ -654,6 +780,7 @@ def main():
         hidden_state_pca_npz=args.hidden_state_pca_npz,
         group_scheme=args.group_scheme,
         group_threshold=args.group_threshold,
+        group_threshold_mode=args.group_threshold_mode,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
         key_pca_angle_threshold_mode=args.key_pca_angle_threshold_mode,
         key_pca_distance_threshold=args.key_pca_distance_threshold,
