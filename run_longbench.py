@@ -14,6 +14,7 @@ from attn_heatmap import (
     get_full_attention_layer_indices,
     is_qwen_attn_heatmap_model,
 )
+from attn_layer_similarity import AttentionLayerSimilarityRunWriter, get_attention_layer_indices
 from attn_output_ratio import AttnOutputRatioRunWriter
 from hidden_state_pca_observation import (
     HiddenStatePCARunWriter,
@@ -222,6 +223,7 @@ def load_local_model(model_family, model_path, model_kwargs):
 def load_model_and_tokenizer(
     model_name,
     attn_heatmap_mode=False,
+    attn_layer_similarity_mode=False,
     compression=False,
     compression_mode=None,
     compression_budget=4096,
@@ -246,7 +248,7 @@ def load_model_and_tokenizer(
         model_kwargs["torch_dtype"] = torch.bfloat16
     else:
         model_kwargs["torch_dtype"] = torch.float32
-    if attn_heatmap_mode:
+    if attn_heatmap_mode or attn_layer_similarity_mode:
         model_kwargs["attn_implementation"] = "eager"
     else:
         model_kwargs["attn_implementation"] = "flash_attention_2"
@@ -275,7 +277,7 @@ def load_model_and_tokenizer(
             model_path,
             model_kwargs,
         )
-    if attn_heatmap_mode:
+    if attn_heatmap_mode or attn_layer_similarity_mode:
         text_config = getattr(model.config, "text_config", model.config)
         setattr(text_config, "_attn_implementation", "eager")
         setattr(model.config, "_attn_implementation", "eager")
@@ -334,6 +336,7 @@ def query_llm(
     stop=None,
     enable_thinking=False,
     attn_sample_writer=None,
+    attn_layer_similarity_sample_writer=None,
     attn_output_ratio_sample_writer=None,
     query_window_sample_writer=None,
     snapkv_observation_sample_writer=None,
@@ -356,6 +359,14 @@ def query_llm(
             inputs=inputs,
             label=prefill_label,
         ).record
+    if attn_layer_similarity_sample_writer is not None:
+        attn_layer_similarity_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
     if query_window_sample_writer is not None:
         query_window_sample_writer.capture_prefill(
             model=model,
@@ -451,6 +462,21 @@ def build_attn_run_writer(args, out_file, model):
     )
 
 
+def build_attn_layer_similarity_run_writer(args, out_file, model):
+    if not args.attn_layer_similarity_mode:
+        return None
+    attention_layers = get_attention_layer_indices(model)
+    return AttentionLayerSimilarityRunWriter(
+        root_dir=args.attn_layer_similarity_dir,
+        model_name=args.model,
+        out_file=out_file,
+        attention_layers=attention_layers,
+        max_prefill_tokens=args.attn_layer_similarity_max_prefill_tokens,
+        heatmap_vmin=args.attn_layer_similarity_vmin,
+        heatmap_vmax=args.attn_layer_similarity_vmax,
+    )
+
+
 def build_query_window_similarity_run_writer(args, out_file):
     if not args.query_window_similarity_mode:
         return None
@@ -506,6 +532,10 @@ def validate_args(args):
         raise ValueError("--query_window_max_prefill_tokens must be at least 1 when provided.")
     if args.attn_output_ratio_max_prefill_tokens is not None and args.attn_output_ratio_max_prefill_tokens < 1:
         raise ValueError("--attn_output_ratio_max_prefill_tokens must be at least 1 when provided.")
+    if args.attn_layer_similarity_max_prefill_tokens is not None and args.attn_layer_similarity_max_prefill_tokens < 1:
+        raise ValueError("--attn_layer_similarity_max_prefill_tokens must be at least 1 when provided.")
+    if args.attn_layer_similarity_vmin >= args.attn_layer_similarity_vmax:
+        raise ValueError("--attn_layer_similarity_vmin must be smaller than --attn_layer_similarity_vmax.")
     if args.hidden_state_pca_max_prefill_tokens is not None and args.hidden_state_pca_max_prefill_tokens < 1:
         raise ValueError("--hidden_state_pca_max_prefill_tokens must be at least 1 when provided.")
     if args.hidden_state_pca_submode not in SUPPORTED_HIDDEN_STATE_PCA_SUBMODES:
@@ -530,6 +560,9 @@ def validate_args(args):
             raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
         if args.n_proc != 1:
             raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
+    if args.attn_layer_similarity_mode:
+        if args.n_proc != 1:
+            raise ValueError("--attn_layer_similarity_mode currently requires --n_proc 1.")
     if args.query_window_similarity_mode and args.n_proc != 1:
         raise ValueError("--query_window_similarity_mode currently requires --n_proc 1.")
     if args.attn_output_ratio_mode and args.n_proc != 1:
@@ -543,12 +576,14 @@ def get_pred(data, args, fout, out_file):
     model, tokenizer = load_model_and_tokenizer(
         model_name,
         attn_heatmap_mode=args.attn_heatmap_mode,
+        attn_layer_similarity_mode=args.attn_layer_similarity_mode,
         compression=args.compression,
         compression_mode=args.compression_mode,
         compression_budget=args.compression_budget,
         hidden_mix_profile_path=args.hidden_mix_profile_path,
     )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
+    attn_layer_similarity_run_writer = build_attn_layer_similarity_run_writer(args, out_file, model)
     query_window_run_writer = build_query_window_similarity_run_writer(args, out_file)
     attn_output_ratio_run_writer = build_attn_output_ratio_run_writer(args, out_file)
     snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
@@ -557,6 +592,11 @@ def get_pred(data, args, fout, out_file):
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
+        attn_layer_similarity_sample_writer = (
+            attn_layer_similarity_run_writer.new_sample(item)
+            if attn_layer_similarity_run_writer is not None
+            else None
+        )
         query_window_sample_writer = (
             query_window_run_writer.new_sample(item)
             if query_window_run_writer is not None
@@ -607,6 +647,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=1024,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_layer_similarity_sample_writer=attn_layer_similarity_sample_writer,
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
@@ -625,6 +666,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_layer_similarity_sample_writer=attn_layer_similarity_sample_writer,
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
@@ -648,6 +690,7 @@ def get_pred(data, args, fout, out_file):
                     max_new_tokens=128,
                     enable_thinking=args.cot,
                     attn_sample_writer=attn_sample_writer,
+                    attn_layer_similarity_sample_writer=attn_layer_similarity_sample_writer,
                     attn_output_ratio_sample_writer=attn_output_ratio_sample_writer,
                     query_window_sample_writer=query_window_sample_writer,
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
@@ -665,6 +708,12 @@ def get_pred(data, args, fout, out_file):
             if attn_sample_writer is not None:
                 item["attn_capture_status"] = attn_sample_writer.build_capture_status()
                 item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
+            if attn_layer_similarity_sample_writer is not None:
+                item["attn_layer_similarity_status"] = attn_layer_similarity_sample_writer.build_capture_status()
+                item["attn_layer_similarity_artifact"] = os.path.relpath(
+                    attn_layer_similarity_sample_writer.sample_dir,
+                    start=args.attn_layer_similarity_dir,
+                )
             if query_window_sample_writer is not None:
                 item["query_window_similarity_status"] = query_window_sample_writer.build_capture_status()
                 item["query_window_similarity_artifact"] = os.path.relpath(
@@ -697,6 +746,8 @@ def get_pred(data, args, fout, out_file):
                 )
             if attn_sample_writer is not None:
                 attn_sample_writer.finalize(item)
+            if attn_layer_similarity_sample_writer is not None:
+                attn_layer_similarity_sample_writer.finalize(item)
             if query_window_sample_writer is not None:
                 query_window_sample_writer.finalize(item)
             if attn_output_ratio_sample_writer is not None:
@@ -718,6 +769,14 @@ def get_pred(data, args, fout, out_file):
                 item["attn_capture_status"] = attn_sample_writer.build_capture_status()
                 item["attn_artifact"] = os.path.relpath(attn_sample_writer.sample_dir, start=args.attn_heatmap_dir)
                 attn_sample_writer.finalize(item)
+            if attn_layer_similarity_sample_writer is not None:
+                item["error"] = str(exc)
+                item["attn_layer_similarity_status"] = attn_layer_similarity_sample_writer.build_capture_status()
+                item["attn_layer_similarity_artifact"] = os.path.relpath(
+                    attn_layer_similarity_sample_writer.sample_dir,
+                    start=args.attn_layer_similarity_dir,
+                )
+                attn_layer_similarity_sample_writer.finalize(item)
             if query_window_sample_writer is not None:
                 item["error"] = str(exc)
                 item["query_window_similarity_status"] = query_window_sample_writer.build_capture_status()
@@ -811,6 +870,11 @@ if __name__ == "__main__":
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="output_dir/results_longbench/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--attn_layer_similarity_mode", action="store_true", help="Capture standard self-attention layer distributions during prefill and plot a layer-id x layer-id cosine similarity heatmap.")
+    parser.add_argument("--attn_layer_similarity_dir", type=str, default="output_dir/results_longbench/attn_layer_similarity")
+    parser.add_argument("--attn_layer_similarity_max_prefill_tokens", type=int, default=None, help="Skip attention layer similarity capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for the attention layer similarity heatmap color scale.")
+    parser.add_argument("--attn_layer_similarity_vmax", type=float, default=1.0, help="Upper bound for the attention layer similarity heatmap color scale.")
     parser.add_argument("--query_window_similarity_mode", action="store_true")
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
     parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise query-window analysis.")
