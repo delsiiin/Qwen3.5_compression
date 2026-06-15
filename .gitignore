@@ -62,3 +62,6 @@ Thumbs.db
 
 !config/**
 !config/
+
+!hidden_mix_profile/**
+!hidden_mix_profile/

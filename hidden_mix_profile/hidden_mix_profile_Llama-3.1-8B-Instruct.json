@@ -1,0 +1,627 @@
+{
+  "metric": "cosine",
+  "similarity_state": "hidden_states",
+  "source": "single_sample",
+  "group_scheme": "key_pca_angle",
+  "group_threshold": 0.85,
+  "key_pca_angle_threshold": 83.08697572254366,
+  "effective_key_pca_angle_threshold": 83.08697572254366,
+  "key_pca_angle_threshold_mode": "mean_without_outliers",
+  "key_pca_angle_threshold_outlier_method": "iqr_1.5",
+  "mix_temperature": 0.1,
+  "mix_min_weight": 0.0,
+  "max_group_size": 5,
+  "actual_window_size": 8,
+  "layer_count": 32,
+  "group_sizes": [
+    1,
+    1,
+    2,
+    1,
+    2,
+    1,
+    2,
+    1,
+    2,
+    2,
+    2,
+    1,
+    5,
+    4,
+    2,
+    3
+  ],
+  "mean_adjacent_similarity": 0.8446116062902636,
+  "mean_adjacent_key_pca_angle_deg": 83.08697572254366,
+  "groups": [
+    {
+      "layers": [
+        0
+      ],
+      "mix": {
+        "0": {
+          "sources": [
+            0
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "0": 664.1801646500826
+      },
+      "attn_output_ratio_variance_sum": 0.0004000922833346022,
+      "budget_weight": 0.012985580633146799
+    },
+    {
+      "layers": [
+        1
+      ],
+      "mix": {
+        "1": {
+          "sources": [
+            1
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "1": 464.69868701696396
+      },
+      "attn_output_ratio_variance_sum": 4.212517890220813e-05,
+      "budget_weight": 0.0013672343359416369
+    },
+    {
+      "layers": [
+        2,
+        3
+      ],
+      "mix": {
+        "2": {
+          "sources": [
+            2,
+            3
+          ],
+          "weights": [
+            0.8650183102629517,
+            0.13498168973704822
+          ]
+        },
+        "3": {
+          "sources": [
+            2,
+            3
+          ],
+          "weights": [
+            0.13497946270113934,
+            0.8650205372988607
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "2": 349.6857752725482,
+        "3": 503.38404493406415
+      },
+      "attn_output_ratio_variance_sum": 0.00016206402167890947,
+      "budget_weight": 0.00526002502148614
+    },
+    {
+      "layers": [
+        4
+      ],
+      "mix": {
+        "4": {
+          "sources": [
+            4
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "4": 652.3781028091908
+      },
+      "attn_output_ratio_variance_sum": 0.0001295914458928504,
+      "budget_weight": 0.004206080047288304
+    },
+    {
+      "layers": [
+        5,
+        6
+      ],
+      "mix": {
+        "5": {
+          "sources": [
+            5,
+            6
+          ],
+          "weights": [
+            0.896786744620637,
+            0.10321325537936307
+          ]
+        },
+        "6": {
+          "sources": [
+            5,
+            6
+          ],
+          "weights": [
+            0.10321237265909251,
+            0.8967876273409074
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "5": 663.2333670072258,
+        "6": 873.5953961163759
+      },
+      "attn_output_ratio_variance_sum": 0.0004692127571602504,
+      "budget_weight": 0.015228986776308073
+    },
+    {
+      "layers": [
+        7
+      ],
+      "mix": {
+        "7": {
+          "sources": [
+            7
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "7": 1064.0088722668588
+      },
+      "attn_output_ratio_variance_sum": 0.0002955816207395361,
+      "budget_weight": 0.009593534116176505
+    },
+    {
+      "layers": [
+        8,
+        9
+      ],
+      "mix": {
+        "8": {
+          "sources": [
+            8,
+            9
+          ],
+          "weights": [
+            0.8864383139189389,
+            0.1135616860810612
+          ]
+        },
+        "9": {
+          "sources": [
+            8,
+            9
+          ],
+          "weights": [
+            0.11356144607619556,
+            0.8864385539238044
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "8": 891.6089855544269,
+        "9": 923.0619923360646
+      },
+      "attn_output_ratio_variance_sum": 0.00040625849387998985,
+      "budget_weight": 0.013185714021300967
+    },
+    {
+      "layers": [
+        10
+      ],
+      "mix": {
+        "10": {
+          "sources": [
+            10
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "10": 855.6323539353907
+      },
+      "attn_output_ratio_variance_sum": 0.00022749248491800596,
+      "budget_weight": 0.007383601557411516
+    },
+    {
+      "layers": [
+        11,
+        12
+      ],
+      "mix": {
+        "11": {
+          "sources": [
+            11,
+            12
+          ],
+          "weights": [
+            0.8835704114239927,
+            0.11642958857600733
+          ]
+        },
+        "12": {
+          "sources": [
+            11,
+            12
+          ],
+          "weights": [
+            0.11643093756838607,
+            0.8835690624316139
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "11": 903.2575367502868,
+        "12": 1186.6169057525694
+      },
+      "attn_output_ratio_variance_sum": 0.00042309620417855994,
+      "budget_weight": 0.01373220655281723
+    },
+    {
+      "layers": [
+        13,
+        14
+      ],
+      "mix": {
+        "13": {
+          "sources": [
+            13,
+            14
+          ],
+          "weights": [
+            0.8667308503866303,
+            0.1332691496133697
+          ]
+        },
+        "14": {
+          "sources": [
+            13,
+            14
+          ],
+          "weights": [
+            0.13326859882696324,
+            0.8667314011730368
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "13": 900.678182285279,
+        "14": 978.3944304324687
+      },
+      "attn_output_ratio_variance_sum": 0.00043921140943538084,
+      "budget_weight": 0.014255249125740707
+    },
+    {
+      "layers": [
+        15,
+        16
+      ],
+      "mix": {
+        "15": {
+          "sources": [
+            15,
+            16
+          ],
+          "weights": [
+            0.8068640821910218,
+            0.1931359178089782
+          ]
+        },
+        "16": {
+          "sources": [
+            15,
+            16
+          ],
+          "weights": [
+            0.19313628934749585,
+            0.8068637106525042
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "15": 906.5976294130087,
+        "16": 965.7601827979088
+      },
+      "attn_output_ratio_variance_sum": 0.0006483288117286768,
+      "budget_weight": 0.021042460482683514
+    },
+    {
+      "layers": [
+        17
+      ],
+      "mix": {
+        "17": {
+          "sources": [
+            17
+          ],
+          "weights": [
+            1.0
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "17": 811.6695308238268
+      },
+      "attn_output_ratio_variance_sum": 0.0003566280726862677,
+      "budget_weight": 0.011574886062069547
+    },
+    {
+      "layers": [
+        18,
+        19,
+        20,
+        21,
+        22
+      ],
+      "mix": {
+        "18": {
+          "sources": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "weights": [
+            0.509746086113924,
+            0.24469357188183988,
+            0.12304776624687404,
+            0.07412453471959671,
+            0.0483880410377653
+          ]
+        },
+        "19": {
+          "sources": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "weights": [
+            0.20373399671575282,
+            0.4244225675926468,
+            0.19098282543098227,
+            0.11052915126497896,
+            0.07033145899563924
+          ]
+        },
+        "20": {
+          "sources": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "weights": [
+            0.09637665096949004,
+            0.17966002935015174,
+            0.3992545973383061,
+            0.20284635368492102,
+            0.12186236865713113
+          ]
+        },
+        "21": {
+          "sources": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "weights": [
+            0.05845557050152872,
+            0.10468870167935143,
+            0.20423634595925208,
+            0.4019885482950656,
+            0.23063083356480218
+          ]
+        },
+        "22": {
+          "sources": [
+            18,
+            19,
+            20,
+            21,
+            22
+          ],
+          "weights": [
+            0.04436672720702305,
+            0.0774511793968055,
+            0.14265627240428772,
+            0.26814691118864525,
+            0.4673789098032385
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "18": 591.2358299121261,
+        "19": 612.7484359666705,
+        "20": 580.712814308703,
+        "21": 918.4930610191077,
+        "22": 654.1385528743267
+      },
+      "attn_output_ratio_variance_sum": 0.0023003313403849217,
+      "budget_weight": 0.07466062043126548
+    },
+    {
+      "layers": [
+        23,
+        24,
+        25,
+        26
+      ],
+      "mix": {
+        "23": {
+          "sources": [
+            23,
+            24,
+            25,
+            26
+          ],
+          "weights": [
+            0.47751479652903367,
+            0.2638337376366812,
+            0.16639128692664096,
+            0.09226017890764418
+          ]
+        },
+        "24": {
+          "sources": [
+            23,
+            24,
+            25,
+            26
+          ],
+          "weights": [
+            0.22117998974690184,
+            0.4003168679709206,
+            0.24483464225361062,
+            0.133668500028567
+          ]
+        },
+        "25": {
+          "sources": [
+            23,
+            24,
+            25,
+            26
+          ],
+          "weights": [
+            0.14101747283009622,
+            0.24751396670937395,
+            0.40469721483383353,
+            0.20677134562669627
+          ]
+        },
+        "26": {
+          "sources": [
+            23,
+            24,
+            25,
+            26
+          ],
+          "weights": [
+            0.09480070070510675,
+            0.1638365619749183,
+            0.2506947633646898,
+            0.49066797395528516
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "23": 696.9678205307573,
+        "24": 735.6380415335298,
+        "25": 929.061628639698,
+        "26": 1199.2805355377495
+      },
+      "attn_output_ratio_variance_sum": 0.004409148968301163,
+      "budget_weight": 0.14310538302371456
+    },
+    {
+      "layers": [
+        27,
+        28
+      ],
+      "mix": {
+        "27": {
+          "sources": [
+            27,
+            28
+          ],
+          "weights": [
+            0.6914794762891973,
+            0.30852052371080274
+          ]
+        },
+        "28": {
+          "sources": [
+            27,
+            28
+          ],
+          "weights": [
+            0.30852179529158014,
+            0.6914782047084199
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "27": 1390.0283189024776,
+        "28": 1608.121037852019
+      },
+      "attn_output_ratio_variance_sum": 0.0045182206075644014,
+      "budget_weight": 0.14664546271392384
+    },
+    {
+      "layers": [
+        29,
+        30,
+        31
+      ],
+      "mix": {
+        "29": {
+          "sources": [
+            29,
+            30,
+            31
+          ],
+          "weights": [
+            0.8360892459699018,
+            0.15957331643029343,
+            0.004337437599804796
+          ]
+        },
+        "30": {
+          "sources": [
+            29,
+            30,
+            31
+          ],
+          "weights": [
+            0.15762834563608882,
+            0.8259142652380532,
+            0.016457389125857858
+          ]
+        },
+        "31": {
+          "sources": [
+            29,
+            30,
+            31
+          ],
+          "weights": [
+            0.005060443318178001,
+            0.019437581007807278,
+            0.9755019756740148
+          ]
+        }
+      },
+      "attn_output_ratio_sums": {
+        "29": 2095.5462246909738,
+        "30": 3038.158704265952,
+        "31": 6122.276072263718
+      },
+      "attn_output_ratio_variance_sum": 0.015583120244900972,
+      "budget_weight": 0.5057729750987252
+    }
+  ],
+  "budget_weight_metric": "attn_output_hidden_l2_ratio_variance_sum",
+  "layer_budget_metric": "attn_output_hidden_l2_ratio_sum",
+  "similarity_npz": "/home/yangx/new_compression/output_dir/results_longbench/query_window_similarity/Llama-3.1-8B-Instruct_domain_multi-document_QA_20260527_082733/samples/sample_0001_66ec0c4c821e116aacb1994a/prefill_000_query_window_similarity.npz",
+  "attn_output_ratio_npz": "/home/yangx/new_compression/output_dir/results_longbench/attn_output_ratios/Llama-3.1-8B-Instruct_domain_multi-document_QA_20260530_133738/samples/sample_0000_66f94f9ebb02136c067c4fde/prefill_000_attn_output_hidden_l2_ratio.npz",
+  "hidden_state_pca_npz": "/home/yangx/new_compression/output_dir/results_longbench/hidden_state_pca/Llama-3.1-8B-Instruct_domain_Code_Repository_Understanding_20260603_154145/samples/sample_0000_66fa208bbb02136c067c5fc1/prefill_000_key_value_state_pca.npz"
+}
