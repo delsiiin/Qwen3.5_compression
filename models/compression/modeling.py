@@ -52,6 +52,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from .methods import (
     SnapKV,
     SnapKVAda,
+    SnapKVAdaHeadCluster,
     SnapKVNeighborShared,
     SnapKVHiddenMix,
     SnapKVAdaHiddenMixAda,
@@ -74,6 +75,7 @@ import torch.nn.functional as F
 KV_COMPRESSION_MAP = {
     "snapkv": SnapKV,
     "snapkv_ada": SnapKVAda,
+    "snapkv_ada_head_cluster": SnapKVAdaHeadCluster,
     "snapkv_neighbor_shared": SnapKVNeighborShared,
     "snapkv_hidden_mix": SnapKVHiddenMix,
     "snapkv_hidden_mix_ada": SnapKVAdaHiddenMixAda,
