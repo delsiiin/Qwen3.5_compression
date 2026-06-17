@@ -14,7 +14,11 @@ from attn_heatmap import (
     get_full_attention_layer_indices,
     is_qwen_attn_heatmap_model,
 )
-from attn_layer_similarity import AttentionLayerSimilarityRunWriter, get_attention_layer_indices
+from attn_layer_similarity import (
+    AttentionLayerSimilarityRunWriter,
+    get_attention_gqa_group_count,
+    get_attention_layer_indices,
+)
 from attn_output_ratio import AttnOutputRatioRunWriter
 from hidden_state_pca_observation import (
     HiddenStatePCARunWriter,
@@ -466,6 +470,7 @@ def build_attn_layer_similarity_run_writer(args, out_file, model):
     if not args.attn_layer_similarity_mode:
         return None
     attention_layers = get_attention_layer_indices(model)
+    gqa_group_count = get_attention_gqa_group_count(model)
     return AttentionLayerSimilarityRunWriter(
         root_dir=args.attn_layer_similarity_dir,
         model_name=args.model,
@@ -474,6 +479,7 @@ def build_attn_layer_similarity_run_writer(args, out_file, model):
         max_prefill_tokens=args.attn_layer_similarity_max_prefill_tokens,
         heatmap_vmin=args.attn_layer_similarity_vmin,
         heatmap_vmax=args.attn_layer_similarity_vmax,
+        gqa_group_count=gqa_group_count,
     )
 
 
@@ -875,14 +881,14 @@ if __name__ == "__main__":
         action="store_true",
         help=(
             "Capture standard self-attention layer distributions during prefill and plot a layer-id x layer-id "
-            "cosine similarity heatmap. The saved .npz can be used by build_hidden_mix_profile.py with "
-            "--group_scheme attn_layer_similarity."
+            "cosine similarity heatmap plus per-layer GQA-group-id x GQA-group-id attention similarity heatmaps. "
+            "The saved .npz can be used by build_hidden_mix_profile.py with --group_scheme attn_layer_similarity."
         ),
     )
     parser.add_argument("--attn_layer_similarity_dir", type=str, default="output_dir/results_longbench/attn_layer_similarity")
     parser.add_argument("--attn_layer_similarity_max_prefill_tokens", type=int, default=None, help="Skip attention layer similarity capture when the prefill token count exceeds this cap.")
-    parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for the attention layer similarity heatmap color scale.")
-    parser.add_argument("--attn_layer_similarity_vmax", type=float, default=1.0, help="Upper bound for the attention layer similarity heatmap color scale.")
+    parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for layer and per-layer GQA head similarity heatmap color scales.")
+    parser.add_argument("--attn_layer_similarity_vmax", type=float, default=1.0, help="Upper bound for layer and per-layer GQA head similarity heatmap color scales.")
     parser.add_argument("--query_window_similarity_mode", action="store_true")
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
     parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise query-window analysis.")
