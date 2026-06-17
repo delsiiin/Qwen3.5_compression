@@ -19,6 +19,9 @@ ATTN_LAYER_SIMILARITY_METRIC = "cosine_similarity"
 ATTN_LAYER_SIMILARITY_REDUCTION = "mean_heads_flatten_attention"
 ATTN_HEAD_SIMILARITY_METRIC = "cosine_similarity"
 ATTN_HEAD_SIMILARITY_REDUCTION = "mean_gqa_group_heads_flatten_attention_per_layer"
+ATTN_HEAD_CLUSTER_DISTANCE_METRIC = "1 - cosine_similarity"
+ATTN_HEAD_CLUSTER_THRESHOLD_MODE = "mean"
+ATTN_HEAD_CLUSTER_OUTLIER_METHOD = None
 
 
 def build_attention_layer_similarity(attn, layer_indices, eps=1e-12):
@@ -84,6 +87,181 @@ def build_attention_head_similarity(attn, layer_indices, gqa_group_count=None, e
             "gqa_group_size": gqa_group_size,
         },
     )
+
+
+def _compute_finite_mean(values, metric_name):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise ValueError(f"{metric_name} requires at least one finite value.")
+    return float(np.mean(finite_values))
+
+
+def compute_attention_head_cluster_distance_threshold(layer_head_similarity):
+    layer_head_similarity = np.asarray(layer_head_similarity)
+    if layer_head_similarity.ndim != 2:
+        raise ValueError("layer_head_similarity must have shape [heads, heads].")
+    if layer_head_similarity.shape[0] != layer_head_similarity.shape[1]:
+        raise ValueError("layer_head_similarity must be square.")
+    if not np.all(np.isfinite(layer_head_similarity)):
+        raise ValueError("layer_head_similarity must contain only finite values.")
+
+    head_count = int(layer_head_similarity.shape[0])
+    if head_count <= 1:
+        return 0.0
+
+    upper_triangle = np.triu_indices(head_count, k=1)
+    pairwise_distance = 1.0 - layer_head_similarity[upper_triangle[0], upper_triangle[1]]
+    return _compute_finite_mean(
+        pairwise_distance,
+        "attn_head_cluster_threshold_mode",
+    )
+
+
+def compute_attention_head_cluster_distance_thresholds(head_similarity):
+    head_similarity = np.asarray(head_similarity)
+    if head_similarity.ndim != 3:
+        raise ValueError("head_similarity must have shape [layers, heads, heads].")
+    if head_similarity.shape[1] != head_similarity.shape[2]:
+        raise ValueError("head_similarity must be square on the head dimensions.")
+    if not np.all(np.isfinite(head_similarity)):
+        raise ValueError("head_similarity must contain only finite values.")
+
+    return np.asarray(
+        [
+            compute_attention_head_cluster_distance_threshold(layer_similarity)
+            for layer_similarity in head_similarity
+        ],
+        dtype=np.float32,
+    )
+
+
+def _cluster_heads_by_complete_link_distance(layer_distance, distance_threshold):
+    layer_distance = np.asarray(layer_distance, dtype=np.float64)
+    head_count = int(layer_distance.shape[0])
+    clusters = [[head_idx] for head_idx in range(head_count)]
+
+    while True:
+        best_pair = None
+        best_distance = None
+        for left_idx in range(len(clusters)):
+            for right_idx in range(left_idx + 1, len(clusters)):
+                pair_distances = layer_distance[np.ix_(clusters[left_idx], clusters[right_idx])]
+                complete_distance = float(np.max(pair_distances))
+                if complete_distance > float(distance_threshold):
+                    continue
+                if best_distance is None or complete_distance < best_distance:
+                    best_distance = complete_distance
+                    best_pair = (left_idx, right_idx)
+
+        if best_pair is None:
+            break
+
+        left_idx, right_idx = best_pair
+        merged_cluster = sorted(clusters[left_idx] + clusters[right_idx])
+        clusters[left_idx] = merged_cluster
+        del clusters[right_idx]
+
+    return sorted(clusters, key=lambda cluster: cluster[0])
+
+
+def build_attention_head_clusters(head_similarity, layer_indices):
+    head_similarity = np.asarray(head_similarity)
+    if head_similarity.ndim != 3:
+        raise ValueError("head_similarity must have shape [layers, heads, heads].")
+    if head_similarity.shape[1] != head_similarity.shape[2]:
+        raise ValueError("head_similarity must be square on the head dimensions.")
+    if not np.all(np.isfinite(head_similarity)):
+        raise ValueError("head_similarity must contain only finite values.")
+
+    layer_indices = [int(layer_idx) for layer_idx in layer_indices]
+    if len(layer_indices) != head_similarity.shape[0]:
+        raise ValueError("layer_indices must match the head similarity layer dimension.")
+
+    distance_thresholds = compute_attention_head_cluster_distance_thresholds(head_similarity)
+    head_clusters = []
+    for layer_pos, layer_idx in enumerate(layer_indices):
+        layer_similarity = head_similarity[layer_pos]
+        layer_distance = 1.0 - layer_similarity
+        distance_threshold = float(distance_thresholds[layer_pos])
+        head_count = int(layer_similarity.shape[0])
+        head_components = _cluster_heads_by_complete_link_distance(layer_distance, distance_threshold)
+        head_to_cluster = [-1] * head_count
+
+        clusters = []
+        for cluster_id, component in enumerate(head_components):
+            for head_idx in component:
+                head_to_cluster[head_idx] = cluster_id
+            pair_similarities = [
+                {
+                    "head_i": int(component[left_pos]),
+                    "head_j": int(component[right_pos]),
+                    "similarity": float(layer_similarity[component[left_pos], component[right_pos]]),
+                    "distance": float(layer_distance[component[left_pos], component[right_pos]]),
+                }
+                for left_pos in range(len(component))
+                for right_pos in range(left_pos + 1, len(component))
+            ]
+            clusters.append(
+                {
+                    "cluster_id": cluster_id,
+                    "heads": component,
+                    "pair_similarities": pair_similarities,
+                }
+            )
+
+        head_clusters.append(
+            {
+                "layer_idx": int(layer_idx),
+                "clusters": clusters,
+                "head_to_cluster": head_to_cluster,
+                "distance_threshold": distance_threshold,
+                "threshold_mode": ATTN_HEAD_CLUSTER_THRESHOLD_MODE,
+                "outlier_method": ATTN_HEAD_CLUSTER_OUTLIER_METHOD,
+                "distance_metric": ATTN_HEAD_CLUSTER_DISTANCE_METRIC,
+            }
+        )
+
+    return head_clusters
+
+
+def build_attention_head_cluster_payload(
+    head_clusters,
+    layer_indices,
+    head_similarity_info,
+):
+    layer_indices = [int(layer_idx) for layer_idx in layer_indices]
+    cluster_layers = list(head_clusters)
+    cluster_by_layer = {str(layer_cluster["layer_idx"]): layer_cluster for layer_cluster in cluster_layers}
+    return {
+        "schema_version": 1,
+        "cluster_scope": "per_layer",
+        "unit": "gqa_group",
+        "attention_head_count": int(head_similarity_info["attention_head_count"]),
+        "gqa_group_count": int(head_similarity_info["gqa_group_count"]),
+        "gqa_group_size": int(head_similarity_info["gqa_group_size"]),
+        "layer_indices": layer_indices,
+        "distance_metric": ATTN_HEAD_CLUSTER_DISTANCE_METRIC,
+        "threshold_mode": ATTN_HEAD_CLUSTER_THRESHOLD_MODE,
+        "outlier_method": ATTN_HEAD_CLUSTER_OUTLIER_METHOD,
+        "distance_threshold_by_layer": {
+            str(layer_cluster["layer_idx"]): float(layer_cluster["distance_threshold"])
+            for layer_cluster in cluster_layers
+        },
+        "cluster_count_by_layer": {
+            str(layer_cluster["layer_idx"]): len(layer_cluster["clusters"])
+            for layer_cluster in cluster_layers
+        },
+        "head_to_cluster_by_layer": {
+            str(layer_cluster["layer_idx"]): list(layer_cluster["head_to_cluster"])
+            for layer_cluster in cluster_layers
+        },
+        "clusters_by_layer": {
+            str(layer_cluster["layer_idx"]): layer_cluster["clusters"]
+            for layer_cluster in cluster_layers
+        },
+        "layers": [cluster_by_layer[str(layer_idx)] for layer_idx in layer_indices if str(layer_idx) in cluster_by_layer],
+    }
 
 
 def get_attention_gqa_group_count(model):
@@ -267,6 +445,7 @@ class AttentionLayerSimilarityRunWriter:
         heatmap_vmin=-1.0,
         heatmap_vmax=1.0,
         gqa_group_count=None,
+        head_cluster_mode=False,
     ):
         self.root_dir = root_dir
         self.model_name = model_name
@@ -276,6 +455,7 @@ class AttentionLayerSimilarityRunWriter:
         self.heatmap_vmin = float(heatmap_vmin)
         self.heatmap_vmax = float(heatmap_vmax)
         self.gqa_group_count = int(gqa_group_count) if gqa_group_count is not None else None
+        self.head_cluster_mode = bool(head_cluster_mode)
         self.run_dir = build_run_dir(root_dir, out_file)
         self.samples_dir = os.path.join(self.run_dir, "samples")
         self.manifest_path = os.path.join(self.run_dir, "manifest.json")
@@ -320,6 +500,10 @@ class AttentionLayerSimilarityRunWriter:
             "attn_head_similarity_heatmap_vmin": self.heatmap_vmin,
             "attn_head_similarity_heatmap_vmax": self.heatmap_vmax,
             "attn_head_similarity_gqa_group_count": self.gqa_group_count,
+            "attn_head_cluster_mode": self.head_cluster_mode,
+            "attn_head_cluster_threshold_mode": ATTN_HEAD_CLUSTER_THRESHOLD_MODE,
+            "attn_head_cluster_outlier_method": ATTN_HEAD_CLUSTER_OUTLIER_METHOD,
+            "attn_head_cluster_distance_metric": ATTN_HEAD_CLUSTER_DISTANCE_METRIC,
             "attn_layer_similarity_max_prefill_tokens": self.max_prefill_tokens,
             "attn_layer_similarity_prefill_cap_mode": "fixed" if self.max_prefill_tokens is not None else "none",
             "sample_count": len(self.samples),
@@ -378,6 +562,14 @@ class AttentionLayerSimilaritySampleWriter:
             "head_similarity_heatmap_dir": None,
             "head_similarity_heatmap_files": [],
             "head_similarity_heatmap_count": 0,
+            "attn_head_cluster_mode": self.run_writer.head_cluster_mode,
+            "head_cluster_distance_threshold_by_layer": {},
+            "head_cluster_threshold_mode": ATTN_HEAD_CLUSTER_THRESHOLD_MODE,
+            "head_cluster_outlier_method": ATTN_HEAD_CLUSTER_OUTLIER_METHOD,
+            "head_cluster_distance_metric": ATTN_HEAD_CLUSTER_DISTANCE_METRIC,
+            "head_cluster_file": None,
+            "head_clusters": [],
+            "head_cluster_count_by_layer": {},
             "similarity_shape": None,
             "head_similarity_shape": None,
             "attention_head_count": None,
@@ -408,11 +600,38 @@ class AttentionLayerSimilaritySampleWriter:
                 layer_indices,
                 gqa_group_count=self.run_writer.gqa_group_count,
             )
+            head_clusters = []
+            head_clusters_json = None
+            head_cluster_payload = None
+            head_cluster_count_by_layer = {}
+            head_cluster_distance_threshold_by_layer = {}
+            if self.run_writer.head_cluster_mode:
+                head_clusters = build_attention_head_clusters(
+                    head_similarity,
+                    layer_indices,
+                )
+                head_cluster_payload = build_attention_head_cluster_payload(
+                    head_clusters,
+                    layer_indices,
+                    head_similarity_info,
+                )
+                head_cluster_distance_threshold_by_layer = head_cluster_payload["distance_threshold_by_layer"]
+                head_clusters_json = json.dumps(head_clusters, ensure_ascii=False)
+                head_cluster_count_by_layer = head_cluster_payload["cluster_count_by_layer"]
+            head_cluster_distance_thresholds = np.asarray(
+                [
+                    head_cluster_distance_threshold_by_layer.get(str(layer_idx), np.nan)
+                    for layer_idx in layer_indices
+                ],
+                dtype=np.float32,
+            )
 
             similarity_file_name = f"prefill_{prefill_index:03d}_attn_layer_similarity.npz"
+            head_cluster_file_name = f"prefill_{prefill_index:03d}_attn_head_clusters.json"
             heatmap_file_name = f"prefill_{prefill_index:03d}_attn_layer_similarity.png"
             head_similarity_heatmap_dir_name = f"prefill_{prefill_index:03d}_gqa_head_similarity"
             similarity_path = os.path.join(self.sample_dir, similarity_file_name)
+            head_cluster_path = os.path.join(self.sample_dir, head_cluster_file_name)
             heatmap_path = os.path.join(self.sample_dir, heatmap_file_name)
             head_similarity_heatmap_dir = os.path.join(self.sample_dir, head_similarity_heatmap_dir_name)
             np.savez_compressed(
@@ -429,19 +648,33 @@ class AttentionLayerSimilaritySampleWriter:
                 attn_head_similarity_reduction=np.asarray(ATTN_HEAD_SIMILARITY_REDUCTION),
                 attn_head_similarity_heatmap_vmin=np.asarray(self.run_writer.heatmap_vmin, dtype=np.float32),
                 attn_head_similarity_heatmap_vmax=np.asarray(self.run_writer.heatmap_vmax, dtype=np.float32),
+                attn_head_cluster_mode=np.asarray(self.run_writer.head_cluster_mode, dtype=np.bool_),
+                attn_head_cluster_distance_thresholds=head_cluster_distance_thresholds,
+                attn_head_cluster_threshold_mode=np.asarray(ATTN_HEAD_CLUSTER_THRESHOLD_MODE),
+                attn_head_cluster_outlier_method=np.asarray(ATTN_HEAD_CLUSTER_OUTLIER_METHOD or ""),
+                attn_head_cluster_distance_metric=np.asarray(ATTN_HEAD_CLUSTER_DISTANCE_METRIC),
+                head_clusters_json=np.asarray(head_clusters_json or "[]"),
                 attention_head_count=np.asarray(head_similarity_info["attention_head_count"], dtype=np.int16),
                 gqa_group_count=np.asarray(head_similarity_info["gqa_group_count"], dtype=np.int16),
                 gqa_group_size=np.asarray(head_similarity_info["gqa_group_size"], dtype=np.int16),
                 token_ids=np.asarray(input_ids, dtype=np.int64),
             )
+            if head_cluster_payload is not None:
+                with open(head_cluster_path, "w", encoding="utf-8") as fout:
+                    json.dump(head_cluster_payload, fout, ensure_ascii=False, indent=2)
 
             record["status"] = "saved"
             record["similarity_file"] = similarity_file_name
+            if head_cluster_payload is not None:
+                record["head_cluster_file"] = head_cluster_file_name
             record["similarity_shape"] = list(similarity.shape)
             record["head_similarity_shape"] = list(head_similarity.shape)
             record["attention_head_count"] = head_similarity_info["attention_head_count"]
             record["gqa_group_count"] = head_similarity_info["gqa_group_count"]
             record["gqa_group_size"] = head_similarity_info["gqa_group_size"]
+            record["head_clusters"] = head_clusters
+            record["head_cluster_distance_threshold_by_layer"] = head_cluster_distance_threshold_by_layer
+            record["head_cluster_count_by_layer"] = head_cluster_count_by_layer
             record["attn_shape"] = list(attn.shape)
             record["layer_indices"] = layer_indices
             record["missing_layers"] = missing_layers
@@ -520,6 +753,13 @@ class AttentionLayerSimilaritySampleWriter:
             "heatmap_file",
             "head_similarity_heatmap_dir",
             "head_similarity_heatmap_count",
+            "attn_head_cluster_mode",
+            "head_cluster_distance_threshold_by_layer",
+            "head_cluster_threshold_mode",
+            "head_cluster_outlier_method",
+            "head_cluster_distance_metric",
+            "head_cluster_file",
+            "head_cluster_count_by_layer",
             "reason",
             "error",
             "plot_error",

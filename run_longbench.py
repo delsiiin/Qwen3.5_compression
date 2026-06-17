@@ -480,6 +480,7 @@ def build_attn_layer_similarity_run_writer(args, out_file, model):
         heatmap_vmin=args.attn_layer_similarity_vmin,
         heatmap_vmax=args.attn_layer_similarity_vmax,
         gqa_group_count=gqa_group_count,
+        head_cluster_mode=args.attn_head_cluster_mode,
     )
 
 
@@ -542,6 +543,8 @@ def validate_args(args):
         raise ValueError("--attn_layer_similarity_max_prefill_tokens must be at least 1 when provided.")
     if args.attn_layer_similarity_vmin >= args.attn_layer_similarity_vmax:
         raise ValueError("--attn_layer_similarity_vmin must be smaller than --attn_layer_similarity_vmax.")
+    if args.attn_head_cluster_mode and not args.attn_layer_similarity_mode:
+        raise ValueError("--attn_head_cluster_mode requires --attn_layer_similarity_mode.")
     if args.hidden_state_pca_max_prefill_tokens is not None and args.hidden_state_pca_max_prefill_tokens < 1:
         raise ValueError("--hidden_state_pca_max_prefill_tokens must be at least 1 when provided.")
     if args.hidden_state_pca_submode not in SUPPORTED_HIDDEN_STATE_PCA_SUBMODES:
@@ -889,6 +892,7 @@ if __name__ == "__main__":
     parser.add_argument("--attn_layer_similarity_max_prefill_tokens", type=int, default=None, help="Skip attention layer similarity capture when the prefill token count exceeds this cap.")
     parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for layer and per-layer GQA head similarity heatmap color scales.")
     parser.add_argument("--attn_layer_similarity_vmax", type=float, default=1.0, help="Upper bound for layer and per-layer GQA head similarity heatmap color scales.")
+    parser.add_argument("--attn_head_cluster_mode", action="store_true", help="Cluster per-layer attention heads/GQA groups from the captured head similarity matrices.")
     parser.add_argument("--query_window_similarity_mode", action="store_true")
     parser.add_argument("--query_window_similarity_dir", type=str, default="output_dir/results_longbench/query_window_similarity")
     parser.add_argument("--query_window_size", type=int, default=8, help="Number of prompt-tail tokens used for layer-wise query-window analysis.")
