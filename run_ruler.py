@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from typing import List
 
 
-context_length_list = [8192]
+context_length_list = [32768, 16384, 8192, 4096]
 # context_length_list = [4096, 8192, 16384]
 
 datasets = ["niah_single_1", "niah_single_2", "niah_single_3", "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
@@ -294,6 +294,52 @@ def validate_args(args):
         raise ValueError("--compression_budget must be at least 1 when compression is enabled.")
 
 
+def get_model_name(args):
+    return args.model_path.rstrip("/").split("/")[-1]
+
+
+def get_output_path(args):
+    model_name = get_model_name(args)
+    run_name = args.compression_mode if args.compression else "FullKV"
+    budget_name = str(args.compression_budget) if args.compression else "full"
+    output_dir = os.path.join(
+        args.save_dir,
+        f"{model_name}_{budget_name}",
+        str(args.context_length),
+        args.dataset,
+    )
+    return os.path.join(output_dir, f"{run_name}_{args.add_file_name}.json")
+
+
+def load_processed_examples(output_path):
+    processed_indices = set()
+    processed_inputs = set()
+    processed_count = 0
+
+    if not os.path.exists(output_path):
+        return processed_indices, processed_inputs, processed_count
+
+    with open(output_path) as fp:
+        for line_no, line in enumerate(fp, start=1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                example = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"Warning: skip malformed result line {line_no} in {output_path}")
+                continue
+
+            processed_count += 1
+            if example.get("index") is not None:
+                processed_indices.add(example["index"])
+            elif example.get("input") is not None:
+                processed_inputs.add(example["input"])
+
+    return processed_indices, processed_inputs, processed_count
+
+
 def get_input_device(model):
     try:
         return next(model.parameters()).device
@@ -376,6 +422,10 @@ def main(args):
 
 
     print("Loading data...")
+    output_path = get_output_path(args)
+    processed_indices, processed_inputs, processed_count = load_processed_examples(output_path)
+    if processed_count:
+        print(f"Found {processed_count} processed examples in {output_path}")
 
     test_data = []
     prompt_list = []
@@ -409,6 +459,17 @@ def main(args):
         elif args.sample_method == "topk":
             test_data = test_data[:args.max_num_examples]
 
+    selected_count = len(test_data)
+    test_data = [
+        example for example in test_data
+        if (
+            example.get("index") not in processed_indices
+            and example.get("input") not in processed_inputs
+        )
+    ]
+    skipped_count = selected_count - len(test_data)
+    print(f"Selected {selected_count} examples, skipped {skipped_count} processed examples, {len(test_data)} remaining.")
+
     for example in test_data:
         prompt_list.append(example["prompt"])
         input_list.append(example["input"])
@@ -416,75 +477,77 @@ def main(args):
         length_list.append(example["length"])
         index_list.append(example["index"])
 
-    print("Finish loading model and tokenizer")
-    model_name = args.model_path.rstrip("/").split("/")[-1]
-    run_name = args.compression_mode if args.compression else "FullKV"
-    budget_name = str(args.compression_budget) if args.compression else "full"
+    print("Finish loading data")
+    if not prompt_list:
+        print(f"All examples for {args.dataset} at context length {args.context_length} have been processed.")
+        return
 
-    os.makedirs(os.path.join(args.save_dir, f"{model_name}_{budget_name}", str(args.context_length), args.dataset), exist_ok=True)
-    fout = open(os.path.join(args.save_dir, f"{model_name}_{budget_name}", str(args.context_length), args.dataset, f"{run_name}_{args.add_file_name}.json"), "w")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "a") as fout:
+        for i in tqdm(range(0, len(prompt_list), args.eval_batch_size)):
 
-    for i in tqdm(range(0, len(prompt_list), args.eval_batch_size)):
+            batch_prompts = prompt_list[i:i+args.eval_batch_size]
+            batch_inputs = input_list[i:i+args.eval_batch_size]
+            batch_answers = outputs_list[i:i+args.eval_batch_size]
+            batch_lengths = length_list[i:i+args.eval_batch_size]
+            batch_indices = index_list[i:i+args.eval_batch_size]
 
-        batch_prompts = prompt_list[i:i+args.eval_batch_size]
-        batch_inputs = input_list[i:i+args.eval_batch_size]
-        batch_answers = outputs_list[i:i+args.eval_batch_size]
-        batch_lengths = length_list[i:i+args.eval_batch_size]
-
-        batch_prompts = [
-            truncate_prompt(prompt, tokenizer, max_input_len)
-            for prompt in batch_prompts
-        ]
-        tokenized_prompts = build_inputs(
-            batch_prompts,
-            tokenizer,
-            get_input_device(model),
-            enable_thinking=args.enable_thinking,
-        )
-        batch_input_ids = tokenized_prompts["input_ids"]
-
-        context_length = batch_input_ids.shape[-1]
-        if args.quant_method == None:
-            output = model.generate(
-                **tokenized_prompts,
-                output_attentions = args.output_attentions,
-                max_new_tokens=output_max_len,
-                num_beams=1,
-                do_sample=False,
-                temperature=1.0,
-                min_length=context_length+1,
-                eos_token_id=[tokenizer.eos_token_id],
-                pad_token_id=tokenizer.pad_token_id
+            batch_prompts = [
+                truncate_prompt(prompt, tokenizer, max_input_len)
+                for prompt in batch_prompts
+            ]
+            tokenized_prompts = build_inputs(
+                batch_prompts,
+                tokenizer,
+                get_input_device(model),
+                enable_thinking=args.enable_thinking,
             )
-        else:
-            output = model.generate(
-                **tokenized_prompts,
-                output_attentions = args.output_attentions,
-                max_new_tokens=output_max_len,
-                num_beams=1,
-                do_sample=False,
-                temperature=1.0,
-                min_length=context_length+1,
-                eos_token_id=[tokenizer.eos_token_id],
-                cache_implementation="quantized",
-                cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
-            )
+            batch_input_ids = tokenized_prompts["input_ids"]
 
-        batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
-        batch_generations = batch_outputs
+            context_length = batch_input_ids.shape[-1]
+            if args.quant_method == None:
+                output = model.generate(
+                    **tokenized_prompts,
+                    output_attentions = args.output_attentions,
+                    max_new_tokens=output_max_len,
+                    num_beams=1,
+                    do_sample=False,
+                    temperature=1.0,
+                    min_length=context_length+1,
+                    eos_token_id=[tokenizer.eos_token_id],
+                    pad_token_id=tokenizer.pad_token_id
+                )
+            else:
+                output = model.generate(
+                    **tokenized_prompts,
+                    output_attentions = args.output_attentions,
+                    max_new_tokens=output_max_len,
+                    num_beams=1,
+                    do_sample=False,
+                    temperature=1.0,
+                    min_length=context_length+1,
+                    eos_token_id=[tokenizer.eos_token_id],
+                    cache_implementation="quantized",
+                    cache_config={"nbits": args.nbits, "backend": "HQQ","device":"cuda","residual_length":output_max_len,"axis_key":1,"q_group_size":64},
+                )
 
-        torch.cuda.empty_cache()
+            batch_outputs = tokenizer.batch_decode(output[:, context_length:], skip_special_tokens=True)
+            batch_generations = batch_outputs
 
-        for j in range(len(batch_prompts)):
+            torch.cuda.empty_cache()
 
-            example = {}
-            example["prompt"] = batch_prompts[j]
-            example["input"] = batch_inputs[j]
-            example["answers"] = batch_answers[j]
-            example["pred"] = batch_generations[j]
-            example["length"] = batch_lengths[j]
+            for j in range(len(batch_prompts)):
 
-            fout.write(json.dumps(example) + "\n")
+                example = {}
+                example["index"] = batch_indices[j]
+                example["prompt"] = batch_prompts[j]
+                example["input"] = batch_inputs[j]
+                example["answers"] = batch_answers[j]
+                example["pred"] = batch_generations[j]
+                example["length"] = batch_lengths[j]
+
+                fout.write(json.dumps(example) + "\n")
+            fout.flush()
 
 
 
@@ -539,6 +602,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
 
     model, tokenizer = load_model_and_tokenizer(args)
+    model_name = get_model_name(args)
 
     for context_length in context_length_list:
         for idx, dataset in enumerate(datasets):
@@ -547,6 +611,6 @@ if __name__ == "__main__":
             print(f"Working on context length {context_length}, method: {run_name}, dataset: {dataset} - {idx}/{len(datasets)}")
             args.context_length = context_length
             args.dataset = dataset
-            args.data_file = f"data/RULER/{context_length}/{args.dataset}.jsonl"
+            args.data_file = f"data/RULER/{model_name}/synthetic/{context_length}/data/{args.dataset}/validation.jsonl"
 
             main(args)
