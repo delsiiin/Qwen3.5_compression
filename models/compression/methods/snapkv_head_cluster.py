@@ -3,6 +3,9 @@ import math
 import os
 
 import torch
+import torch.nn.functional as F
+
+from ..utils import compute_attention_scores
 
 
 class AttentionHeadClusterMixin:
@@ -44,6 +47,26 @@ class AttentionHeadClusterMixin:
             raise ValueError("Attention head cluster profile requires cluster_scope='per_layer'.")
         if raw_profile.get("unit") != "gqa_group":
             raise ValueError("Attention head cluster profile requires unit='gqa_group'.")
+        if raw_profile.get("head_mean_similarity_unit") != "raw_head_to_gqa_group_mean_before_grouping":
+            raise ValueError(
+                "Attention head cluster profile requires "
+                "head_mean_similarity_unit='raw_head_to_gqa_group_mean_before_grouping'."
+            )
+        if raw_profile.get("head_mean_similarity_metric") != "cosine_similarity":
+            raise ValueError("Attention head cluster profile requires head_mean_similarity_metric='cosine_similarity'.")
+        if (
+            raw_profile.get("head_mean_similarity_reduction")
+            != "raw_head_to_mean_gqa_group_attention_distribution_per_layer"
+        ):
+            raise ValueError(
+                "Attention head cluster profile requires "
+                "head_mean_similarity_reduction='raw_head_to_mean_gqa_group_attention_distribution_per_layer'."
+            )
+        gqa_group_count = self._parse_positive_int(raw_profile.get("gqa_group_count"), "gqa_group_count")
+        gqa_group_size = self._parse_positive_int(raw_profile.get("gqa_group_size"), "gqa_group_size")
+        attention_head_count = raw_profile.get("attention_head_count")
+        if attention_head_count is not None and int(attention_head_count) != gqa_group_count * gqa_group_size:
+            raise ValueError("Attention head cluster profile attention_head_count must equal gqa_group_count * gqa_group_size.")
 
         raw_clusters_by_layer = raw_profile.get("clusters_by_layer")
         if not isinstance(raw_clusters_by_layer, dict):
@@ -60,15 +83,26 @@ class AttentionHeadClusterMixin:
             clusters_by_layer[layer_idx] = self._parse_layer_clusters(
                 layer_idx,
                 raw_clusters,
+                gqa_group_size,
                 raw_head_to_cluster.get(str(layer_idx)),
             )
 
         if not clusters_by_layer:
             raise ValueError("Attention head cluster profile must contain at least one layer.")
         return {
-            "gqa_group_count": raw_profile.get("gqa_group_count"),
+            "gqa_group_count": gqa_group_count,
+            "gqa_group_size": gqa_group_size,
             "clusters_by_layer": clusters_by_layer,
         }
+
+    def _parse_positive_int(self, value, field_name):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Attention head cluster profile requires integer {field_name}.") from None
+        if value < 1:
+            raise ValueError(f"Attention head cluster profile {field_name} must be at least 1.")
+        return value
 
     def _clusters_by_layer_from_layers(self, raw_layers):
         if not isinstance(raw_layers, list):
@@ -80,7 +114,7 @@ class AttentionHeadClusterMixin:
             clusters_by_layer[str(int(raw_layer["layer_idx"]))] = raw_layer.get("clusters")
         return clusters_by_layer
 
-    def _parse_layer_clusters(self, layer_idx, raw_clusters, raw_head_to_cluster=None):
+    def _parse_layer_clusters(self, layer_idx, raw_clusters, gqa_group_size, raw_head_to_cluster=None):
         if not isinstance(raw_clusters, list) or not raw_clusters:
             raise ValueError(f"Layer {layer_idx} requires a non-empty cluster list.")
 
@@ -101,17 +135,19 @@ class AttentionHeadClusterMixin:
                 raise ValueError(f"Layer {layer_idx} head appears in multiple clusters: {sorted(duplicate_heads)}.")
             seen_heads.update(heads)
 
-            similarities = self._parse_pair_similarities(
+            raw_head_weights = self._parse_head_mean_similarities(
                 layer_idx,
                 cluster_id,
                 heads,
-                raw_cluster.get("pair_similarities", []),
+                raw_cluster.get("raw_heads_by_gqa_group"),
+                raw_cluster.get("head_mean_similarities"),
+                gqa_group_size,
             )
             clusters.append(
                 {
                     "cluster_id": cluster_id,
                     "heads": heads,
-                    "similarities": similarities,
+                    "raw_head_weights": raw_head_weights,
                 }
             )
 
@@ -131,37 +167,78 @@ class AttentionHeadClusterMixin:
 
         return tuple(clusters)
 
-    def _parse_pair_similarities(self, layer_idx, cluster_id, heads, raw_pair_similarities):
-        if raw_pair_similarities is None:
-            raw_pair_similarities = []
-        if not isinstance(raw_pair_similarities, list):
-            raise ValueError(f"Layer {layer_idx} cluster {cluster_id} pair_similarities must be a list.")
+    def _parse_head_mean_similarities(
+        self,
+        layer_idx,
+        cluster_id,
+        heads,
+        raw_heads_by_gqa_group,
+        raw_head_mean_similarities,
+        gqa_group_size,
+    ):
+        if raw_heads_by_gqa_group is None or raw_head_mean_similarities is None:
+            raise ValueError(
+                f"Layer {layer_idx} cluster {cluster_id} requires head_mean_similarities "
+                "and raw_heads_by_gqa_group; pair_similarities-only profiles are unsupported."
+            )
+        if not isinstance(raw_heads_by_gqa_group, dict):
+            raise ValueError(f"Layer {layer_idx} cluster {cluster_id} raw_heads_by_gqa_group must be an object.")
+        if not isinstance(raw_head_mean_similarities, list):
+            raise ValueError(f"Layer {layer_idx} cluster {cluster_id} head_mean_similarities must be a list.")
 
+        expected_raw_heads = tuple(range(int(gqa_group_size)))
         head_set = set(heads)
-        similarities = {}
-        for raw_pair in raw_pair_similarities:
-            if not isinstance(raw_pair, dict):
-                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} pair similarity entries must be objects.")
-            head_i = int(raw_pair["head_i"])
-            head_j = int(raw_pair["head_j"])
-            if head_i == head_j or head_i not in head_set or head_j not in head_set:
-                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} has invalid similarity pair.")
-            similarity = float(raw_pair["similarity"])
-            if not math.isfinite(similarity) or similarity < 0.0:
-                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} similarity must be finite and non-negative.")
-            key = tuple(sorted((head_i, head_j)))
-            if key in similarities:
-                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} has duplicate similarity pair {key}.")
-            similarities[key] = similarity
+        raw_heads_by_group = {}
+        for gqa_group_text, raw_heads in raw_heads_by_gqa_group.items():
+            gqa_group_id = int(gqa_group_text)
+            if gqa_group_id not in head_set:
+                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} has raw heads for non-cluster GQA group.")
+            if not isinstance(raw_heads, list):
+                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} raw head entries must be lists.")
+            raw_head_tuple = tuple(int(head_id) for head_id in raw_heads)
+            if raw_head_tuple != expected_raw_heads:
+                raise ValueError(
+                    f"Layer {layer_idx} cluster {cluster_id} raw heads for GQA group {gqa_group_id} "
+                    f"must be 0..{int(gqa_group_size) - 1}."
+                )
+            raw_heads_by_group[gqa_group_id] = raw_head_tuple
+        if set(raw_heads_by_group) != head_set:
+            raise ValueError(f"Layer {layer_idx} cluster {cluster_id} raw_heads_by_gqa_group must match heads.")
 
-        for offset, head_i in enumerate(heads):
-            for head_j in heads[offset + 1 :]:
-                key = tuple(sorted((head_i, head_j)))
-                if key not in similarities:
-                    raise ValueError(
-                        f"Layer {layer_idx} cluster {cluster_id} is missing similarity pair {key}."
-                    )
-        return similarities
+        similarities = {head: [None] * int(gqa_group_size) for head in heads}
+        for raw_entry in raw_head_mean_similarities:
+            if not isinstance(raw_entry, dict):
+                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} head_mean_similarities entries must be objects.")
+            gqa_group_id = int(raw_entry["gqa_group_id"])
+            raw_head_id = int(raw_entry["head_id"])
+            if gqa_group_id not in head_set or raw_head_id < 0 or raw_head_id >= int(gqa_group_size):
+                raise ValueError(f"Layer {layer_idx} cluster {cluster_id} has invalid head_mean_similarities entry.")
+            similarity = float(raw_entry["similarity"])
+            if not math.isfinite(similarity) or similarity < 0.0:
+                raise ValueError(
+                    f"Layer {layer_idx} cluster {cluster_id} head_mean similarity must be finite and non-negative."
+                )
+            if similarities[gqa_group_id][raw_head_id] is not None:
+                raise ValueError(
+                    f"Layer {layer_idx} cluster {cluster_id} duplicates GQA group {gqa_group_id} raw head {raw_head_id}."
+                )
+            similarities[gqa_group_id][raw_head_id] = similarity
+
+        raw_head_weights = {}
+        for gqa_group_id, group_similarities in similarities.items():
+            if any(similarity is None for similarity in group_similarities):
+                raise ValueError(
+                    f"Layer {layer_idx} cluster {cluster_id} is missing head_mean_similarities "
+                    f"for GQA group {gqa_group_id}."
+                )
+            weight_sum = float(sum(group_similarities))
+            if weight_sum <= 0.0:
+                raise ValueError(
+                    f"Layer {layer_idx} cluster {cluster_id} head_mean_similarities "
+                    f"for GQA group {gqa_group_id} must sum to a positive value."
+                )
+            raw_head_weights[gqa_group_id] = tuple(float(similarity) / weight_sum for similarity in group_similarities)
+        return raw_head_weights
 
     def _layer_clusters(self, num_heads):
         if self.layer_idx is None:
@@ -188,30 +265,73 @@ class AttentionHeadClusterMixin:
             )
         return clusters
 
-    def _mix_attn_cache_by_cluster(self, attn_cache, clusters=None):
-        if clusters is None:
-            clusters = self._layer_clusters(attn_cache.shape[1])
-
-        mixed_cache = attn_cache.clone()
+    def _raw_head_weight_tensor(self, num_heads, clusters, device, dtype):
+        gqa_group_size = int(self.attn_head_cluster_profile["gqa_group_size"])
+        weights = torch.zeros((int(num_heads), gqa_group_size), dtype=torch.float32, device=device)
         for cluster in clusters:
-            heads = cluster["heads"]
-            if len(heads) == 1:
-                continue
+            for head_idx, raw_head_weights in cluster["raw_head_weights"].items():
+                weights[int(head_idx)] = torch.tensor(raw_head_weights, dtype=torch.float32, device=device)
+        return weights.to(dtype=dtype)
 
-            weights = attn_cache.new_zeros((len(heads), len(heads)), dtype=torch.float32)
-            for target_offset, target_head in enumerate(heads):
-                for source_offset, source_head in enumerate(heads):
-                    if target_head == source_head:
-                        weights[target_offset, source_offset] = 1.0
-                    else:
-                        key = tuple(sorted((target_head, source_head)))
-                        weights[target_offset, source_offset] = float(cluster["similarities"][key])
-            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(weights.dtype).eps)
-            weights = weights.to(device=attn_cache.device, dtype=attn_cache.dtype)
+    def _compute_head_cluster_attn_cache(self, key_states, query_states, valid_mask=None):
+        bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+        hist_len = kv_cache_len - self.window_size
+        if hist_len < 1:
+            return key_states.new_zeros(bsz, num_key_value_heads, 0)
 
-            head_index = torch.tensor(heads, dtype=torch.long, device=attn_cache.device)
-            cluster_cache = attn_cache.index_select(dim=1, index=head_index)
-            mixed_cluster = torch.einsum("ts,bsl->btl", weights, cluster_cache)
-            for offset, head_idx in enumerate(heads):
-                mixed_cache[:, head_idx, :] = mixed_cluster[:, offset, :]
-        return mixed_cache
+        clusters = self._layer_clusters(num_key_value_heads)
+        gqa_group_size = int(self.attn_head_cluster_profile["gqa_group_size"])
+        expected_query_heads = num_key_value_heads * gqa_group_size
+        if query_states.shape[1] != expected_query_heads:
+            raise ValueError(
+                f"{self.attn_head_cluster_method_name} expected {expected_query_heads} query heads "
+                f"from gqa_group_count={num_key_value_heads} and gqa_group_size={gqa_group_size}, "
+                f"got {query_states.shape[1]}."
+            )
+
+        query_window = min(self.window_size, query_states.shape[-2])
+        query_states = query_states[:, :, -query_window:, :]
+
+        attn_weights = compute_attention_scores(query_states, key_states)
+        attention_mask = torch.ones_like(attn_weights) * float("-inf")
+        attention_mask = torch.triu(attention_mask, diagonal=kv_cache_len - query_window + 1)
+        attn_weights = attn_weights + attention_mask
+        if valid_mask is not None:
+            full_valid = valid_mask[:, :, None, :].expand(
+                bsz,
+                num_key_value_heads,
+                gqa_group_size,
+                kv_cache_len,
+            )
+            full_valid = full_valid.reshape(bsz, query_states.shape[1], kv_cache_len)
+            attn_weights = attn_weights.masked_fill(
+                ~full_valid[:, :, None, :],
+                torch.finfo(attn_weights.dtype).min,
+            )
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = attn_weights[..., :hist_len]
+
+        raw_head_scores = attn_weights.view(
+            bsz,
+            num_key_value_heads,
+            gqa_group_size,
+            query_window,
+            hist_len,
+        ).mean(dim=-2)
+        raw_head_weights = self._raw_head_weight_tensor(
+            num_key_value_heads,
+            clusters,
+            device=attn_weights.device,
+            dtype=raw_head_scores.dtype,
+        )
+        attn_weights_sum = (raw_head_scores * raw_head_weights[None, :, :, None]).sum(dim=2)
+        attn_cache = F.max_pool1d(
+            attn_weights_sum,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
+        if valid_mask is not None:
+            hist_valid = valid_mask[:, :, :hist_len].to(device=attn_cache.device, dtype=torch.bool)
+            attn_cache = torch.where(hist_valid, attn_cache, torch.zeros_like(attn_cache))
+        return attn_cache

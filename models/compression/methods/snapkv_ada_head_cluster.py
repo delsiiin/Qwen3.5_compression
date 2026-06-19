@@ -7,10 +7,15 @@ from .snapkv_head_cluster import AttentionHeadClusterMixin
 class SnapKV(AttentionHeadClusterMixin, SnapKVAda):
     manages_kv_cache = True
 
-    def __init__(self, *args, attn_head_cluster_path="/home/yangx/new_compression/attn_head_clusters_llama_8b.json", **kwargs):
+    def __init__(self, *args, attn_head_cluster_path=None, **kwargs):
+        if attn_head_cluster_path is None:
+            raise ValueError("snapkv_ada_head_cluster requires attn_head_cluster_path.")
         super().__init__(*args, **kwargs)
         self.attn_head_cluster_path = self._resolve_attn_head_cluster_path(attn_head_cluster_path)
         self.attn_head_cluster_profile = self._load_attn_head_cluster_profile(self.attn_head_cluster_path)
+
+    def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
+        return self._compute_head_cluster_attn_cache(key_states, query_states, valid_mask)
 
     def _select_layer_head_topk(self, key_states, scores, valid_mask):
         batch_size, num_heads = key_states.shape[:2]
@@ -21,7 +26,6 @@ class SnapKV(AttentionHeadClusterMixin, SnapKVAda):
             raise ValueError("snapkv_ada_head_cluster attn_cache length must match historical cache length.")
 
         clusters = self._layer_clusters(num_heads)
-        mixed_scores = self._mix_attn_cache_by_cluster(scores, clusters)
         hist_valid = valid_mask[:, :, :hist_len].to(device=scores.device, dtype=torch.bool)
         selected = torch.zeros(batch_size, num_heads, hist_len, dtype=torch.bool, device=scores.device)
 
@@ -29,7 +33,7 @@ class SnapKV(AttentionHeadClusterMixin, SnapKVAda):
         for cluster in clusters:
             heads = cluster["heads"]
             head_index = torch.tensor(heads, dtype=torch.long, device=scores.device)
-            cluster_scores = mixed_scores.index_select(dim=1, index=head_index)
+            cluster_scores = scores.index_select(dim=1, index=head_index)
             cluster_valid = hist_valid.index_select(dim=1, index=head_index)
             flat_valid = cluster_valid.reshape(batch_size, -1)
             valid_count = flat_valid.sum(dim=-1)
