@@ -22,6 +22,11 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen3.5",
 }
 
+HEAD_CLUSTER_COMPRESSION_MODES = {
+    "snapkv_ada_head_cluster",
+    "snapkv_hidden_mix_no_cos_head_cluster",
+}
+
 def cleanup_memory(verbos=True) -> None:
     """Run GC and clear GPU memory."""
     import gc
@@ -112,7 +117,12 @@ class FirstTokenTimingCriteria(StoppingCriteria):
         return False
 
 
-def build_compression_config(compression_mode, compression_budget, hidden_mix_profile_path=None):
+def build_compression_config(
+    compression_mode,
+    compression_budget,
+    hidden_mix_profile_path=None,
+    attn_head_cluster_path=None,
+):
     method_config = {
         "budget": compression_budget,
         "window_size": 8,
@@ -123,6 +133,8 @@ def build_compression_config(compression_mode, compression_budget, hidden_mix_pr
     }
     if hidden_mix_profile_path:
         method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
+    if attn_head_cluster_path:
+        method_config["attn_head_cluster_path"] = attn_head_cluster_path
     return {
         "method": compression_mode,
         "method_config": method_config,
@@ -209,6 +221,7 @@ def load_model_and_tokenizer(
     compression_mode=None,
     compression_budget=4096,
     hidden_mix_profile_path=None,
+    attn_head_cluster_path=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -240,7 +253,12 @@ def load_model_and_tokenizer(
                 f"models, got: {model_path}"
             )
 
-        compression_config = build_compression_config(compression_mode, compression_budget, hidden_mix_profile_path)
+        compression_config = build_compression_config(
+            compression_mode,
+            compression_budget,
+            hidden_mix_profile_path,
+            attn_head_cluster_path,
+        )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         apply_compression_setup(model, tokenizer, compression_mode)
@@ -306,6 +324,7 @@ def measure_throughput(
     compression_mode: str = None,
     compression_budget: int = 4096,
     hidden_mix_profile_path: str = None,
+    attn_head_cluster_path: str = None,
     # experiment arguments
     batch_size: int = 16,
     input_len: int = 128,
@@ -327,6 +346,18 @@ def measure_throughput(
             f"output_dir/results_efficiency/"
             f"throughput_results_{model_name}_{mode_name}{budget_suffix}_{batch_size}_{input_len}.txt"
         )
+
+    if compression and not compression_mode:
+        raise ValueError("Please provide compression_mode when compression=True.")
+    if (
+        compression
+        and compression_mode in HEAD_CLUSTER_COMPRESSION_MODES
+        and not attn_head_cluster_path
+    ):
+        raise ValueError(f"compression_mode {compression_mode} requires attn_head_cluster_path.")
+    if compression and compression_budget < 1:
+        raise ValueError("compression_budget must be at least 1 when compression=True.")
+
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -343,6 +374,7 @@ def measure_throughput(
         compression_mode=compression_mode,
         compression_budget=compression_budget,
         hidden_mix_profile_path=hidden_mix_profile_path,
+        attn_head_cluster_path=attn_head_cluster_path,
     )
 
     # Input Sequence      

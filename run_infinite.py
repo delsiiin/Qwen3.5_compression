@@ -41,6 +41,11 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen3.5",
 }
 
+HEAD_CLUSTER_COMPRESSION_MODES = {
+    "snapkv_ada_head_cluster",
+    "snapkv_hidden_mix_no_cos_head_cluster",
+}
+
 DATA_NAME_TO_PATH = {
     # Retrieval tasks
     "passkey": "passkey.jsonl",
@@ -130,6 +135,7 @@ def build_compression_config(
     compression_mode,
     compression_budget,
     hidden_mix_profile_path=None,
+    attn_head_cluster_path=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -141,6 +147,8 @@ def build_compression_config(
     }
     if hidden_mix_profile_path:
         method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
+    if attn_head_cluster_path:
+        method_config["attn_head_cluster_path"] = attn_head_cluster_path
 
     return {
         "method": compression_mode,
@@ -308,6 +316,7 @@ def load_model_and_tokenizer(args):
             args.compression_mode,
             args.compression_budget,
             args.hidden_mix_profile_path,
+            args.attn_head_cluster_path,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
@@ -330,6 +339,12 @@ def validate_args(args):
         raise ValueError("--model_maxlen must be at least 1.")
     if args.compression and not args.compression_mode:
         raise ValueError("--compression requires --compression_mode.")
+    if (
+        args.compression
+        and args.compression_mode in HEAD_CLUSTER_COMPRESSION_MODES
+        and not args.attn_head_cluster_path
+    ):
+        raise ValueError(f"--compression_mode {args.compression_mode} requires --attn_head_cluster_path.")
     if args.compression and args.compression_budget < 1:
         raise ValueError("--compression_budget must be at least 1 when compression is enabled.")
 
@@ -553,6 +568,7 @@ def parse_args() -> Namespace:
     p.add_argument("--compression_mode", type=str, default=None)
     p.add_argument("--compression_budget", type=int, default=4096)
     p.add_argument("--hidden_mix_profile_path", type=str, default=None)
+    p.add_argument("--attn_head_cluster_path", type=str, default=None)
     p.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to chat templates that support it.")
 
     p.add_argument(
