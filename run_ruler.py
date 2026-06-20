@@ -349,10 +349,19 @@ def load_processed_examples(output_path):
             processed_count += 1
             if example.get("index") is not None:
                 processed_indices.add(example["index"])
-            elif example.get("input") is not None:
+            if example.get("input") is not None:
                 processed_inputs.add(example["input"])
 
     return processed_indices, processed_inputs, processed_count
+
+
+def is_processed_example(example, processed_indices, processed_inputs):
+    example_input = example.get("input")
+    if example_input is not None:
+        return example_input in processed_inputs
+
+    example_index = example.get("index")
+    return example_index is not None and example_index in processed_indices
 
 
 def get_input_device(model):
@@ -477,10 +486,7 @@ def main(args):
     selected_count = len(test_data)
     test_data = [
         example for example in test_data
-        if (
-            example.get("index") not in processed_indices
-            and example.get("input") not in processed_inputs
-        )
+        if not is_processed_example(example, processed_indices, processed_inputs)
     ]
     skipped_count = selected_count - len(test_data)
     print(f"Selected {selected_count} examples, skipped {skipped_count} processed examples, {len(test_data)} remaining.")
