@@ -56,12 +56,6 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen3moe",
     "qwen3.5",
 }
-HEAD_CLUSTER_COMPRESSION_MODES = {
-    "snapkv_ada_head_cluster",
-    "snapkv_hidden_mix_no_cos_head_cluster",
-}
-
-
 def get_model_path(model_name):
     return model_map.get(model_name, model_name)
 
@@ -541,12 +535,6 @@ def validate_args(args):
         raise ValueError("--num_samples must be at least 1 when provided.")
     if args.compression and not args.compression_mode:
         raise ValueError("--compression requires --compression_mode.")
-    if (
-        args.compression
-        and args.compression_mode in HEAD_CLUSTER_COMPRESSION_MODES
-        and not args.attn_head_cluster_path
-    ):
-        raise ValueError(f"--compression_mode {args.compression_mode} requires --attn_head_cluster_path.")
     if args.compression and args.compression_budget < 1:
         raise ValueError("--compression_budget must be at least 1 when compression is enabled.")
     if args.query_window_size < 1:

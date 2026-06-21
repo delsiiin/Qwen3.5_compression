@@ -22,11 +22,6 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen3.5",
 }
 
-HEAD_CLUSTER_COMPRESSION_MODES = {
-    "snapkv_ada_head_cluster",
-    "snapkv_hidden_mix_no_cos_head_cluster",
-}
-
 def cleanup_memory(verbos=True) -> None:
     """Run GC and clear GPU memory."""
     import gc
@@ -349,12 +344,6 @@ def measure_throughput(
 
     if compression and not compression_mode:
         raise ValueError("Please provide compression_mode when compression=True.")
-    if (
-        compression
-        and compression_mode in HEAD_CLUSTER_COMPRESSION_MODES
-        and not attn_head_cluster_path
-    ):
-        raise ValueError(f"compression_mode {compression_mode} requires attn_head_cluster_path.")
     if compression and compression_budget < 1:
         raise ValueError("compression_budget must be at least 1 when compression=True.")
 
