@@ -486,6 +486,7 @@ def build_attn_layer_similarity_run_writer(args, out_file, model):
         out_file=out_file,
         attention_layers=attention_layers,
         max_prefill_tokens=args.attn_layer_similarity_max_prefill_tokens,
+        window_size=args.attn_layer_similarity_window_size,
         heatmap_vmin=args.attn_layer_similarity_vmin,
         heatmap_vmax=args.attn_layer_similarity_vmax,
         gqa_group_count=gqa_group_count,
@@ -556,6 +557,8 @@ def validate_args(args):
         raise ValueError("--attn_output_ratio_max_prefill_tokens must be at least 1 when provided.")
     if args.attn_layer_similarity_max_prefill_tokens is not None and args.attn_layer_similarity_max_prefill_tokens < 1:
         raise ValueError("--attn_layer_similarity_max_prefill_tokens must be at least 1 when provided.")
+    if args.attn_layer_similarity_window_size < 1:
+        raise ValueError("--attn_layer_similarity_window_size must be at least 1.")
     if args.attn_layer_similarity_vmin >= args.attn_layer_similarity_vmax:
         raise ValueError("--attn_layer_similarity_vmin must be smaller than --attn_layer_similarity_vmax.")
     if args.attn_head_cluster_mode and not args.attn_layer_similarity_mode:
@@ -900,7 +903,8 @@ if __name__ == "__main__":
         "--attn_layer_similarity_mode",
         action="store_true",
         help=(
-            "Capture standard self-attention layer distributions during prefill and plot a layer-id x layer-id "
+            "Capture standard self-attention layer distributions during prefill, and additionally plot metrics from "
+            "the final --attn_layer_similarity_window_size prompt tokens: a layer-id x layer-id "
             "cosine similarity heatmap plus per-layer GQA-group-id x GQA-group-id and raw-head-id x raw-head-id "
             "attention similarity heatmaps. "
             "The saved .npz can be used by build_hidden_mix_profile.py with --group_scheme attn_layer_similarity."
@@ -908,6 +912,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--attn_layer_similarity_dir", type=str, default="output_dir/results_longbench/attn_layer_similarity")
     parser.add_argument("--attn_layer_similarity_max_prefill_tokens", type=int, default=None, help="Skip attention layer similarity capture when the prefill token count exceeds this cap.")
+    parser.add_argument("--attn_layer_similarity_window_size", type=int, default=8, help="Number of input-tail query tokens whose full-context attention distributions are used for attention similarity metrics and plots.")
     parser.add_argument("--attn_layer_similarity_vmin", type=float, default=-1.0, help="Lower bound for layer and per-layer GQA head similarity heatmap color scales.")
     parser.add_argument("--attn_layer_similarity_vmax", type=float, default=1.0, help="Upper bound for layer and per-layer GQA head similarity heatmap color scales.")
     parser.add_argument("--attn_head_cluster_mode", action="store_true", help="Cluster per-layer attention heads/GQA groups from the captured head similarity matrices.")
