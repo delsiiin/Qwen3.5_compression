@@ -151,6 +151,15 @@ class OnlineAttentionHeadCluster:
     def build_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
         result = self.build(key_states, query_states, valid_mask)
         attn_weights_sum = (result.raw_head_scores * result.raw_head_weights[None, :, :, None]).sum(dim=2)
+        return result, self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
+
+    def build_mean_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
+        """Build a cluster result while mean-pooling raw GQA heads without similarity weights."""
+        result = self.build(key_states, query_states, valid_mask)
+        attn_weights_sum = result.raw_head_scores.mean(dim=2)
+        return result, self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
+
+    def _pool_attn_cache(self, attn_weights_sum, key_states, kernel_size, valid_mask):
         attn_cache = F.max_pool1d(
             attn_weights_sum,
             kernel_size=int(kernel_size),
@@ -158,9 +167,9 @@ class OnlineAttentionHeadCluster:
             stride=1,
         )
         if valid_mask is not None:
-            hist_valid = valid_mask[:, :, : result.hist_len].to(device=attn_cache.device, dtype=torch.bool)
+            hist_valid = valid_mask[:, :, : attn_cache.shape[-1]].to(device=attn_cache.device, dtype=torch.bool)
             attn_cache = torch.where(hist_valid, attn_cache, torch.zeros_like(attn_cache))
-        return result, attn_cache.to(dtype=key_states.dtype)
+        return attn_cache.to(dtype=key_states.dtype)
 
 
 class SnapKVAdaOnlineHeadCluster(SnapKVAda):
