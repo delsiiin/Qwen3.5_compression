@@ -11,7 +11,6 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
         # Kept for direct-call compatibility. Online clustering does not read profiles.
         self.attn_head_cluster_path = attn_head_cluster_path
         self._online_head_clusterer = OnlineAttentionHeadCluster(self.window_size)
-        self._online_head_cluster_result = None
 
     def update_kv_cache(
         self,
@@ -57,29 +56,43 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
         return key_states, value_states
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
-        result, attn_cache = self._online_head_clusterer.build_mean_attn_cache(
+        return self._online_head_clusterer.build_mean_attn_cache_without_clustering(
             key_states,
             query_states,
             self.kernel_size,
             valid_mask,
         )
-        self._online_head_cluster_result = result
-        return attn_cache
 
     def _store_group_entry(self, key_states, value_states, attn_cache, layer_cache, valid_mask=None):
         super()._store_group_entry(key_states, value_states, attn_cache, layer_cache)
-        result = self._online_head_cluster_result
         if valid_mask is None:
             valid_mask = torch.ones(key_states.shape[:3], dtype=torch.bool, device=key_states.device)
-        clusters = (
-            result.clusters
-            if result is not None
-            else tuple({"cluster_id": head_idx, "heads": (head_idx,)} for head_idx in range(key_states.shape[1]))
-        )
         group_layers = self._group_layers(self.layer_idx)
         entry = self._state()["groups"][tuple(group_layers)][self.layer_idx]
-        entry["clusters"] = clusters
         entry["valid_mask"] = valid_mask
+
+    def _compress_group(self, entries, group_layers):
+        entry_by_layer = {int(entry["layer_idx"]): entry for entry in entries}
+        for entry in entries:
+            target_layer = int(entry["layer_idx"])
+            mix = self._mix_for_layer(group_layers, target_layer)
+            mixed_cache = None
+            for source_layer, weight in zip(mix["sources"], mix["weights"]):
+                source_cache = entry_by_layer[int(source_layer)]["attn_cache"]
+                source_cache = source_cache.to(device=entry["attn_cache"].device, dtype=entry["attn_cache"].dtype)
+                if source_cache.shape != entry["attn_cache"].shape:
+                    raise ValueError("snapkv_hidden_mix requires matching attn_cache shapes within a layer group.")
+                normalized_cache = self._normalize_attn_cache(source_cache)
+                weighted = normalized_cache * float(weight)
+                mixed_cache = weighted if mixed_cache is None else mixed_cache + weighted
+
+            valid_mask = entry["valid_mask"].to(device=mixed_cache.device, dtype=torch.bool)
+            hist_valid = valid_mask[:, :, : mixed_cache.shape[-1]]
+            entry["clusters"] = self._online_head_clusterer.build_clusters_from_scores(
+                mixed_cache,
+                hist_valid,
+            )
+            self._pack_layer(entry, mixed_cache)
 
     def _pack_layer(self, entry, attn_cache):
         key_states = entry["key_states"]

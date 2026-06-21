@@ -57,7 +57,7 @@ class OnlineAttentionHeadCluster:
         self.window_size = int(window_size)
         self.eps = float(eps)
 
-    def build(self, key_states, query_states, valid_mask=None):
+    def _build_raw_head_attention(self, key_states, query_states, valid_mask=None):
         if key_states.ndim != 4 or query_states.ndim != 4:
             raise ValueError("Online attention head clustering requires rank-4 key and query states.")
         if key_states.shape[0] != 1 or query_states.shape[0] != 1:
@@ -106,6 +106,11 @@ class OnlineAttentionHeadCluster:
             query_window,
             hist_len,
         )[0]
+        return raw_head_attention
+
+    def build(self, key_states, query_states, valid_mask=None):
+        raw_head_attention = self._build_raw_head_attention(key_states, query_states, valid_mask)
+        num_key_value_heads, gqa_group_size, _, hist_len = raw_head_attention.shape
         raw_head_scores = raw_head_attention.mean(dim=-2).unsqueeze(0)
 
         group_attention = raw_head_attention.mean(dim=1)
@@ -148,6 +153,41 @@ class OnlineAttentionHeadCluster:
             hist_len=hist_len,
         )
 
+    def build_clusters_from_scores(self, scores, valid_mask=None):
+        """Cluster KV heads from final per-head historical token scores."""
+        if scores.ndim != 3:
+            raise ValueError("Online attention head clustering scores must be rank 3 [batch, heads, history].")
+        if scores.shape[0] != 1:
+            raise ValueError("Online attention head clustering only supports batch size 1.")
+        if scores.shape[-1] < 1:
+            raise ValueError("Online attention head clustering requires at least one historical KV token.")
+
+        if valid_mask is not None:
+            if valid_mask.shape != scores.shape:
+                raise ValueError(
+                    "Online attention head clustering score valid_mask must match [1, key_value_heads, history]."
+                )
+            scores = scores.masked_fill(~valid_mask.to(device=scores.device, dtype=torch.bool), 0)
+
+        vectors = scores[0].to(dtype=torch.float32)
+        normalized_vectors = F.normalize(vectors, p=2, dim=-1, eps=self.eps)
+        group_similarity = (normalized_vectors @ normalized_vectors.transpose(0, 1)).clamp(
+            min=-1.0,
+            max=1.0,
+        )
+        num_key_value_heads = scores.shape[1]
+        if num_key_value_heads <= 1:
+            distance_threshold = 0.0
+        else:
+            upper = torch.triu_indices(
+                num_key_value_heads,
+                num_key_value_heads,
+                offset=1,
+                device=group_similarity.device,
+            )
+            distance_threshold = float((1.0 - group_similarity[upper[0], upper[1]]).mean().item())
+        return _complete_link_clusters(1.0 - group_similarity, distance_threshold)
+
     def build_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
         result = self.build(key_states, query_states, valid_mask)
         attn_weights_sum = (result.raw_head_scores * result.raw_head_weights[None, :, :, None]).sum(dim=2)
@@ -158,6 +198,12 @@ class OnlineAttentionHeadCluster:
         result = self.build(key_states, query_states, valid_mask)
         attn_weights_sum = result.raw_head_scores.mean(dim=2)
         return result, self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
+
+    def build_mean_attn_cache_without_clustering(self, key_states, query_states, kernel_size, valid_mask=None):
+        """Mean-pool raw GQA attention without constructing an online head cluster."""
+        raw_head_attention = self._build_raw_head_attention(key_states, query_states, valid_mask)
+        attn_weights_sum = raw_head_attention.mean(dim=-2).unsqueeze(0).mean(dim=2)
+        return self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
 
     def _pool_attn_cache(self, attn_weights_sum, key_states, kernel_size, valid_mask):
         attn_cache = F.max_pool1d(
