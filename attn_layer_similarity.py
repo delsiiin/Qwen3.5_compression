@@ -26,6 +26,29 @@ ATTN_HEAD_MEAN_SIMILARITY_REDUCTION = "raw_head_to_mean_gqa_group_attention_dist
 ATTN_HEAD_CLUSTER_DISTANCE_METRIC = "1 - cosine_similarity"
 ATTN_HEAD_CLUSTER_THRESHOLD_MODE = "mean"
 ATTN_HEAD_CLUSTER_OUTLIER_METHOD = None
+ATTN_LAYER_SIMILARITY_QUERY_TOKEN_SCOPE = "input_tail_window"
+
+
+def select_attention_query_window(attn, window_size):
+    """Keep attention distributions for the final query-token window.
+
+    The key dimension is intentionally left intact: each selected prompt-tail
+    token is still represented by its attention distribution over the full
+    input context.
+    """
+    attn = np.asarray(attn)
+    if attn.ndim != 4:
+        raise ValueError("attn must have shape [layers, heads, query_tokens, key_tokens].")
+    window_size = int(window_size)
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1.")
+
+    query_token_count = int(attn.shape[2])
+    if query_token_count < 1:
+        raise ValueError("attn must contain at least one query token.")
+    selected_count = min(window_size, query_token_count)
+    query_start = query_token_count - selected_count
+    return attn[:, :, query_start:, :], query_start, selected_count
 
 
 def build_attention_layer_similarity(attn, layer_indices, eps=1e-12):
@@ -597,6 +620,7 @@ class AttentionLayerSimilarityRunWriter:
         out_file,
         attention_layers,
         max_prefill_tokens,
+        window_size=8,
         heatmap_vmin=-1.0,
         heatmap_vmax=1.0,
         gqa_group_count=None,
@@ -607,6 +631,9 @@ class AttentionLayerSimilarityRunWriter:
         self.out_file = os.path.abspath(out_file)
         self.attention_layers = [int(layer_idx) for layer_idx in attention_layers]
         self.max_prefill_tokens = int(max_prefill_tokens) if max_prefill_tokens is not None else None
+        self.window_size = int(window_size)
+        if self.window_size < 1:
+            raise ValueError("window_size must be at least 1.")
         self.heatmap_vmin = float(heatmap_vmin)
         self.heatmap_vmax = float(heatmap_vmax)
         self.gqa_group_count = int(gqa_group_count) if gqa_group_count is not None else None
@@ -646,6 +673,8 @@ class AttentionLayerSimilarityRunWriter:
             "model_name": self.model_name,
             "result_path": self.out_file,
             "attention_layers": self.attention_layers,
+            "tail_window_attention_scope": ATTN_LAYER_SIMILARITY_QUERY_TOKEN_SCOPE,
+            "tail_window_attention_size": self.window_size,
             "attn_layer_similarity_metric": ATTN_LAYER_SIMILARITY_METRIC,
             "attn_layer_similarity_reduction": ATTN_LAYER_SIMILARITY_REDUCTION,
             "attn_layer_similarity_heatmap_vmin": self.heatmap_vmin,
@@ -709,6 +738,10 @@ class AttentionLayerSimilaritySampleWriter:
             "tokens": build_token_entries(tokenizer, input_ids),
             "attn_layer_similarity_metric": ATTN_LAYER_SIMILARITY_METRIC,
             "attn_layer_similarity_reduction": ATTN_LAYER_SIMILARITY_REDUCTION,
+            "tail_window_attention_scope": ATTN_LAYER_SIMILARITY_QUERY_TOKEN_SCOPE,
+            "tail_window_attention_size": self.run_writer.window_size,
+            "tail_window_attention_query_token_start": None,
+            "tail_window_attention_query_token_count": None,
             "attn_layer_similarity_heatmap_vmin": self.run_writer.heatmap_vmin,
             "attn_layer_similarity_heatmap_vmax": self.run_writer.heatmap_vmax,
             "attn_head_similarity_metric": ATTN_HEAD_SIMILARITY_METRIC,
@@ -728,6 +761,13 @@ class AttentionLayerSimilaritySampleWriter:
             "raw_head_similarity_heatmap_dir": None,
             "raw_head_similarity_heatmap_files": [],
             "raw_head_similarity_heatmap_count": 0,
+            "tail_window_heatmap_file": None,
+            "tail_window_head_similarity_heatmap_dir": None,
+            "tail_window_head_similarity_heatmap_files": [],
+            "tail_window_head_similarity_heatmap_count": 0,
+            "tail_window_raw_head_similarity_heatmap_dir": None,
+            "tail_window_raw_head_similarity_heatmap_files": [],
+            "tail_window_raw_head_similarity_heatmap_count": 0,
             "attn_head_cluster_mode": self.run_writer.head_cluster_mode,
             "head_cluster_distance_threshold_by_layer": {},
             "head_cluster_threshold_mode": ATTN_HEAD_CLUSTER_THRESHOLD_MODE,
@@ -738,11 +778,15 @@ class AttentionLayerSimilaritySampleWriter:
             "similarity_shape": None,
             "head_similarity_shape": None,
             "raw_head_similarity_shape": None,
+            "tail_window_similarity_shape": None,
+            "tail_window_head_similarity_shape": None,
+            "tail_window_raw_head_similarity_shape": None,
             "attention_head_count": None,
             "raw_head_count": None,
             "gqa_group_count": None,
             "gqa_group_size": None,
             "attn_shape": None,
+            "tail_window_attn_shape": None,
             "layer_indices": [],
             "missing_layers": [],
         }
@@ -761,6 +805,10 @@ class AttentionLayerSimilaritySampleWriter:
                 inputs=inputs,
                 attention_layers=self.run_writer.attention_layers,
             )
+            window_attn, query_token_start, query_token_count = select_attention_query_window(
+                attn,
+                self.run_writer.window_size,
+            )
             similarity, layer_indices = build_attention_layer_similarity(attn, layer_indices)
             head_similarity, layer_indices, head_similarity_info = build_attention_head_similarity(
                 attn,
@@ -769,6 +817,16 @@ class AttentionLayerSimilaritySampleWriter:
             )
             raw_head_similarity, layer_indices, raw_head_similarity_info = build_raw_attention_head_similarity(
                 attn,
+                layer_indices,
+            )
+            tail_window_similarity, _ = build_attention_layer_similarity(window_attn, layer_indices)
+            tail_window_head_similarity, _, _ = build_attention_head_similarity(
+                window_attn,
+                layer_indices,
+                gqa_group_count=self.run_writer.gqa_group_count,
+            )
+            tail_window_raw_head_similarity, _, _ = build_raw_attention_head_similarity(
+                window_attn,
                 layer_indices,
             )
             head_clusters = []
@@ -802,18 +860,36 @@ class AttentionLayerSimilaritySampleWriter:
             heatmap_file_name = f"prefill_{prefill_index:03d}_attn_layer_similarity.png"
             head_similarity_heatmap_dir_name = f"prefill_{prefill_index:03d}_gqa_head_similarity"
             raw_head_similarity_heatmap_dir_name = f"prefill_{prefill_index:03d}_raw_head_similarity"
+            tail_window_heatmap_file_name = f"prefill_{prefill_index:03d}_tail_window_attn_layer_similarity.png"
+            tail_window_head_similarity_heatmap_dir_name = f"prefill_{prefill_index:03d}_tail_window_gqa_head_similarity"
+            tail_window_raw_head_similarity_heatmap_dir_name = f"prefill_{prefill_index:03d}_tail_window_raw_head_similarity"
             similarity_path = os.path.join(self.sample_dir, similarity_file_name)
             head_cluster_path = os.path.join(self.sample_dir, head_cluster_file_name)
             heatmap_path = os.path.join(self.sample_dir, heatmap_file_name)
             head_similarity_heatmap_dir = os.path.join(self.sample_dir, head_similarity_heatmap_dir_name)
             raw_head_similarity_heatmap_dir = os.path.join(self.sample_dir, raw_head_similarity_heatmap_dir_name)
+            tail_window_heatmap_path = os.path.join(self.sample_dir, tail_window_heatmap_file_name)
+            tail_window_head_similarity_heatmap_dir = os.path.join(
+                self.sample_dir, tail_window_head_similarity_heatmap_dir_name
+            )
+            tail_window_raw_head_similarity_heatmap_dir = os.path.join(
+                self.sample_dir, tail_window_raw_head_similarity_heatmap_dir_name
+            )
             np.savez_compressed(
                 similarity_path,
                 similarity=similarity,
                 head_similarity=head_similarity,
                 raw_head_similarity=raw_head_similarity,
+                tail_window_similarity=tail_window_similarity,
+                tail_window_head_similarity=tail_window_head_similarity,
+                tail_window_raw_head_similarity=tail_window_raw_head_similarity,
                 layer_indices=np.asarray(layer_indices, dtype=np.int16),
                 attn_shape=np.asarray(attn.shape, dtype=np.int64),
+                tail_window_attn_shape=np.asarray(window_attn.shape, dtype=np.int64),
+                tail_window_attention_scope=np.asarray(ATTN_LAYER_SIMILARITY_QUERY_TOKEN_SCOPE),
+                tail_window_attention_size=np.asarray(self.run_writer.window_size, dtype=np.int64),
+                tail_window_attention_query_token_start=np.asarray(query_token_start, dtype=np.int64),
+                tail_window_attention_query_token_count=np.asarray(query_token_count, dtype=np.int64),
                 attn_layer_similarity_metric=np.asarray(ATTN_LAYER_SIMILARITY_METRIC),
                 attn_layer_similarity_reduction=np.asarray(ATTN_LAYER_SIMILARITY_REDUCTION),
                 attn_layer_similarity_heatmap_vmin=np.asarray(self.run_writer.heatmap_vmin, dtype=np.float32),
@@ -848,6 +924,9 @@ class AttentionLayerSimilaritySampleWriter:
             record["similarity_shape"] = list(similarity.shape)
             record["head_similarity_shape"] = list(head_similarity.shape)
             record["raw_head_similarity_shape"] = list(raw_head_similarity.shape)
+            record["tail_window_similarity_shape"] = list(tail_window_similarity.shape)
+            record["tail_window_head_similarity_shape"] = list(tail_window_head_similarity.shape)
+            record["tail_window_raw_head_similarity_shape"] = list(tail_window_raw_head_similarity.shape)
             record["attention_head_count"] = head_similarity_info["attention_head_count"]
             record["raw_head_count"] = raw_head_similarity_info["raw_head_count"]
             record["gqa_group_count"] = head_similarity_info["gqa_group_count"]
@@ -855,6 +934,9 @@ class AttentionLayerSimilaritySampleWriter:
             record["head_cluster_distance_threshold_by_layer"] = head_cluster_distance_threshold_by_layer
             record["head_cluster_count_by_layer"] = head_cluster_count_by_layer
             record["attn_shape"] = list(attn.shape)
+            record["tail_window_attn_shape"] = list(window_attn.shape)
+            record["tail_window_attention_query_token_start"] = query_token_start
+            record["tail_window_attention_query_token_count"] = query_token_count
             record["layer_indices"] = layer_indices
             record["missing_layers"] = missing_layers
             try:
@@ -919,6 +1001,63 @@ class AttentionLayerSimilaritySampleWriter:
                 elif record["status"] in {"saved_npz_plot_error", "saved_npz_head_plot_error"}:
                     record["status"] = "saved_npz_plot_errors"
                 record["raw_head_similarity_heatmap_error"] = str(raw_head_plot_exc)
+            try:
+                plot_attention_layer_similarity_heatmap(
+                    similarity=tail_window_similarity,
+                    layer_indices=layer_indices,
+                    output_path=tail_window_heatmap_path,
+                    title=(
+                        f"{label}: tail-window attention layer similarity "
+                        f"({ATTN_LAYER_SIMILARITY_REDUCTION}, {ATTN_LAYER_SIMILARITY_METRIC}, "
+                        f"last {query_token_count} query tokens of {len(input_ids)}, range "
+                        f"{self.run_writer.heatmap_vmin:g}..{self.run_writer.heatmap_vmax:g})"
+                    ),
+                    vmin=self.run_writer.heatmap_vmin,
+                    vmax=self.run_writer.heatmap_vmax,
+                )
+                record["tail_window_heatmap_file"] = tail_window_heatmap_file_name
+            except Exception as tail_window_plot_exc:
+                record["tail_window_heatmap_error"] = str(tail_window_plot_exc)
+            try:
+                tail_window_head_similarity_heatmap_files = plot_attention_head_similarity_heatmaps(
+                    head_similarity=tail_window_head_similarity,
+                    layer_indices=layer_indices,
+                    output_dir=tail_window_head_similarity_heatmap_dir,
+                    file_prefix=f"prefill_{prefill_index:03d}_tail_window",
+                    title_prefix=f"{label} (last {query_token_count} query tokens of {len(input_ids)})",
+                    vmin=self.run_writer.heatmap_vmin,
+                    vmax=self.run_writer.heatmap_vmax,
+                )
+                record["tail_window_head_similarity_heatmap_dir"] = tail_window_head_similarity_heatmap_dir_name
+                record["tail_window_head_similarity_heatmap_files"] = [
+                    os.path.join(tail_window_head_similarity_heatmap_dir_name, file_name)
+                    for file_name in tail_window_head_similarity_heatmap_files
+                ]
+                record["tail_window_head_similarity_heatmap_count"] = len(
+                    tail_window_head_similarity_heatmap_files
+                )
+            except Exception as tail_window_head_plot_exc:
+                record["tail_window_head_similarity_heatmap_error"] = str(tail_window_head_plot_exc)
+            try:
+                tail_window_raw_head_similarity_heatmap_files = plot_raw_attention_head_similarity_heatmaps(
+                    raw_head_similarity=tail_window_raw_head_similarity,
+                    layer_indices=layer_indices,
+                    output_dir=tail_window_raw_head_similarity_heatmap_dir,
+                    file_prefix=f"prefill_{prefill_index:03d}_tail_window",
+                    title_prefix=f"{label} (last {query_token_count} query tokens of {len(input_ids)})",
+                    vmin=self.run_writer.heatmap_vmin,
+                    vmax=self.run_writer.heatmap_vmax,
+                )
+                record["tail_window_raw_head_similarity_heatmap_dir"] = tail_window_raw_head_similarity_heatmap_dir_name
+                record["tail_window_raw_head_similarity_heatmap_files"] = [
+                    os.path.join(tail_window_raw_head_similarity_heatmap_dir_name, file_name)
+                    for file_name in tail_window_raw_head_similarity_heatmap_files
+                ]
+                record["tail_window_raw_head_similarity_heatmap_count"] = len(
+                    tail_window_raw_head_similarity_heatmap_files
+                )
+            except Exception as tail_window_raw_head_plot_exc:
+                record["tail_window_raw_head_similarity_heatmap_error"] = str(tail_window_raw_head_plot_exc)
         except Exception as exc:
             record["status"] = "error"
             record["error"] = str(exc)
@@ -939,6 +1078,10 @@ class AttentionLayerSimilaritySampleWriter:
             "token_count",
             "attn_layer_similarity_metric",
             "attn_layer_similarity_reduction",
+            "tail_window_attention_scope",
+            "tail_window_attention_size",
+            "tail_window_attention_query_token_start",
+            "tail_window_attention_query_token_count",
             "attn_layer_similarity_heatmap_vmin",
             "attn_layer_similarity_heatmap_vmax",
             "attn_head_similarity_metric",
@@ -953,6 +1096,10 @@ class AttentionLayerSimilaritySampleWriter:
             "similarity_shape",
             "head_similarity_shape",
             "raw_head_similarity_shape",
+            "tail_window_attn_shape",
+            "tail_window_similarity_shape",
+            "tail_window_head_similarity_shape",
+            "tail_window_raw_head_similarity_shape",
             "attention_head_count",
             "raw_head_count",
             "gqa_group_count",
@@ -964,6 +1111,13 @@ class AttentionLayerSimilaritySampleWriter:
             "raw_head_similarity_heatmap_dir",
             "raw_head_similarity_heatmap_files",
             "raw_head_similarity_heatmap_count",
+            "tail_window_heatmap_file",
+            "tail_window_head_similarity_heatmap_dir",
+            "tail_window_head_similarity_heatmap_files",
+            "tail_window_head_similarity_heatmap_count",
+            "tail_window_raw_head_similarity_heatmap_dir",
+            "tail_window_raw_head_similarity_heatmap_files",
+            "tail_window_raw_head_similarity_heatmap_count",
             "attn_head_cluster_mode",
             "head_cluster_distance_threshold_by_layer",
             "head_cluster_threshold_mode",
@@ -976,6 +1130,9 @@ class AttentionLayerSimilaritySampleWriter:
             "plot_error",
             "head_similarity_heatmap_error",
             "raw_head_similarity_heatmap_error",
+            "tail_window_heatmap_error",
+            "tail_window_head_similarity_heatmap_error",
+            "tail_window_raw_head_similarity_heatmap_error",
         ]
         return [{key: record[key] for key in keys if key in record} for record in self.prefills]
 
