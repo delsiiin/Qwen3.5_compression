@@ -134,7 +134,7 @@ def build_compression_config(
 ):
     method_config = {
         "budget": compression_budget,
-        "window_size": 8,
+        "window_size": 32,
         "mix_lambda": 0.07,
         "retain_ratio": 0.2,
         "retain_direction": "last",
