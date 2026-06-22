@@ -2,6 +2,7 @@ from ..utils import cal_similarity, compute_attention_scores
 
 from .snapkv import SnapKV
 from .snapkv_ada import SnapKV as SnapKVAda
+from .snapkv_spatio_temporal import SnapKVSpatioTemporal
 from .snapkv_ada_online_head_cluster import SnapKVAdaOnlineHeadCluster
 from .snapkv_neighbor_shared import SnapKVNeighborShared
 from .snapkv_hidden_mix import SnapKVHiddenMix
@@ -21,6 +22,7 @@ from .laprox import LaProx
 __all__ = [
     "SnapKV",
     "SnapKVAda",
+    "SnapKVSpatioTemporal",
     "SnapKVAdaHeadCluster",
     "SnapKVAdaOnlineHeadCluster",
     "SnapKVNeighborShared",
