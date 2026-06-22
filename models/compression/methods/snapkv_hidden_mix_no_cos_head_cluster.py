@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from .snapkv_ada_online_head_cluster import OnlineAttentionHeadCluster
 from .snapkv_hidden_mix_no_cos import SnapKVHiddenMix as SnapKVHiddenMixNoCos
@@ -56,9 +57,47 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
         return key_states, value_states
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
-        return self._online_head_clusterer.build_mean_attn_cache_without_clustering(
+        """Build per-KV-head scores with spatio-temporal 2D pooling.
+
+        The 2D grid spans flattened KV/GQA heads and the query window, matching
+        ``snapkv_spatio_temporal``.  The resulting scores still feed the
+        hidden-mix-specific online clustering and shared-budget selection below.
+        """
+        raw_head_attention = self._online_head_clusterer._build_raw_head_attention(
             key_states,
             query_states,
+            valid_mask,
+        )
+        (
+            num_key_value_heads,
+            num_key_value_groups,
+            query_window,
+            hist_len,
+        ) = raw_head_attention.shape
+
+        spatiotemporal_scores = raw_head_attention.permute(3, 0, 1, 2).reshape(
+            hist_len,
+            1,
+            num_key_value_heads * num_key_value_groups,
+            query_window,
+        )
+        spatiotemporal_scores = F.avg_pool2d(
+            spatiotemporal_scores,
+            kernel_size=self.kernel_size,
+            stride=1,
+            padding=self.kernel_size // 2,
+            count_include_pad=False,
+        )
+        attn_weights_sum = spatiotemporal_scores.reshape(
+            hist_len,
+            num_key_value_heads,
+            num_key_value_groups,
+            query_window,
+        ).permute(1, 0, 2, 3).amax(dim=(-1, -2)).unsqueeze(0)
+
+        return self._online_head_clusterer._pool_attn_cache(
+            attn_weights_sum,
+            key_states,
             self.kernel_size,
             valid_mask,
         )
