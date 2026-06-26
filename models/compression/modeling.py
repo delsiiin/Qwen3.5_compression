@@ -1356,6 +1356,8 @@ def Llama_CausalLM_forward(
     if self.config.compression_content == "think" and self.after_think == True:
         is_newline = False
 
+    is_newline = False
+
     # Set compression flag for all layers at once
     for layer in self.model.layers:
         layer.self_attn.config.compression = is_newline
@@ -1451,6 +1453,8 @@ def Qwen3_CausalLM_forward(
 
     if self.config.compression_content == "think" and self.after_think == True:
         is_newline = False
+
+    is_newline = False
 
     # Set compression flag for all layers at once
     for layer in self.model.layers:
@@ -1554,6 +1558,8 @@ def Qwen3Moe_CausalLM_forward(
 
     if self.config.compression_content == "think" and self.after_think == True:
         is_newline = False
+
+    is_newline = False
 
     # Set compression flag for all layers at once
     for layer in self.model.layers:
