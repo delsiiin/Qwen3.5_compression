@@ -81,19 +81,18 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
             num_key_value_heads * num_key_value_groups,
             query_window,
         )
-        spatiotemporal_scores = F.avg_pool2d(
+        spatiotemporal_scores = F.max_pool2d(
             spatiotemporal_scores,
             kernel_size=self.kernel_size,
             stride=1,
             padding=self.kernel_size // 2,
-            count_include_pad=False,
         )
         attn_weights_sum = spatiotemporal_scores.reshape(
             hist_len,
             num_key_value_heads,
             num_key_value_groups,
             query_window,
-        ).permute(1, 0, 2, 3).amax(dim=(-1, -2)).unsqueeze(0)
+        ).permute(1, 0, 2, 3).mean(dim=(-1, -2)).unsqueeze(0)
 
         return self._online_head_clusterer._pool_attn_cache(
             attn_weights_sum,
