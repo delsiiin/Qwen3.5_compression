@@ -19,9 +19,11 @@ SIMILARITY_SOURCE_QUERY_WINDOW = "query_window_similarity"
 SIMILARITY_SOURCE_ATTN_LAYER = "attn_layer_similarity"
 GROUP_THRESHOLD_MODE_FIXED = "fixed"
 GROUP_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
+GROUP_THRESHOLD_MODE_EMA = "ema"
 SUPPORTED_GROUP_THRESHOLD_MODES = (
     GROUP_THRESHOLD_MODE_FIXED,
     GROUP_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS,
+    GROUP_THRESHOLD_MODE_EMA,
 )
 KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED = "fixed"
 KEY_PCA_ANGLE_THRESHOLD_MODE_MEAN_WITHOUT_OUTLIERS = "mean_without_outliers"
@@ -228,6 +230,45 @@ def split_layer_groups(similarity, layer_indices, group_threshold=0.85, max_grou
     return groups
 
 
+def split_layer_groups_by_similarity_ema(similarity, layer_indices, ema_decay=0.7, max_group_size=6):
+    if max_group_size < 1:
+        raise ValueError("max_group_size must be at least 1.")
+    if ema_decay < 0.0 or ema_decay > 1.0:
+        raise ValueError("group_threshold_ema_decay must be in [0, 1].")
+
+    adjacent_similarity = get_adjacent_similarity_scores(similarity)
+    groups = []
+    current = [int(layer_indices[0])]
+    ema = None
+    ema_initial = None
+    ema_thresholds = []
+
+    for pos in range(1, len(layer_indices)):
+        current_similarity = float(adjacent_similarity[pos - 1])
+        should_split = len(current) >= max_group_size
+        if ema is None:
+            ema_initial = current_similarity
+            ema = current_similarity
+            ema_thresholds.append(None)
+        else:
+            ema_thresholds.append(float(ema))
+            if current_similarity < float(ema):
+                should_split = True
+            ema = float(ema_decay) * float(ema) + (1.0 - float(ema_decay)) * current_similarity
+
+        if should_split:
+            groups.append(current)
+            current = []
+        current.append(int(layer_indices[pos]))
+
+    groups.append(current)
+    return groups, {
+        "initial": None if ema_initial is None else float(ema_initial),
+        "final": None if ema is None else float(ema),
+        "thresholds": ema_thresholds,
+    }
+
+
 def split_layer_groups_by_key_pca_angle(
     layer_indices,
     key_adjacent_angles_deg,
@@ -329,6 +370,8 @@ def compute_group_threshold(
     if threshold_mode not in SUPPORTED_GROUP_THRESHOLD_MODES:
         raise ValueError(f"group_threshold_mode must be one of {SUPPORTED_GROUP_THRESHOLD_MODES}.")
     if threshold_mode == GROUP_THRESHOLD_MODE_FIXED:
+        return float(group_threshold), None
+    if threshold_mode == GROUP_THRESHOLD_MODE_EMA:
         return float(group_threshold), None
 
     return (
@@ -452,6 +495,7 @@ def build_profile_from_similarity(
     similarity_reduction="flatten_window",
     group_threshold=0.85,
     group_threshold_mode=GROUP_THRESHOLD_MODE_FIXED,
+    group_threshold_ema_decay=0.7,
     max_group_size=6,
     attn_output_ratio=None,
     attn_output_ratio_layer_indices=None,
@@ -485,6 +529,11 @@ def build_profile_from_similarity(
     adjacent_similarity = get_adjacent_similarity_scores(similarity)
     effective_group_threshold = float(group_threshold)
     group_threshold_outlier_method = None
+    group_threshold_ema_info = {
+        "initial": None,
+        "final": None,
+        "thresholds": None,
+    }
     effective_key_pca_angle_threshold = float(key_pca_angle_threshold)
     key_pca_angle_threshold_outlier_method = None
     effective_key_pca_distance_threshold = float(key_pca_distance_threshold)
@@ -495,12 +544,22 @@ def build_profile_from_similarity(
                 "attn_layer_similarity grouping requires an attention-layer similarity npz "
                 "produced by --attn_layer_similarity_mode."
             )
-        effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
-            adjacent_similarity,
-            group_threshold=group_threshold,
-            threshold_mode=group_threshold_mode,
-        )
-        groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
+        if group_threshold_mode == GROUP_THRESHOLD_MODE_EMA:
+            groups, group_threshold_ema_info = split_layer_groups_by_similarity_ema(
+                similarity,
+                layer_indices,
+                ema_decay=group_threshold_ema_decay,
+                max_group_size=max_group_size,
+            )
+            if group_threshold_ema_info["final"] is not None:
+                effective_group_threshold = float(group_threshold_ema_info["final"])
+        else:
+            effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
+                adjacent_similarity,
+                group_threshold=group_threshold,
+                threshold_mode=group_threshold_mode,
+            )
+            groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
     elif group_scheme == GROUP_SCHEME_KEY_PCA_ANGLE:
         if key_pca_adjacent_angles_deg is None:
             raise ValueError("key_pca_adjacent_angles_deg is required for key_pca_angle grouping.")
@@ -533,12 +592,22 @@ def build_profile_from_similarity(
             max_group_size=max_group_size,
         )
     else:
-        effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
-            adjacent_similarity,
-            group_threshold=group_threshold,
-            threshold_mode=group_threshold_mode,
-        )
-        groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
+        if group_threshold_mode == GROUP_THRESHOLD_MODE_EMA:
+            groups, group_threshold_ema_info = split_layer_groups_by_similarity_ema(
+                similarity,
+                layer_indices,
+                ema_decay=group_threshold_ema_decay,
+                max_group_size=max_group_size,
+            )
+            if group_threshold_ema_info["final"] is not None:
+                effective_group_threshold = float(group_threshold_ema_info["final"])
+        else:
+            effective_group_threshold, group_threshold_outlier_method = compute_group_threshold(
+                adjacent_similarity,
+                group_threshold=group_threshold,
+                threshold_mode=group_threshold_mode,
+            )
+            groups = split_layer_groups(similarity, layer_indices, effective_group_threshold, max_group_size)
     group_ratio_sums = None
     group_budget_weights = None
     ratio_layer_sums = None
@@ -604,6 +673,10 @@ def build_profile_from_similarity(
         "effective_group_threshold": float(effective_group_threshold),
         "group_threshold_mode": str(group_threshold_mode),
         "group_threshold_outlier_method": group_threshold_outlier_method,
+        "group_threshold_ema_decay": float(group_threshold_ema_decay),
+        "group_threshold_ema_initial": group_threshold_ema_info["initial"],
+        "group_threshold_ema_final": group_threshold_ema_info["final"],
+        "group_threshold_ema_thresholds": group_threshold_ema_info["thresholds"],
         "key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
         "effective_key_pca_angle_threshold": float(effective_key_pca_angle_threshold),
         "key_pca_angle_threshold_mode": str(key_pca_angle_threshold_mode),
@@ -646,6 +719,7 @@ def build_profile_from_npz(
     group_scheme=GROUP_SCHEME_SIMILARITY,
     group_threshold=0.85,
     group_threshold_mode=GROUP_THRESHOLD_MODE_FIXED,
+    group_threshold_ema_decay=0.7,
     key_pca_angle_threshold=90.0,
     key_pca_angle_threshold_mode=KEY_PCA_ANGLE_THRESHOLD_MODE_FIXED,
     key_pca_distance_threshold=1.0,
@@ -697,6 +771,7 @@ def build_profile_from_npz(
         similarity_reduction=similarity_reduction,
         group_threshold=group_threshold,
         group_threshold_mode=group_threshold_mode,
+        group_threshold_ema_decay=group_threshold_ema_decay,
         key_pca_angle_threshold=key_pca_angle_threshold,
         key_pca_angle_threshold_mode=key_pca_angle_threshold_mode,
         key_pca_distance_threshold=key_pca_distance_threshold,
@@ -754,6 +829,7 @@ def parse_args():
         choices=SUPPORTED_GROUP_THRESHOLD_MODES,
         default=GROUP_THRESHOLD_MODE_FIXED,
     )
+    parser.add_argument("--group_threshold_ema_decay", type=float, default=0.7)
     parser.add_argument("--key_pca_angle_threshold", type=float, default=90.0)
     parser.add_argument(
         "--key_pca_angle_threshold_mode",
@@ -781,6 +857,7 @@ def main():
         group_scheme=args.group_scheme,
         group_threshold=args.group_threshold,
         group_threshold_mode=args.group_threshold_mode,
+        group_threshold_ema_decay=args.group_threshold_ema_decay,
         key_pca_angle_threshold=args.key_pca_angle_threshold,
         key_pca_angle_threshold_mode=args.key_pca_angle_threshold_mode,
         key_pca_distance_threshold=args.key_pca_distance_threshold,
