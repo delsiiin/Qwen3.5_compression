@@ -41,6 +41,7 @@ def build_compression_config(
     compression_budget,
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
+    group_threshold_ema_decay=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -54,6 +55,8 @@ def build_compression_config(
         method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
     if attn_head_cluster_path:
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
+    if group_threshold_ema_decay is not None:
+        method_config["group_threshold_ema_decay"] = group_threshold_ema_decay
 
     return {
         "method": compression_mode,
@@ -195,6 +198,7 @@ def load_model_and_tokenizer(
     compression_budget=4096,
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
+    group_threshold_ema_decay=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -231,6 +235,7 @@ def load_model_and_tokenizer(
             compression_budget,
             hidden_mix_profile_path,
             attn_head_cluster_path,
+            group_threshold_ema_decay,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -332,6 +337,7 @@ class LLMNeedleHaystackTester:
                  compression_budget=4096,
                  hidden_mix_profile_path=None,
                  attn_head_cluster_path=None,
+                 group_threshold_ema_decay=None,
                  enable_thinking=False):
         """
         :param needle: The needle to be found in the haystack. Default is None.
@@ -380,6 +386,7 @@ class LLMNeedleHaystackTester:
         self.compression_budget = compression_budget
         self.hidden_mix_profile_path = hidden_mix_profile_path
         self.attn_head_cluster_path = attn_head_cluster_path
+        self.group_threshold_ema_decay = group_threshold_ema_decay
         self.enable_thinking = enable_thinking
 
 
@@ -426,6 +433,7 @@ class LLMNeedleHaystackTester:
             compression_budget=self.compression_budget,
             hidden_mix_profile_path=self.hidden_mix_profile_path,
             attn_head_cluster_path=self.attn_head_cluster_path,
+            group_threshold_ema_decay=self.group_threshold_ema_decay,
         )
 
 
@@ -741,6 +749,7 @@ if __name__ == "__main__":
     parser.add_argument("--compression_budget", type=int, default=4096)
     parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--attn_head_cluster_path", type=str, default=None)
+    parser.add_argument("--group_threshold_ema_decay", type=float, default=None)
     parser.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to chat templates that support it.")
     args = parser.parse_args()
 
@@ -763,6 +772,7 @@ if __name__ == "__main__":
                                  compression_budget=args.compression_budget,
                                  hidden_mix_profile_path=args.hidden_mix_profile_path,
                                  attn_head_cluster_path=args.attn_head_cluster_path,
+                                 group_threshold_ema_decay=args.group_threshold_ema_decay,
                                  enable_thinking=args.enable_thinking
                                  )
 

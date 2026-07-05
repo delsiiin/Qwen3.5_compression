@@ -80,6 +80,7 @@ def build_compression_config(
     compression_budget,
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
+    group_threshold_ema_decay=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -93,6 +94,8 @@ def build_compression_config(
         method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
     if attn_head_cluster_path:
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
+    if group_threshold_ema_decay is not None:
+        method_config["group_threshold_ema_decay"] = group_threshold_ema_decay
 
     return {
         "method": compression_mode,
@@ -234,6 +237,7 @@ def load_model_and_tokenizer(
     compression_budget=4096,
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
+    group_threshold_ema_decay=None,
 ):
     model_path = get_model_path(model_name)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -274,6 +278,7 @@ def load_model_and_tokenizer(
             compression_budget,
             hidden_mix_profile_path,
             attn_head_cluster_path,
+            group_threshold_ema_decay,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -597,6 +602,7 @@ def get_pred(data, args, fout, out_file):
         compression_budget=args.compression_budget,
         hidden_mix_profile_path=args.hidden_mix_profile_path,
         attn_head_cluster_path=args.attn_head_cluster_path,
+        group_threshold_ema_decay=args.group_threshold_ema_decay,
     )
     attn_run_writer = build_attn_run_writer(args, out_file, model)
     attn_layer_similarity_run_writer = build_attn_layer_similarity_run_writer(args, out_file, model)
@@ -884,6 +890,7 @@ if __name__ == "__main__":
     parser.add_argument("--compression_budget", type=int, default=4096)
     parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--attn_head_cluster_path", type=str, default=None)
+    parser.add_argument("--group_threshold_ema_decay", type=float, default=None)
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="output_dir/results_longbench/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")

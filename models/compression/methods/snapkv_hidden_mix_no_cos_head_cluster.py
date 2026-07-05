@@ -7,11 +7,38 @@ from .snapkv_hidden_mix_no_cos import SnapKVHiddenMix as SnapKVHiddenMixNoCos
 
 class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
 
-    def __init__(self, *args, attn_head_cluster_path=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Kept for direct-call compatibility. Online clustering does not read profiles.
+    def __init__(
+        self,
+        *args,
+        attn_head_cluster_path=None,
+        hidden_mix_profile_path=None,
+        group_threshold_ema_decay=0.1,
+        max_group_size=10,
+        mix_temperature=0.1,
+        mix_min_weight=0.0,
+        **kwargs,
+    ):
+        if not 0.0 <= float(group_threshold_ema_decay) <= 1.0:
+            raise ValueError("group_threshold_ema_decay must be in [0, 1].")
+        if int(max_group_size) < 1:
+            raise ValueError("max_group_size must be at least 1.")
+        if float(mix_temperature) <= 0.0:
+            raise ValueError("mix_temperature must be greater than 0.")
+        if float(mix_min_weight) < 0.0:
+            raise ValueError("mix_min_weight must be non-negative.")
+
+        # Kept for direct-call compatibility. This online variant no longer
+        # reads hidden-mix profiles, so avoid passing the path to the parent.
+        super().__init__(*args, hidden_mix_profile_path=None, **kwargs)
         self.attn_head_cluster_path = attn_head_cluster_path
+        self.hidden_mix_profile_path = hidden_mix_profile_path
+        self.hidden_mix_profile = None
+        self.group_threshold_ema_decay = float(group_threshold_ema_decay)
+        self.max_group_size = int(max_group_size)
+        self.mix_temperature = float(mix_temperature)
+        self.mix_min_weight = float(mix_min_weight)
         self._online_head_clusterer = OnlineAttentionHeadCluster(self.window_size)
+        self._online_window_attention_vector = None
 
     def update_kv_cache(
         self,
@@ -53,8 +80,33 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
             attn_cache=attn_cache,
             layer_cache=layer_cache,
             valid_mask=valid_mask,
+            attention_vector=self._online_window_attention_vector,
         )
         return key_states, value_states
+
+    def finalize_after_attention(self, attention, hidden_states, attn_output, layer_cache):
+        state = self._state()
+        online = state["online"]
+        group_key = online["layer_to_group"].get(int(self.layer_idx))
+        if group_key is None:
+            return
+        group = state["groups"].get(group_key)
+        if group is None:
+            return
+        entry = group.get(int(self.layer_idx))
+        if entry is None:
+            return
+
+        entry["finalized"] = True
+        if int(self.layer_idx) == 0:
+            if self._close_group(group_key):
+                online["last_attention_vector"] = None
+                online["last_attn_cache_shape"] = None
+            return
+
+        num_layers = getattr(self.model_config, "num_hidden_layers", None)
+        if num_layers is not None and int(self.layer_idx) == int(num_layers) - 1:
+            self._close_group(group_key)
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
         """Build per-KV-head scores with spatio-temporal 2D pooling.
@@ -74,6 +126,12 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
             query_window,
             hist_len,
         ) = raw_head_attention.shape
+        self._online_window_attention_vector = (
+            raw_head_attention.to(dtype=torch.float32)
+            .mean(dim=(0, 1))
+            .reshape(-1)
+            .detach()
+        )
 
         spatiotemporal_scores = raw_head_attention.permute(3, 0, 1, 2).reshape(
             hist_len,
@@ -101,19 +159,142 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
             valid_mask,
         )
 
-    def _store_group_entry(self, key_states, value_states, attn_cache, layer_cache, valid_mask=None):
-        super()._store_group_entry(key_states, value_states, attn_cache, layer_cache)
+    def _state(self):
+        state = super()._state()
+        state.setdefault("groups", {})
+        state.setdefault(
+            "online",
+            {
+                "active_group_key": None,
+                "active_layers": [],
+                "next_group_id": 0,
+                "last_layer_idx": None,
+                "last_attention_vector": None,
+                "attention_vector_device": None,
+                "last_attn_cache_shape": None,
+                "ema": None,
+                "ema_initial": None,
+                "layer_to_group": {},
+            },
+        )
+        state["online"].setdefault("active_group_key", None)
+        state["online"].setdefault("active_layers", [])
+        state["online"].setdefault("next_group_id", 0)
+        state["online"].setdefault("last_layer_idx", None)
+        state["online"].setdefault("last_attention_vector", None)
+        state["online"].setdefault("attention_vector_device", None)
+        state["online"].setdefault("last_attn_cache_shape", None)
+        state["online"].setdefault("ema", None)
+        state["online"].setdefault("ema_initial", None)
+        state["online"].setdefault("layer_to_group", {})
+        return state
+
+    def _reset_online_state(self):
+        state = self._state()
+        state["groups"] = {}
+        state["online"] = {
+            "active_group_key": None,
+            "active_layers": [],
+            "next_group_id": 0,
+            "last_layer_idx": None,
+            "last_attention_vector": None,
+            "attention_vector_device": None,
+            "last_attn_cache_shape": None,
+            "ema": None,
+            "ema_initial": None,
+            "layer_to_group": {},
+        }
+        return state
+
+    def _store_group_entry(
+        self,
+        key_states,
+        value_states,
+        attn_cache,
+        layer_cache,
+        valid_mask=None,
+        attention_vector=None,
+    ):
         if valid_mask is None:
             valid_mask = torch.ones(key_states.shape[:3], dtype=torch.bool, device=key_states.device)
-        group_layers = self._group_layers(self.layer_idx)
-        entry = self._state()["groups"][tuple(group_layers)][self.layer_idx]
-        entry["valid_mask"] = valid_mask
+        raw_attention_vector = attention_vector
+        state = self._state()
+        online = state["online"]
+        layer_idx = int(self.layer_idx)
+        if layer_idx == 0 or (
+            online["last_layer_idx"] is not None and layer_idx <= int(online["last_layer_idx"])
+        ):
+            state = self._reset_online_state()
+            online = state["online"]
+
+        should_split = False
+        if online["active_group_key"] is not None:
+            last_shape = online["last_attn_cache_shape"]
+            if last_shape is not None and tuple(attn_cache.shape) != tuple(last_shape):
+                should_split = True
+            if len(online["active_layers"]) >= self.max_group_size:
+                should_split = True
+
+            last_vector = online["last_attention_vector"]
+            compare_vector = self._prepare_attention_vector(
+                raw_attention_vector,
+                device=getattr(last_vector, "device", online["attention_vector_device"]),
+            )
+            if compare_vector is not None and last_vector is not None:
+                if tuple(compare_vector.shape) != tuple(last_vector.shape):
+                    should_split = True
+                else:
+                    similarity = self._cosine_similarity(compare_vector, last_vector)
+                    if online["ema"] is None:
+                        online["ema"] = similarity
+                        online["ema_initial"] = similarity
+                    else:
+                        if similarity < float(online["ema"]):
+                            should_split = True
+                        online["ema"] = (
+                            self.group_threshold_ema_decay * float(online["ema"])
+                            + (1.0 - self.group_threshold_ema_decay) * similarity
+                        )
+
+        if should_split:
+            self._close_group(online["active_group_key"])
+            online = state["online"]
+
+        if online["active_group_key"] is None:
+            online["active_group_key"] = int(online["next_group_id"])
+            online["next_group_id"] = int(online["next_group_id"]) + 1
+            online["active_layers"] = []
+            online["attention_vector_device"] = self._attention_vector_device(raw_attention_vector)
+            state["groups"][online["active_group_key"]] = {}
+
+        group_key = online["active_group_key"]
+        group = state["groups"].setdefault(group_key, {})
+        attention_vector = self._prepare_attention_vector(
+            raw_attention_vector,
+            device=online["attention_vector_device"],
+        )
+        group[layer_idx] = {
+            "layer_idx": layer_idx,
+            "key_states": key_states,
+            "value_states": value_states,
+            "attn_cache": attn_cache,
+            "attention_vector": attention_vector,
+            "layer_cache": layer_cache,
+            "valid_mask": valid_mask,
+            "finalized": False,
+        }
+        online["active_layers"].append(layer_idx)
+        online["layer_to_group"][layer_idx] = group_key
+        online["last_layer_idx"] = layer_idx
+        online["last_attention_vector"] = attention_vector
+        online["last_attn_cache_shape"] = tuple(attn_cache.shape)
 
     def _compress_group(self, entries, group_layers):
         entry_by_layer = {int(entry["layer_idx"]): entry for entry in entries}
+        online_mix = self._build_online_mix(entries, group_layers)
         for entry in entries:
             target_layer = int(entry["layer_idx"])
-            mix = self._mix_for_layer(group_layers, target_layer)
+            mix = online_mix.get(target_layer, {"sources": (target_layer,), "weights": (1.0,)})
             mixed_cache = None
             for source_layer, weight in zip(mix["sources"], mix["weights"]):
                 source_cache = entry_by_layer[int(source_layer)]["attn_cache"]
@@ -131,6 +312,104 @@ class SnapKVHiddenMix(SnapKVHiddenMixNoCos):
                 hist_valid,
             )
             self._pack_layer(entry, mixed_cache)
+
+    def _close_group(self, group_key):
+        if group_key is None:
+            return False
+        state = self._state()
+        group = state["groups"].get(group_key)
+        if not group:
+            return False
+        group_layers = tuple(state["online"]["active_layers"])
+        if not group_layers:
+            group_layers = tuple(sorted(int(layer_idx) for layer_idx in group))
+        if not all(layer_idx in group and group[layer_idx].get("finalized") for layer_idx in group_layers):
+            return False
+
+        entries = [group[layer_idx] for layer_idx in group_layers]
+        try:
+            self._compress_group(entries, group_layers)
+        finally:
+            for entry in entries:
+                state["online"]["layer_to_group"].pop(int(entry["layer_idx"]), None)
+                entry.clear()
+            state["groups"].pop(group_key, None)
+            if state["online"]["active_group_key"] == group_key:
+                state["online"]["active_group_key"] = None
+                state["online"]["active_layers"] = []
+                state["online"]["attention_vector_device"] = None
+        return True
+
+    def _build_online_mix(self, entries, group_layers):
+        vectors = []
+        for entry in entries:
+            target_device = vectors[0].device if vectors else None
+            vector = self._prepare_attention_vector(entry.get("attention_vector"), device=target_device)
+            if vector is None or not torch.is_tensor(vector) or vector.ndim != 1:
+                return {
+                    int(layer_idx): {"sources": (int(layer_idx),), "weights": (1.0,)}
+                    for layer_idx in group_layers
+                }
+            if vectors and vector.shape != vectors[0].shape:
+                return {
+                    int(layer_idx): {"sources": (int(layer_idx),), "weights": (1.0,)}
+                    for layer_idx in group_layers
+                }
+            vectors.append(vector)
+
+        if not vectors:
+            return {}
+
+        matrix = torch.stack(vectors, dim=0)
+        normalized = F.normalize(matrix, p=2, dim=-1, eps=1e-12)
+        similarity = (normalized @ normalized.transpose(0, 1)).clamp(min=-1.0, max=1.0)
+        group_layers = tuple(int(layer_idx) for layer_idx in group_layers)
+        mix_by_layer = {}
+        for target_pos, target_layer in enumerate(group_layers):
+            logits = similarity[target_pos] / self.mix_temperature
+            weights = torch.softmax(logits, dim=0)
+            keep = weights >= self.mix_min_weight
+            if not bool(keep.any().item()):
+                mix_by_layer[target_layer] = {"sources": (target_layer,), "weights": (1.0,)}
+                continue
+            kept_weights = weights[keep]
+            weight_sum = kept_weights.sum()
+            if not torch.isfinite(weight_sum) or float(weight_sum.item()) <= 0.0:
+                mix_by_layer[target_layer] = {"sources": (target_layer,), "weights": (1.0,)}
+                continue
+            kept_sources = [
+                layer
+                for layer, should_keep in zip(group_layers, keep.tolist())
+                if bool(should_keep)
+            ]
+            normalized_weights = (kept_weights / weight_sum).tolist()
+            mix_by_layer[target_layer] = {
+                "sources": tuple(int(source) for source in kept_sources),
+                "weights": tuple(float(weight) for weight in normalized_weights),
+            }
+        return mix_by_layer
+
+    def _cosine_similarity(self, left, right):
+        left = self._prepare_attention_vector(left)
+        right = self._prepare_attention_vector(right, device=getattr(left, "device", None))
+        if left is None or right is None:
+            raise ValueError("snapkv_hidden_mix_no_cos_head_cluster cosine similarity requires tensor vectors.")
+        return float(F.cosine_similarity(left, right, dim=0, eps=1e-12).clamp(min=-1.0, max=1.0).item())
+
+    def _attention_vector_device(self, attention_vector):
+        if torch.is_tensor(attention_vector):
+            return attention_vector.device
+        return None
+
+    def _prepare_attention_vector(self, attention_vector, device=None):
+        if attention_vector is None:
+            return None
+        if not torch.is_tensor(attention_vector):
+            return attention_vector
+        attention_vector = attention_vector.detach()
+        if device is None:
+            return attention_vector.to(dtype=torch.float32)
+        return attention_vector.to(device=device, dtype=torch.float32)
 
     def _pack_layer(self, entry, attn_cache):
         key_states = entry["key_states"]
