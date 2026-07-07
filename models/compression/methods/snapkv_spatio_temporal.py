@@ -65,12 +65,11 @@ class SnapKVSpatioTemporal:
             num_key_value_heads * num_key_value_groups,
             self.window_size,
         )
-        spatiotemporal_scores = F.avg_pool2d(
+        spatiotemporal_scores = F.max_pool2d(
             spatiotemporal_scores,
             kernel_size=self.kernel_size,
             stride=1,
             padding=self.kernel_size // 2,
-            count_include_pad=False,
         ).reshape(
             bsz,
             history_length,
@@ -78,7 +77,7 @@ class SnapKVSpatioTemporal:
             num_key_value_groups,
             self.window_size,
         )
-        attn_weights_sum = spatiotemporal_scores.permute(0, 2, 1, 3, 4).amax(dim=(-1, -2))
+        attn_weights_sum = spatiotemporal_scores.permute(0, 2, 1, 3, 4).mean(dim=(-1, -2))
 
         attn_cache = F.max_pool1d(
             attn_weights_sum,

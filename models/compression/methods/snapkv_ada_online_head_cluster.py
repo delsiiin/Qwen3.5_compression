@@ -110,7 +110,18 @@ class OnlineAttentionHeadCluster:
 
     def build(self, key_states, query_states, valid_mask=None):
         raw_head_attention = self._build_raw_head_attention(key_states, query_states, valid_mask)
+        return self.build_from_raw_head_attention(raw_head_attention)
+
+    def build_from_raw_head_attention(self, raw_head_attention):
+        """Build online clusters from precomputed raw GQA attention."""
+        if raw_head_attention.ndim != 4:
+            raise ValueError(
+                "Online attention head clustering raw attention must be rank 4 "
+                "[key_value_heads, groups, query_window, history]."
+            )
         num_key_value_heads, gqa_group_size, _, hist_len = raw_head_attention.shape
+        if hist_len < 1:
+            raise ValueError("Online attention head clustering requires at least one historical KV token.")
         raw_head_scores = raw_head_attention.mean(dim=-2).unsqueeze(0)
 
         group_attention = raw_head_attention.mean(dim=1)
