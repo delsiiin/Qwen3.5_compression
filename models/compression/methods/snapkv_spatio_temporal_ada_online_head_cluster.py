@@ -357,7 +357,6 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
                 leftover -= 1
                 if leftover <= 0:
                     break
-        print(f"Layer budgets: {[int(entry['layer_idx']) for entry in entries]} -> {budgets}")
         return {int(entry["layer_idx"]): budget for entry, budget in zip(entries, budgets)}
 
     def _select_layer_head_topk_with_budget(
