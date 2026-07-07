@@ -42,6 +42,8 @@ def build_compression_config(
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
+    prefill_layer_budget=None,
+    prefill_layer_budget_reduction=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -57,6 +59,10 @@ def build_compression_config(
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
     if group_threshold_ema_decay is not None:
         method_config["group_threshold_ema_decay"] = group_threshold_ema_decay
+    if prefill_layer_budget is not None:
+        method_config["prefill_layer_budget"] = prefill_layer_budget
+    if prefill_layer_budget_reduction is not None:
+        method_config["prefill_layer_budget_reduction"] = prefill_layer_budget_reduction
 
     return {
         "method": compression_mode,
@@ -199,6 +205,8 @@ def load_model_and_tokenizer(
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
+    prefill_layer_budget=None,
+    prefill_layer_budget_reduction=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -236,6 +244,8 @@ def load_model_and_tokenizer(
             hidden_mix_profile_path,
             attn_head_cluster_path,
             group_threshold_ema_decay,
+            prefill_layer_budget,
+            prefill_layer_budget_reduction,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -338,6 +348,8 @@ class LLMNeedleHaystackTester:
                  hidden_mix_profile_path=None,
                  attn_head_cluster_path=None,
                  group_threshold_ema_decay=None,
+                 prefill_layer_budget=None,
+                 prefill_layer_budget_reduction=None,
                  enable_thinking=False):
         """
         :param needle: The needle to be found in the haystack. Default is None.
@@ -387,6 +399,8 @@ class LLMNeedleHaystackTester:
         self.hidden_mix_profile_path = hidden_mix_profile_path
         self.attn_head_cluster_path = attn_head_cluster_path
         self.group_threshold_ema_decay = group_threshold_ema_decay
+        self.prefill_layer_budget = prefill_layer_budget
+        self.prefill_layer_budget_reduction = prefill_layer_budget_reduction
         self.enable_thinking = enable_thinking
 
 
@@ -434,6 +448,8 @@ class LLMNeedleHaystackTester:
             hidden_mix_profile_path=self.hidden_mix_profile_path,
             attn_head_cluster_path=self.attn_head_cluster_path,
             group_threshold_ema_decay=self.group_threshold_ema_decay,
+            prefill_layer_budget=self.prefill_layer_budget,
+            prefill_layer_budget_reduction=self.prefill_layer_budget_reduction,
         )
 
 
@@ -750,6 +766,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--attn_head_cluster_path", type=str, default=None)
     parser.add_argument("--group_threshold_ema_decay", type=float, default=None)
+    parser.add_argument("--prefill_layer_budget", type=str, default=None)
+    parser.add_argument("--prefill_layer_budget_reduction", type=str, default=None)
     parser.add_argument("--enable_thinking", action="store_true", help="Pass enable_thinking=True to chat templates that support it.")
     args = parser.parse_args()
 
@@ -773,6 +791,8 @@ if __name__ == "__main__":
                                  hidden_mix_profile_path=args.hidden_mix_profile_path,
                                  attn_head_cluster_path=args.attn_head_cluster_path,
                                  group_threshold_ema_decay=args.group_threshold_ema_decay,
+                                 prefill_layer_budget=args.prefill_layer_budget,
+                                 prefill_layer_budget_reduction=args.prefill_layer_budget_reduction,
                                  enable_thinking=args.enable_thinking
                                  )
 

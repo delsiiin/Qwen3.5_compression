@@ -118,6 +118,8 @@ def build_compression_config(
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
+    prefill_layer_budget=None,
+    prefill_layer_budget_reduction=None,
 ):
     method_config = {
         "budget": compression_budget,
@@ -133,6 +135,10 @@ def build_compression_config(
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
     if group_threshold_ema_decay is not None:
         method_config["group_threshold_ema_decay"] = group_threshold_ema_decay
+    if prefill_layer_budget is not None:
+        method_config["prefill_layer_budget"] = prefill_layer_budget
+    if prefill_layer_budget_reduction is not None:
+        method_config["prefill_layer_budget_reduction"] = prefill_layer_budget_reduction
     return {
         "method": compression_mode,
         "method_config": method_config,
@@ -221,6 +227,8 @@ def load_model_and_tokenizer(
     hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
+    prefill_layer_budget=None,
+    prefill_layer_budget_reduction=None,
 ):
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -258,6 +266,8 @@ def load_model_and_tokenizer(
             hidden_mix_profile_path,
             attn_head_cluster_path,
             group_threshold_ema_decay,
+            prefill_layer_budget,
+            prefill_layer_budget_reduction,
         )
         apply_compression_monkeypatch(model_family, compression_config)
         model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
@@ -326,6 +336,8 @@ def measure_throughput(
     hidden_mix_profile_path: str = None,
     attn_head_cluster_path: str = None,
     group_threshold_ema_decay: float = None,
+    prefill_layer_budget: str = None,
+    prefill_layer_budget_reduction: str = None,
     # experiment arguments
     batch_size: int = 16,
     input_len: int = 128,
@@ -371,6 +383,8 @@ def measure_throughput(
         hidden_mix_profile_path=hidden_mix_profile_path,
         attn_head_cluster_path=attn_head_cluster_path,
         group_threshold_ema_decay=group_threshold_ema_decay,
+        prefill_layer_budget=prefill_layer_budget,
+        prefill_layer_budget_reduction=prefill_layer_budget_reduction,
     )
 
     # Input Sequence      

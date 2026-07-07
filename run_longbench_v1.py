@@ -273,6 +273,8 @@ def get_pred(data, args, out_file):
         compression_budget=args.compression_budget,
         hidden_mix_profile_path=args.hidden_mix_profile_path,
         group_threshold_ema_decay=args.group_threshold_ema_decay,
+        prefill_layer_budget=args.prefill_layer_budget,
+        prefill_layer_budget_reduction=args.prefill_layer_budget_reduction,
     )
     dataset2prompt = load_json("config/dataset2prompt.json")
     dataset2maxlen = load_json("config/dataset2maxlen.json")
@@ -453,6 +455,8 @@ def parse_args(args=None):
     parser.add_argument("--compression_budget", type=int, default=4096)
     parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--group_threshold_ema_decay", type=float, default=None)
+    parser.add_argument("--prefill_layer_budget", type=str, default=None)
+    parser.add_argument("--prefill_layer_budget_reduction", type=str, default=None)
     parser.add_argument("--attn_heatmap_mode", action="store_true")
     parser.add_argument("--attn_heatmap_dir", type=str, default="output_dir/results_longbench_v1/attn_heatmaps")
     parser.add_argument("--attn_max_prefill_tokens", type=int, default=None, help="Skip attention heatmap capture when the prefill token count exceeds this cap.")
