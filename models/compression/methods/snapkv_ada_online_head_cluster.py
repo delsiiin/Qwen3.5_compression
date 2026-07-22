@@ -232,10 +232,8 @@ class OnlineAttentionHeadCluster:
 class SnapKVAdaOnlineHeadCluster(SnapKVAda):
     manages_kv_cache = True
 
-    def __init__(self, *args, attn_head_cluster_path=None, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Kept for direct-call compatibility. Online clustering does not read profiles.
-        self.attn_head_cluster_path = attn_head_cluster_path
         self._online_head_clusterer = OnlineAttentionHeadCluster(self.window_size)
         self._online_head_cluster_result = None
 
