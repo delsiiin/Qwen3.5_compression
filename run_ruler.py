@@ -84,7 +84,6 @@ def truncate_prompt(prompt, tokenizer, max_input_len):
 def build_compression_config(
     compression_mode,
     compression_budget,
-    hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
     prefill_layer_budget=None,
@@ -98,8 +97,6 @@ def build_compression_config(
         "retain_direction": "last",
         "first_tokens": 4,
     }
-    if hidden_mix_profile_path:
-        method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
     if attn_head_cluster_path:
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
     if group_threshold_ema_decay is not None:
@@ -274,7 +271,6 @@ def load_model_and_tokenizer(args):
         compression_config = build_compression_config(
             args.compression_mode,
             args.compression_budget,
-            args.hidden_mix_profile_path,
             args.attn_head_cluster_path,
             args.group_threshold_ema_decay,
             args.prefill_layer_budget,
@@ -603,7 +599,6 @@ if __name__ == "__main__":
     parser.add_argument("--compression", action="store_true")
     parser.add_argument("--compression_mode", type=str, default=None)
     parser.add_argument("--compression_budget", type=int, default=4096)
-    parser.add_argument("--hidden_mix_profile_path", type=str, default=None)
     parser.add_argument("--attn_head_cluster_path", type=str, default=None)
     parser.add_argument("--group_threshold_ema_decay", type=float, default=None)
     parser.add_argument("--prefill_layer_budget", type=str, default=None)

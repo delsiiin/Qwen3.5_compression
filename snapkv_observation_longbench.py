@@ -61,7 +61,6 @@ class SnapKVObservationRunWriter:
                 "window_size": self.config.window_size,
                 "kernel_size": self.config.kernel_size,
                 "max_prefill_tokens": self.config.max_prefill_tokens,
-                "hidden_mix_profile_path": self.config.hidden_mix_profile_path,
             },
             "sample_count": len(self.samples),
             "samples": self.samples,
@@ -333,7 +332,6 @@ def build_snapkv_observation_run_writer(args, out_file):
         window_size=args.snapkv_observation_window_size,
         kernel_size=args.snapkv_observation_kernel_size,
         max_prefill_tokens=args.snapkv_observation_max_prefill_tokens,
-        hidden_mix_profile_path=getattr(args, "hidden_mix_profile_path", None),
     )
     return SnapKVObservationRunWriter(
         root_dir=args.snapkv_observation_dir,
@@ -351,7 +349,6 @@ def build_snapkv_topk_overlap_run_writer(args, out_file):
         window_size=args.snapkv_observation_window_size,
         kernel_size=args.snapkv_observation_kernel_size,
         max_prefill_tokens=args.snapkv_observation_max_prefill_tokens,
-        hidden_mix_profile_path=None,
     )
     return SnapKVTopKOverlapRunWriter(
         root_dir=args.snapkv_observation_dir,

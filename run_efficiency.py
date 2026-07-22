@@ -115,7 +115,6 @@ class FirstTokenTimingCriteria(StoppingCriteria):
 def build_compression_config(
     compression_mode,
     compression_budget,
-    hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
     prefill_layer_budget=None,
@@ -129,8 +128,6 @@ def build_compression_config(
         "retain_direction": "last",
         "first_tokens": 4,
     }
-    if hidden_mix_profile_path:
-        method_config["hidden_mix_profile_path"] = hidden_mix_profile_path
     if attn_head_cluster_path:
         method_config["attn_head_cluster_path"] = attn_head_cluster_path
     if group_threshold_ema_decay is not None:
@@ -224,7 +221,6 @@ def load_model_and_tokenizer(
     compression=False,
     compression_mode=None,
     compression_budget=4096,
-    hidden_mix_profile_path=None,
     attn_head_cluster_path=None,
     group_threshold_ema_decay=None,
     prefill_layer_budget=None,
@@ -263,7 +259,6 @@ def load_model_and_tokenizer(
         compression_config = build_compression_config(
             compression_mode,
             compression_budget,
-            hidden_mix_profile_path,
             attn_head_cluster_path,
             group_threshold_ema_decay,
             prefill_layer_budget,
@@ -333,7 +328,6 @@ def measure_throughput(
     compression: bool = False,
     compression_mode: str = None,
     compression_budget: int = 4096,
-    hidden_mix_profile_path: str = None,
     attn_head_cluster_path: str = None,
     group_threshold_ema_decay: float = None,
     prefill_layer_budget: str = None,
@@ -380,7 +374,6 @@ def measure_throughput(
         compression=compression,
         compression_mode=compression_mode,
         compression_budget=compression_budget,
-        hidden_mix_profile_path=hidden_mix_profile_path,
         attn_head_cluster_path=attn_head_cluster_path,
         group_threshold_ema_decay=group_threshold_ema_decay,
         prefill_layer_budget=prefill_layer_budget,

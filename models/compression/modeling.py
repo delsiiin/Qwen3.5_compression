@@ -55,22 +55,12 @@ from .methods import (
     SnapKVSpatioTemporal,
     SnapKVAdaOnlineHeadCluster,
     SnapKVSpatioTemporalAdaOnlineHeadCluster,
-    SnapKVNeighborShared,
-    SnapKVHiddenMix,
-    SnapKVAdaHiddenMixAda,
-    SnapKVHiddenMixLayer,
-    SnapKVHiddenMixNeighbor,
-    SnapKVHiddenMixNoCos,
-    SnapKVHiddenMixNoCosHeadCluster,
-    SnapKVHiddenMixRandom,
-    SnapKVHiddenWoMix,
     StreamingLLM,
     H2O,
     CriticalKV,
     DefensiveKV,
     LaProx,
 )
-from .methods.snapkv_neighbor_shared import masked_eager_attention_forward
 
 import math
 import torch.nn.functional as F
@@ -81,15 +71,6 @@ KV_COMPRESSION_MAP = {
     "snapkv_spatio_temporal": SnapKVSpatioTemporal,
     "snapkv_ada_online_head_cluster": SnapKVAdaOnlineHeadCluster,
     "snapkv_spatio_temporal_ada_online_head_cluster": SnapKVSpatioTemporalAdaOnlineHeadCluster,
-    "snapkv_neighbor_shared": SnapKVNeighborShared,
-    "snapkv_hidden_mix": SnapKVHiddenMix,
-    "snapkv_hidden_mix_ada": SnapKVAdaHiddenMixAda,
-    "snapkv_hidden_mix_layer": SnapKVHiddenMixLayer,
-    "snapkv_hidden_mix_neighbor": SnapKVHiddenMixNeighbor,
-    "snapkv_hidden_mix_no_cos": SnapKVHiddenMixNoCos,
-    "snapkv_hidden_mix_no_cos_head_cluster": SnapKVHiddenMixNoCosHeadCluster,
-    "snapkv_hidden_mix_random": SnapKVHiddenMixRandom,
-    "snapkv_hidden_wo_mix": SnapKVHiddenWoMix,
     "streamingllm": StreamingLLM,
     "h2o": H2O,
     "criticalkv": CriticalKV,
@@ -117,6 +98,52 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         return hidden_states
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def masked_eager_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    kv_valid_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    scaling = module.head_dim**-0.5 if scaling is None else scaling
+    num_key_value_groups = query.shape[1] // key.shape[1]
+    if num_key_value_groups != 1:
+        key = repeat_kv(key, num_key_value_groups)
+        value = repeat_kv(value, num_key_value_groups)
+        kv_valid_mask = kv_valid_mask[:, :, None, :].expand(
+            kv_valid_mask.shape[0],
+            kv_valid_mask.shape[1],
+            num_key_value_groups,
+            kv_valid_mask.shape[-1],
+        )
+        kv_valid_mask = kv_valid_mask.reshape(
+            kv_valid_mask.shape[0],
+            query.shape[1],
+            kv_valid_mask.shape[-1],
+        )
+
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=attn_weights.device)
+        causal_mask = attention_mask[:, :, :, : key.shape[-2]]
+        if causal_mask.shape[-1] < key.shape[-2]:
+            causal_mask = F.pad(causal_mask, (0, key.shape[-2] - causal_mask.shape[-1]), value=0.0)
+        attn_weights = attn_weights + causal_mask
+    attn_weights = attn_weights.masked_fill(
+        ~kv_valid_mask[:, :, None, :],
+        torch.finfo(attn_weights.dtype).min,
+    )
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights if kwargs.get("output_attentions", False) else None
 
 
 def _get_kv_valid_mask(attention, past_key_values, key_states, query_states):
@@ -150,7 +177,7 @@ def _flash_attn_varlen_func():
     try:
         from flash_attn import flash_attn_varlen_func
     except ImportError as exc:
-        raise ImportError("snapkv_neighbor_shared flatten cache requires flash_attn.") from exc
+        raise ImportError("Flattened KV cache requires flash_attn.") from exc
     return flash_attn_varlen_func
 
 
@@ -166,7 +193,7 @@ def flatten_varlen_attention_forward(
 ):
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
-            "snapkv_neighbor_shared flatten cache uses flash-attn varlen and does not return attentions/head masks."
+            "Flattened KV cache uses flash-attn varlen and does not return attentions/head masks."
         )
 
     num_kv_heads = int(layer_cache.kv_num_heads)
