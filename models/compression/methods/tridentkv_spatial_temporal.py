@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from . import compute_attention_scores
 
 
-class SnapKVSpatioTemporal:
+class TridentKVSpatialTemporal:
     def __init__(
         self,
         budget=128,
@@ -59,14 +59,14 @@ class SnapKVSpatioTemporal:
             self.window_size,
             history_length,
         )
-        spatiotemporal_scores = scores.permute(0, 4, 1, 2, 3).reshape(
+        spatial_temporal_scores = scores.permute(0, 4, 1, 2, 3).reshape(
             bsz * history_length,
             1,
             num_key_value_heads * num_key_value_groups,
             self.window_size,
         )
-        spatiotemporal_scores = F.max_pool2d(
-            spatiotemporal_scores,
+        spatial_temporal_scores = F.max_pool2d(
+            spatial_temporal_scores,
             kernel_size=self.kernel_size,
             stride=1,
             padding=self.kernel_size // 2,
@@ -77,7 +77,7 @@ class SnapKVSpatioTemporal:
             num_key_value_groups,
             self.window_size,
         )
-        attn_weights_sum = spatiotemporal_scores.permute(0, 2, 1, 3, 4).mean(dim=(-1, -2))
+        attn_weights_sum = spatial_temporal_scores.permute(0, 2, 1, 3, 4).mean(dim=(-1, -2))
 
         attn_cache = F.max_pool1d(
             attn_weights_sum,

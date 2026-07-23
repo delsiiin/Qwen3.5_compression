@@ -1,11 +1,11 @@
 import torch
 import torch.nn.functional as F
 
-from .snapkv_ada_online_head_cluster import SnapKVAdaOnlineHeadCluster
+from .tridentkv_head_cluster import TridentKVHeadCluster
 
 
-class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
-    """SnapKV spatio-temporal scoring with online head-cluster budget sharing."""
+class TridentKV(TridentKVHeadCluster):
+    """TridentKV spatial-temporal scoring with head-cluster budget sharing."""
 
     requires_layer_coordination = True
 
@@ -43,8 +43,8 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
         self.prefill_layer_budget_min_history = int(prefill_layer_budget_min_history)
         self.prefill_layer_budget_temperature = float(prefill_layer_budget_temperature)
         if model_config := self.model_config:
-            if not hasattr(model_config, "_snapkv_spatiotemporal_layer_budget_state"):
-                model_config._snapkv_spatiotemporal_layer_budget_state = {"layers": {}}
+            if not hasattr(model_config, "_tridentkv_layer_budget_state"):
+                model_config._tridentkv_layer_budget_state = {"layers": {}}
 
     def update_kv_cache(
         self,
@@ -125,7 +125,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
             query_cache = query_states[:, :, -self.window_size :, :]
         attn_cache = self._compute_attn_cache(key_states, query_cache, valid_mask)
         hist_len = key_states.shape[-2] - self.window_size
-        result = self._online_head_cluster_result
+        result = self._tridentkv_head_cluster_result
         layer_vector = self._layer_attention_distribution(attn_cache, valid_mask, hist_len)
         self._store_prefill_layer_budget_entry(
             layer_idx=self.layer_idx,
@@ -139,7 +139,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
                 "valid_mask": valid_mask,
                 "hist_len": hist_len,
                 "layer_cache": layer_cache,
-                "online_head_cluster_result": result,
+                "tridentkv_head_cluster_result": result,
                 "layer_vector": layer_vector,
             },
         )
@@ -147,13 +147,13 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
         return key_states, value_states
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
-        raw_head_attention = self._online_head_clusterer._build_raw_head_attention(
+        raw_head_attention = self._tridentkv_head_clusterer._build_raw_head_attention(
             key_states,
             query_states,
             valid_mask,
         )
-        result = self._online_head_clusterer.build_from_raw_head_attention(raw_head_attention)
-        self._online_head_cluster_result = result
+        result = self._tridentkv_head_clusterer.build_from_raw_head_attention(raw_head_attention)
+        self._tridentkv_head_cluster_result = result
 
         (
             num_key_value_heads,
@@ -162,7 +162,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
             hist_len,
         ) = raw_head_attention.shape
         if self.kernel_size % 2 == 0:
-            raise ValueError("snapkv_spatio_temporal_ada_online_head_cluster requires odd kernel_size.")
+            raise ValueError("tridentkv requires odd kernel_size.")
 
         attn_weights_sum = raw_head_attention.new_empty(1, num_key_value_heads, hist_len)
         for cluster in result.clusters:
@@ -197,7 +197,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
             cluster_head_scores = cluster_scores.mean(dim=(1, 3)).transpose(0, 1)
             attn_weights_sum[:, head_index, :] = cluster_head_scores.unsqueeze(0)
 
-        return self._online_head_clusterer._pool_attn_cache(
+        return self._tridentkv_head_clusterer._pool_attn_cache(
             attn_weights_sum,
             key_states,
             self.kernel_size,
@@ -230,9 +230,9 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
         return tuple(range(int(num_layers)))
 
     def _layer_budget_state(self):
-        if not hasattr(self.model_config, "_snapkv_spatiotemporal_layer_budget_state"):
-            self.model_config._snapkv_spatiotemporal_layer_budget_state = {"layers": {}}
-        return self.model_config._snapkv_spatiotemporal_layer_budget_state
+        if not hasattr(self.model_config, "_tridentkv_layer_budget_state"):
+            self.model_config._tridentkv_layer_budget_state = {"layers": {}}
+        return self.model_config._tridentkv_layer_budget_state
 
     def _store_prefill_layer_budget_entry(self, layer_idx, entry):
         self._layer_budget_state()["layers"][int(layer_idx)] = entry
@@ -254,7 +254,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
                     entry["key_states"],
                     entry["scores"],
                     entry["valid_mask"],
-                    entry["online_head_cluster_result"],
+                    entry["tridentkv_head_cluster_result"],
                     hist_budget,
                 )
                 self._pack_layer(
@@ -364,7 +364,7 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
         key_states,
         scores,
         valid_mask,
-        online_head_cluster_result,
+        tridentkv_head_cluster_result,
         hist_budget_per_head,
     ):
         batch_size, num_heads = key_states.shape[:2]
@@ -372,16 +372,16 @@ class SnapKVSpatioTemporalAdaOnlineHeadCluster(SnapKVAdaOnlineHeadCluster):
         if hist_len < 1:
             return torch.zeros(batch_size, num_heads, 0, dtype=torch.bool, device=key_states.device), 0
         if scores.shape[-1] != hist_len:
-            raise ValueError("snapkv_spatio_temporal_ada_online_head_cluster scores length must match history.")
-        if online_head_cluster_result is None:
-            raise RuntimeError("snapkv_spatio_temporal_ada_online_head_cluster requires online clusters.")
-        if online_head_cluster_result.hist_len != hist_len:
-            raise ValueError("snapkv_spatio_temporal_ada_online_head_cluster cluster history length mismatch.")
+            raise ValueError("tridentkv scores length must match history.")
+        if tridentkv_head_cluster_result is None:
+            raise RuntimeError("tridentkv requires head clusters.")
+        if tridentkv_head_cluster_result.hist_len != hist_len:
+            raise ValueError("tridentkv head-cluster history length mismatch.")
 
         hist_valid = valid_mask[:, :, :hist_len].to(device=scores.device, dtype=torch.bool)
         selected = torch.zeros(batch_size, num_heads, hist_len, dtype=torch.bool, device=scores.device)
         hist_budget_per_head = max(0, int(hist_budget_per_head))
-        for cluster in online_head_cluster_result.clusters:
+        for cluster in tridentkv_head_cluster_result.clusters:
             heads = cluster["heads"]
             head_index = torch.tensor(heads, dtype=torch.long, device=scores.device)
             cluster_scores = scores.index_select(dim=1, index=head_index)

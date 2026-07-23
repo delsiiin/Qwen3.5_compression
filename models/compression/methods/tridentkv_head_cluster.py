@@ -8,8 +8,8 @@ from .snapkv_ada import SnapKV as SnapKVAda
 
 
 @dataclass(frozen=True)
-class OnlineAttentionHeadClusterResult:
-    """Per-compression attention-head grouping data derived from SnapKV attention."""
+class TridentKVHeadClusterResult:
+    """Per-compression head-clustering data derived from TridentKV attention."""
 
     clusters: tuple
     group_similarity: torch.Tensor
@@ -50,8 +50,8 @@ def _complete_link_clusters(layer_distance, distance_threshold):
     )
 
 
-class OnlineAttentionHeadCluster:
-    """Build SnapKV GQA clusters directly from the current query-window attention."""
+class TridentKVHeadClusterer:
+    """Build TridentKV GQA clusters from the current query-window attention."""
 
     def __init__(self, window_size, eps=1e-12):
         self.window_size = int(window_size)
@@ -156,7 +156,7 @@ class OnlineAttentionHeadCluster:
             raw_head_similarity / weight_sums.clamp_min(self.eps),
             torch.full_like(raw_head_similarity, 1.0 / gqa_group_size),
         )
-        return OnlineAttentionHeadClusterResult(
+        return TridentKVHeadClusterResult(
             clusters=clusters,
             group_similarity=group_similarity,
             raw_head_weights=raw_head_weights,
@@ -199,18 +199,24 @@ class OnlineAttentionHeadCluster:
             distance_threshold = float((1.0 - group_similarity[upper[0], upper[1]]).mean().item())
         return _complete_link_clusters(1.0 - group_similarity, distance_threshold)
 
-    def build_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
+    def build_head_cluster_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
         result = self.build(key_states, query_states, valid_mask)
         attn_weights_sum = (result.raw_head_scores * result.raw_head_weights[None, :, :, None]).sum(dim=2)
         return result, self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
 
-    def build_mean_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
+    def build_mean_head_cluster_attn_cache(self, key_states, query_states, kernel_size, valid_mask=None):
         """Build a cluster result while mean-pooling raw GQA heads without similarity weights."""
         result = self.build(key_states, query_states, valid_mask)
         attn_weights_sum = result.raw_head_scores.mean(dim=2)
         return result, self._pool_attn_cache(attn_weights_sum, key_states, kernel_size, valid_mask)
 
-    def build_mean_attn_cache_without_clustering(self, key_states, query_states, kernel_size, valid_mask=None):
+    def build_mean_attn_cache_without_head_clustering(
+        self,
+        key_states,
+        query_states,
+        kernel_size,
+        valid_mask=None,
+    ):
         """Mean-pool raw GQA attention without constructing an online head cluster."""
         raw_head_attention = self._build_raw_head_attention(key_states, query_states, valid_mask)
         attn_weights_sum = raw_head_attention.mean(dim=-2).unsqueeze(0).mean(dim=2)
@@ -229,22 +235,22 @@ class OnlineAttentionHeadCluster:
         return attn_cache.to(dtype=key_states.dtype)
 
 
-class SnapKVAdaOnlineHeadCluster(SnapKVAda):
+class TridentKVHeadCluster(SnapKVAda):
     manages_kv_cache = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._online_head_clusterer = OnlineAttentionHeadCluster(self.window_size)
-        self._online_head_cluster_result = None
+        self._tridentkv_head_clusterer = TridentKVHeadClusterer(self.window_size)
+        self._tridentkv_head_cluster_result = None
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
-        result, attn_cache = self._online_head_clusterer.build_attn_cache(
+        result, attn_cache = self._tridentkv_head_clusterer.build_head_cluster_attn_cache(
             key_states,
             query_states,
             self.kernel_size,
             valid_mask,
         )
-        self._online_head_cluster_result = result
+        self._tridentkv_head_cluster_result = result
         return attn_cache
 
     def _select_layer_head_topk(self, key_states, scores, valid_mask):
@@ -253,16 +259,16 @@ class SnapKVAdaOnlineHeadCluster(SnapKVAda):
         if hist_len < 1:
             return torch.zeros(batch_size, num_heads, 0, dtype=torch.bool, device=key_states.device), 0
         if scores.shape[-1] != hist_len:
-            raise ValueError("snapkv_ada_head_cluster attn_cache length must match historical cache length.")
+            raise ValueError("tridentkv_head_cluster attn_cache length must match historical cache length.")
 
-        result = self._online_head_cluster_result
+        result = self._tridentkv_head_cluster_result
         if result is None:
-            raise RuntimeError("snapkv_ada_head_cluster requires online clusters from _compute_attn_cache.")
+            raise RuntimeError("tridentkv_head_cluster requires head clusters from _compute_attn_cache.")
         if result.hist_len != hist_len:
-            raise ValueError("snapkv_ada_head_cluster online cluster history length does not match current cache.")
+            raise ValueError("tridentkv_head_cluster head-cluster history length does not match current cache.")
         if result.group_similarity.shape[0] != num_heads:
             raise ValueError(
-                "snapkv_ada_head_cluster online cluster head count does not match runtime key/value heads."
+                "tridentkv_head_cluster head count does not match runtime key/value heads."
             )
         clusters = result.clusters
         hist_valid = valid_mask[:, :, :hist_len].to(device=scores.device, dtype=torch.bool)
