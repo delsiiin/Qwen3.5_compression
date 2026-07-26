@@ -7,6 +7,73 @@ from ..utils import compute_attention_scores
 from .snapkv_ada import SnapKV as SnapKVAda
 
 
+def compute_kv_head_attention_pca(raw_head_attention, component_count=2):
+    """Project per-KV-head raw attention with a small head-space Gram matrix."""
+    if raw_head_attention.ndim != 4:
+        raise ValueError(
+            "Raw head attention must have shape "
+            "[key_value_heads, groups, query_window, history]."
+        )
+    if int(component_count) < 1:
+        raise ValueError("component_count must be positive.")
+
+    kv_head_count, _, query_window, history_len = raw_head_attention.shape
+    if kv_head_count < 1 or query_window < 1 or history_len < 1:
+        raise ValueError("KV-head PCA requires non-empty heads, query window, and history.")
+
+    vectors = raw_head_attention.mean(dim=1).reshape(kv_head_count, -1).to(dtype=torch.float32)
+    gram = vectors @ vectors.transpose(0, 1)
+    centered_gram = (
+        gram
+        - gram.mean(dim=0, keepdim=True)
+        - gram.mean(dim=1, keepdim=True)
+        + gram.mean()
+    )
+    centered_gram = (centered_gram + centered_gram.transpose(0, 1)) * 0.5
+    eigenvalues, eigenvectors = torch.linalg.eigh(centered_gram)
+    eigenvalues = eigenvalues.clamp_min(0.0)
+    order = torch.argsort(eigenvalues, descending=True)
+
+    points = vectors.new_zeros((kv_head_count, int(component_count)))
+    explained = vectors.new_zeros((int(component_count),))
+    actual_components = min(int(component_count), kv_head_count)
+    if actual_components > 0:
+        selected = order[:actual_components]
+        selected_values = eigenvalues.index_select(0, selected)
+        points[:, :actual_components] = (
+            eigenvectors.index_select(1, selected) * selected_values.sqrt().unsqueeze(0)
+        )
+        total = eigenvalues.sum()
+        if float(total.item()) > torch.finfo(eigenvalues.dtype).eps:
+            explained[:actual_components] = selected_values / total
+
+        # PCA axes have an arbitrary sign. Canonicalize each axis so saved
+        # artifacts and regression tests remain deterministic.
+        for component_idx in range(actual_components):
+            column = points[:, component_idx]
+            pivot = int(column.abs().argmax().item())
+            if float(column[pivot].item()) < 0.0:
+                points[:, component_idx] = -column
+
+    return points, explained
+
+
+def build_kv_head_cluster_ids(clusters, kv_head_count, device=None):
+    cluster_ids = torch.full(
+        (int(kv_head_count),),
+        -1,
+        dtype=torch.int16,
+        device=device,
+    )
+    for cluster in clusters:
+        cluster_id = int(cluster["cluster_id"])
+        heads = torch.as_tensor(cluster["heads"], dtype=torch.long, device=device)
+        cluster_ids.index_fill_(0, heads, cluster_id)
+    if bool((cluster_ids < 0).any().item()):
+        raise ValueError("Every KV head must belong to exactly one head cluster.")
+    return cluster_ids
+
+
 @dataclass(frozen=True)
 class TridentKVHeadClusterResult:
     """Per-compression head-clustering data derived from TridentKV attention."""
@@ -242,16 +309,80 @@ class TridentKVHeadCluster(SnapKVAda):
         super().__init__(*args, **kwargs)
         self._tridentkv_head_clusterer = TridentKVHeadClusterer(self.window_size)
         self._tridentkv_head_cluster_result = None
+        self._pending_head_cluster_pca_observation = None
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
-        result, attn_cache = self._tridentkv_head_clusterer.build_head_cluster_attn_cache(
+        if (
+            not self._head_cluster_observation_enabled
+            or self._head_cluster_observation_submode != "head_cluster_pca"
+        ):
+            result, attn_cache = (
+                self._tridentkv_head_clusterer.build_head_cluster_attn_cache(
+                    key_states,
+                    query_states,
+                    self.kernel_size,
+                    valid_mask,
+                )
+            )
+            self._tridentkv_head_cluster_result = result
+            return attn_cache
+
+        raw_head_attention = self._tridentkv_head_clusterer._build_raw_head_attention(
             key_states,
             query_states,
+            valid_mask,
+        )
+        result = self._tridentkv_head_clusterer.build_from_raw_head_attention(raw_head_attention)
+        self._tridentkv_head_cluster_result = result
+        self._capture_head_cluster_pca_observation(raw_head_attention, result)
+        attn_weights_sum = (
+            result.raw_head_scores * result.raw_head_weights[None, :, :, None]
+        ).sum(dim=2)
+        return self._tridentkv_head_clusterer._pool_attn_cache(
+            attn_weights_sum,
+            key_states,
             self.kernel_size,
             valid_mask,
         )
-        self._tridentkv_head_cluster_result = result
-        return attn_cache
+
+    def _capture_head_cluster_pca_observation(self, raw_head_attention, result):
+        if (
+            not self._head_cluster_observation_enabled
+            or self._head_cluster_observation_submode != "head_cluster_pca"
+        ):
+            return
+        pca_points, explained = compute_kv_head_attention_pca(raw_head_attention)
+        cluster_ids = build_kv_head_cluster_ids(
+            result.clusters,
+            raw_head_attention.shape[0],
+            device=raw_head_attention.device,
+        )
+        self._pending_head_cluster_pca_observation = {
+            "history_len": int(raw_head_attention.shape[-1]),
+            "query_window_len": int(raw_head_attention.shape[-2]),
+            "group_similarity": result.group_similarity.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .clone(),
+            "kv_head_cluster_ids": cluster_ids.detach().to(device="cpu").clone(),
+            "kv_head_pca_points": pca_points.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .clone(),
+            "pca_explained_variance_ratio": explained.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .clone(),
+        }
+
+    def _consume_head_cluster_pca_observation(self):
+        record = self._pending_head_cluster_pca_observation
+        self._pending_head_cluster_pca_observation = None
+        if record is None:
+            raise RuntimeError(
+                "head_cluster_pca observation requires data from the real TridentKV cluster path."
+            )
+        return record
+
+    def _clear_pending_head_cluster_observation(self):
+        self._pending_head_cluster_pca_observation = None
 
     def _select_layer_head_topk(self, key_states, scores, valid_mask):
         batch_size, num_heads = key_states.shape[:2]

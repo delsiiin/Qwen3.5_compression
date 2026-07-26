@@ -124,7 +124,7 @@ class TridentKV(TridentKVHeadCluster):
         if query_cache is None or query_cache.shape[-2] == 0:
             query_cache = query_states[:, :, -self.window_size :, :]
         observation_raw_attention = None
-        if self._head_cluster_observation_enabled:
+        if self._observes_head_budget_attention():
             observation_raw_attention = self._compute_head_cluster_observation_attention(
                 key_states,
                 query_cache,
@@ -164,6 +164,11 @@ class TridentKV(TridentKVHeadCluster):
         )
         result = self._tridentkv_head_clusterer.build_from_raw_head_attention(raw_head_attention)
         self._tridentkv_head_cluster_result = result
+        if (
+            self._head_cluster_observation_enabled
+            and self._head_cluster_observation_submode == "head_cluster_pca"
+        ):
+            self._capture_head_cluster_pca_observation(raw_head_attention, result)
 
         (
             num_key_value_heads,

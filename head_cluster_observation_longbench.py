@@ -9,6 +9,8 @@ from attn_heatmap import (
 )
 from models.compression.experiments.head_cluster_observation import (
     HEAD_BUDGET_ATTENTION_SUBMODE,
+    HEAD_CLUSTER_PCA_METHODS,
+    HEAD_CLUSTER_PCA_SUBMODE,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES,
     HeadClusterObservationConfig,
@@ -201,10 +203,16 @@ def validate_head_cluster_observation_args(args):
         return
     if not args.compression:
         raise ValueError("--head_cluster_observation_mode requires --compression.")
-    if args.compression_mode not in SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS:
+    supported_methods = (
+        HEAD_CLUSTER_PCA_METHODS
+        if args.head_cluster_observation_submode == HEAD_CLUSTER_PCA_SUBMODE
+        else SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS
+    )
+    if args.compression_mode not in supported_methods:
         raise ValueError(
-            "--head_cluster_observation_mode supports --compression_mode values "
-            f"{sorted(SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS)}."
+            f"--head_cluster_observation_submode {args.head_cluster_observation_submode!r} "
+            "supports --compression_mode values "
+            f"{sorted(supported_methods)}."
         )
     if args.n_proc != 1:
         raise ValueError("--head_cluster_observation_mode currently requires --n_proc 1.")
@@ -216,7 +224,7 @@ def add_head_cluster_observation_args(parser):
         action="store_true",
         help=(
             "Run an isolated cached prefill with the active compression method and save real "
-            "per-layer KV-head budget and raw-attention observation artifacts."
+            "per-layer KV-head budget/raw-attention or head-cluster/PCA artifacts."
         ),
     )
     parser.add_argument(
@@ -224,7 +232,11 @@ def add_head_cluster_observation_args(parser):
         type=str,
         choices=sorted(SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES),
         default=HEAD_BUDGET_ATTENTION_SUBMODE,
-        help="Head-cluster observation experiment to run.",
+        help=(
+            "Head-cluster observation experiment: head_budget_attention saves existing budget "
+            "and attention plots; head_cluster_pca saves cluster partitions and per-KV-head "
+            "raw-attention PCA plots."
+        ),
     )
     parser.add_argument(
         "--head_cluster_observation_dir",

@@ -14,8 +14,14 @@ SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS = {
     "tridentkv",
 }
 HEAD_BUDGET_ATTENTION_SUBMODE = "head_budget_attention"
+HEAD_CLUSTER_PCA_SUBMODE = "head_cluster_pca"
+HEAD_CLUSTER_PCA_METHODS = {
+    "tridentkv_head_cluster",
+    "tridentkv",
+}
 SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES = {
     HEAD_BUDGET_ATTENTION_SUBMODE,
+    HEAD_CLUSTER_PCA_SUBMODE,
 }
 
 
@@ -44,6 +50,11 @@ class HeadClusterObservationResult:
     post_compression_token_counts: np.ndarray
     pre_compression_kv_cache_lengths: np.ndarray
     history_lengths: np.ndarray
+    group_similarity: np.ndarray | None = None
+    kv_head_cluster_ids: np.ndarray | None = None
+    kv_head_pca_points: np.ndarray | None = None
+    pca_explained_variance_ratio: np.ndarray | None = None
+    query_window_lengths: np.ndarray | None = None
 
 
 def compute_head_cluster_observation(
@@ -96,6 +107,13 @@ def compute_head_cluster_observation(
             f"{sorted(SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS)}."
         )
         return _empty_result(summary)
+    if config.submode == HEAD_CLUSTER_PCA_SUBMODE and method not in HEAD_CLUSTER_PCA_METHODS:
+        summary["status"] = "error"
+        summary["reason"] = (
+            f"Submode {HEAD_CLUSTER_PCA_SUBMODE!r} requires one of "
+            f"{sorted(HEAD_CLUSTER_PCA_METHODS)}, got {method!r}."
+        )
+        return _empty_result(summary)
 
     first_cluster = attentions[0][1].kv_cluster
     summary["compression_config"] = {
@@ -122,7 +140,7 @@ def compute_head_cluster_observation(
         )
     for _, attention in attentions:
         cluster = attention.kv_cluster
-        cluster.enable_head_cluster_observation()
+        cluster.enable_head_cluster_observation(config.submode)
     try:
         _run_cached_observation_forward(model, inputs)
     except Exception as exc:
@@ -164,20 +182,44 @@ def compute_head_cluster_observation(
         if record is None:
             layer_summary["status"] = "skipped_no_compression"
         else:
-            layer_summary.update(
-                {
-                    "status": "saved",
-                    "pre_compression_kv_cache_len": record["pre_compression_kv_cache_len"],
-                    "history_len": record["history_len"],
-                    "kv_head_count": int(record["post_compression_token_counts"].numel()),
-                }
-            )
+            if config.submode == HEAD_CLUSTER_PCA_SUBMODE:
+                kv_head_count = int(record["group_similarity"].shape[0])
+                layer_summary.update(
+                    {
+                        "status": "saved",
+                        "pre_compression_kv_cache_len": record[
+                            "pre_compression_kv_cache_len"
+                        ],
+                        "history_len": record["history_len"],
+                        "query_window_len": record["query_window_len"],
+                        "kv_head_count": kv_head_count,
+                        "cluster_count": int(
+                            torch.unique(record["kv_head_cluster_ids"]).numel()
+                        ),
+                    }
+                )
+            else:
+                layer_summary.update(
+                    {
+                        "status": "saved",
+                        "pre_compression_kv_cache_len": record[
+                            "pre_compression_kv_cache_len"
+                        ],
+                        "history_len": record["history_len"],
+                        "kv_head_count": int(
+                            record["post_compression_token_counts"].numel()
+                        ),
+                    }
+                )
             collected.append(record)
         summary["layers"].append(layer_summary)
 
     if not collected:
         summary["status"] = "no_valid_layers"
         return _empty_result(summary)
+
+    if config.submode == HEAD_CLUSTER_PCA_SUBMODE:
+        return _build_head_cluster_pca_result(summary, collected)
 
     try:
         layer_indices = np.asarray(
@@ -236,6 +278,67 @@ def compute_head_cluster_observation(
     )
 
 
+def _build_head_cluster_pca_result(summary, collected):
+    try:
+        layer_indices = np.asarray(
+            [int(record["layer_idx"]) for record in collected],
+            dtype=np.int16,
+        )
+        group_similarity = _stack_records(collected, "group_similarity", np.float32)
+        cluster_ids = _stack_records(collected, "kv_head_cluster_ids", np.int16)
+        pca_points = _stack_records(collected, "kv_head_pca_points", np.float32)
+        explained = _stack_records(
+            collected,
+            "pca_explained_variance_ratio",
+            np.float32,
+        )
+    except ValueError as exc:
+        summary["status"] = "error"
+        summary["reason"] = f"Incompatible observation shapes across layers: {exc}"
+        return _empty_result(summary)
+
+    pre_lengths = np.asarray(
+        [int(record["pre_compression_kv_cache_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    history_lengths = np.asarray(
+        [int(record["history_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    query_window_lengths = np.asarray(
+        [int(record["query_window_len"]) for record in collected],
+        dtype=np.int16,
+    )
+    summary.update(
+        {
+            "status": "saved",
+            "valid_layer_indices": layer_indices.astype(int).tolist(),
+            "group_similarity_shape": list(group_similarity.shape),
+            "kv_head_cluster_ids_shape": list(cluster_ids.shape),
+            "kv_head_pca_points_shape": list(pca_points.shape),
+            "pca_explained_variance_ratio_shape": list(explained.shape),
+            "query_window_lengths_shape": list(query_window_lengths.shape),
+            "history_lengths_shape": list(history_lengths.shape),
+        }
+    )
+    return HeadClusterObservationResult(
+        summary=summary,
+        layer_indices=layer_indices,
+        raw_attention=np.asarray([], dtype=np.float32),
+        selected_hist_mask=np.asarray([], dtype=np.bool_),
+        history_selected_token_counts=np.asarray([], dtype=np.int32),
+        recent_retained_token_counts=np.asarray([], dtype=np.int32),
+        post_compression_token_counts=np.asarray([], dtype=np.int32),
+        pre_compression_kv_cache_lengths=pre_lengths,
+        history_lengths=history_lengths,
+        group_similarity=group_similarity,
+        kv_head_cluster_ids=cluster_ids,
+        kv_head_pca_points=pca_points,
+        pca_explained_variance_ratio=explained,
+        query_window_lengths=query_window_lengths,
+    )
+
+
 def save_head_cluster_observation(
     result: HeadClusterObservationResult,
     output_dir: str,
@@ -251,18 +354,37 @@ def save_head_cluster_observation(
 
     with open(summary_path, "w", encoding="utf-8") as fout:
         json.dump(result.summary, fout, ensure_ascii=False, indent=2)
-    np.savez_compressed(
-        npz_path,
-        layer_indices=result.layer_indices,
-        raw_attention=result.raw_attention,
-        selected_hist_mask=result.selected_hist_mask,
-        history_selected_token_counts=result.history_selected_token_counts,
-        recent_retained_token_counts=result.recent_retained_token_counts,
-        post_compression_token_counts=result.post_compression_token_counts,
-        pre_compression_kv_cache_lengths=result.pre_compression_kv_cache_lengths,
-        history_lengths=result.history_lengths,
-    )
+    if _result_submode(result) == HEAD_CLUSTER_PCA_SUBMODE:
+        np.savez_compressed(
+            npz_path,
+            layer_indices=result.layer_indices,
+            group_similarity=result.group_similarity,
+            kv_head_cluster_ids=result.kv_head_cluster_ids,
+            kv_head_pca_points=result.kv_head_pca_points,
+            pca_explained_variance_ratio=result.pca_explained_variance_ratio,
+            query_window_lengths=result.query_window_lengths,
+            history_lengths=result.history_lengths,
+        )
+    else:
+        np.savez_compressed(
+            npz_path,
+            layer_indices=result.layer_indices,
+            raw_attention=result.raw_attention,
+            selected_hist_mask=result.selected_hist_mask,
+            history_selected_token_counts=result.history_selected_token_counts,
+            recent_retained_token_counts=result.recent_retained_token_counts,
+            post_compression_token_counts=result.post_compression_token_counts,
+            pre_compression_kv_cache_lengths=result.pre_compression_kv_cache_lengths,
+            history_lengths=result.history_lengths,
+        )
     return {"summary": summary_path, "npz": npz_path, "images": image_paths}
+
+
+def _result_submode(result):
+    return result.summary.get("config", {}).get(
+        "submode",
+        HEAD_BUDGET_ATTENTION_SUBMODE,
+    )
 
 
 def plot_head_cluster_observation(
@@ -278,6 +400,9 @@ def plot_head_cluster_observation(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    if _result_submode(result) == HEAD_CLUSTER_PCA_SUBMODE:
+        return _plot_head_cluster_pca_observation(result, output_dir, prefix, plt)
 
     image_paths = {}
     for layer_pos, layer_idx_value in enumerate(result.layer_indices):
@@ -305,6 +430,194 @@ def plot_head_cluster_observation(
         )
         image_paths[attention_key] = attention_path
     return image_paths
+
+
+def _plot_head_cluster_pca_observation(result, output_dir, prefix, plt):
+    required = {
+        "group_similarity": result.group_similarity,
+        "kv_head_cluster_ids": result.kv_head_cluster_ids,
+        "kv_head_pca_points": result.kv_head_pca_points,
+        "pca_explained_variance_ratio": result.pca_explained_variance_ratio,
+        "query_window_lengths": result.query_window_lengths,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "head_cluster_pca result is missing required arrays: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    image_paths = {}
+    for layer_pos, layer_idx_value in enumerate(result.layer_indices):
+        layer_idx = int(layer_idx_value)
+        partition_key = f"head_cluster_partition_layer_{layer_idx:03d}"
+        partition_path = os.path.join(output_dir, f"{prefix}_{partition_key}.png")
+        _plot_head_cluster_partition(
+            result.group_similarity[layer_pos],
+            result.kv_head_cluster_ids[layer_pos],
+            layer_idx,
+            partition_path,
+            plt,
+        )
+        image_paths[partition_key] = partition_path
+
+        pca_key = f"raw_attention_pca_layer_{layer_idx:03d}"
+        pca_path = os.path.join(output_dir, f"{prefix}_{pca_key}.png")
+        _plot_kv_head_attention_pca(
+            result.kv_head_pca_points[layer_pos],
+            result.kv_head_cluster_ids[layer_pos],
+            result.pca_explained_variance_ratio[layer_pos],
+            int(result.query_window_lengths[layer_pos]),
+            int(result.history_lengths[layer_pos]),
+            layer_idx,
+            pca_path,
+            plt,
+        )
+        image_paths[pca_key] = pca_path
+    return image_paths
+
+
+def _plot_head_cluster_partition(
+    group_similarity,
+    cluster_ids,
+    layer_idx,
+    output_path,
+    plt,
+):
+    similarity = np.asarray(group_similarity, dtype=np.float32)
+    cluster_ids = np.asarray(cluster_ids, dtype=np.int16)
+    if similarity.ndim != 2 or similarity.shape[0] != similarity.shape[1]:
+        raise ValueError("group_similarity must be a square matrix.")
+    if cluster_ids.shape != (similarity.shape[0],):
+        raise ValueError("kv_head_cluster_ids must match group_similarity.")
+
+    order = np.lexsort((np.arange(cluster_ids.size), cluster_ids))
+    reordered = similarity[np.ix_(order, order)]
+    reordered_clusters = cluster_ids[order]
+    lower = float(np.nanmin(reordered))
+    if 1.0 - lower < 1e-6:
+        lower = 0.0
+
+    size = max(5.8, min(10.0, 0.55 * similarity.shape[0] + 3.5))
+    fig, ax = plt.subplots(figsize=(size, size), dpi=180)
+    image = ax.imshow(
+        reordered,
+        cmap="viridis",
+        vmin=max(-1.0, lower),
+        vmax=1.0,
+        interpolation="nearest",
+        aspect="equal",
+    )
+    tick_positions = np.arange(order.size)
+    tick_labels = [str(int(head_idx)) for head_idx in order]
+    ax.set_xticks(tick_positions)
+    ax.set_yticks(tick_positions)
+    ax.set_xticklabels(tick_labels)
+    ax.set_yticklabels(tick_labels)
+    ax.set_xlabel("KV head id (cluster-reordered)")
+    ax.set_ylabel("KV head id (cluster-reordered)")
+    ax.set_title(f"KV-head cluster partition — layer {layer_idx}")
+
+    boundaries = np.flatnonzero(np.diff(reordered_clusters)) + 0.5
+    for boundary in boundaries:
+        ax.axhline(boundary, color="white", linewidth=1.8)
+        ax.axvline(boundary, color="white", linewidth=1.8)
+
+    starts = np.r_[0, np.flatnonzero(np.diff(reordered_clusters)) + 1]
+    ends = np.r_[starts[1:], reordered_clusters.size]
+    for start, end in zip(starts, ends):
+        cluster_id = int(reordered_clusters[start])
+        midpoint = (float(start) + float(end) - 1.0) / 2.0
+        ax.text(
+            midpoint,
+            -0.82,
+            f"C{cluster_id}",
+            ha="center",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            clip_on=False,
+        )
+
+    if similarity.shape[0] <= 16:
+        for row in range(reordered.shape[0]):
+            for column in range(reordered.shape[1]):
+                value = float(reordered[row, column])
+                color = "white" if value < (lower + 1.0) * 0.5 else "black"
+                ax.text(
+                    column,
+                    row,
+                    f"{value:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    color=color,
+                )
+
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Cosine similarity")
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+
+
+def _plot_kv_head_attention_pca(
+    pca_points,
+    cluster_ids,
+    explained,
+    query_window_len,
+    history_len,
+    layer_idx,
+    output_path,
+    plt,
+):
+    points = np.asarray(pca_points, dtype=np.float32)
+    cluster_ids = np.asarray(cluster_ids, dtype=np.int16)
+    explained = np.asarray(explained, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("kv_head_pca_points must have shape [kv_head, 2].")
+    if cluster_ids.shape != (points.shape[0],):
+        raise ValueError("kv_head_cluster_ids must match kv_head_pca_points.")
+    if explained.shape != (2,):
+        raise ValueError("pca_explained_variance_ratio must have shape [2].")
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.2), dpi=180)
+    cmap = plt.get_cmap("tab10")
+    unique_clusters = np.unique(cluster_ids)
+    for color_pos, cluster_id in enumerate(unique_clusters):
+        mask = cluster_ids == cluster_id
+        ax.scatter(
+            points[mask, 0],
+            points[mask, 1],
+            s=64,
+            alpha=0.86,
+            color=cmap(color_pos % 10),
+            edgecolors="#202020",
+            linewidths=0.7,
+            label=f"Cluster {int(cluster_id)}",
+            zorder=2,
+        )
+    for head_idx, point in enumerate(points):
+        ax.annotate(
+            f"H{head_idx}",
+            xy=(point[0], point[1]),
+            xytext=(5, 4),
+            textcoords="offset points",
+            fontsize=8,
+            zorder=3,
+        )
+
+    ax.set_title(
+        f"KV-head raw-attention PCA — layer {layer_idx}\n"
+        f"query window={query_window_len}, history={history_len}"
+    )
+    ax.set_xlabel(f"PC 1 ({100.0 * float(explained[0]):.1f}% variance)")
+    ax.set_ylabel(f"PC 2 ({100.0 * float(explained[1]):.1f}% variance)")
+    ax.grid(alpha=0.2, linewidth=0.7)
+    ax.legend(loc="best", frameon=True, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def _plot_head_budget(history_counts, recent_counts, post_counts, layer_idx, output_path, plt):
@@ -493,4 +806,9 @@ def _empty_result(summary):
         post_compression_token_counts=np.asarray([], dtype=np.int32),
         pre_compression_kv_cache_lengths=np.asarray([], dtype=np.int32),
         history_lengths=np.asarray([], dtype=np.int32),
+        group_similarity=np.asarray([], dtype=np.float32),
+        kv_head_cluster_ids=np.asarray([], dtype=np.int16),
+        kv_head_pca_points=np.asarray([], dtype=np.float32),
+        pca_explained_variance_ratio=np.asarray([], dtype=np.float32),
+        query_window_lengths=np.asarray([], dtype=np.int16),
     )

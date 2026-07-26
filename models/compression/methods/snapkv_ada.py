@@ -43,20 +43,39 @@ class SnapKV:
         # Observation is strictly opt-in. Outside an observation capture these
         # fields stay disabled/empty and no additional attention is computed.
         self._head_cluster_observation_enabled = False
+        self._head_cluster_observation_submode = None
         self._head_cluster_observation_records = []
 
-    def enable_head_cluster_observation(self):
+    def enable_head_cluster_observation(self, submode="head_budget_attention"):
         self._head_cluster_observation_enabled = True
+        self._head_cluster_observation_submode = str(submode)
         self._head_cluster_observation_records = []
+        self._clear_pending_head_cluster_observation()
 
     def disable_head_cluster_observation(self):
         self._head_cluster_observation_enabled = False
+        self._head_cluster_observation_submode = None
 
     def clear_head_cluster_observation_records(self):
         self._head_cluster_observation_records = []
+        self._clear_pending_head_cluster_observation()
 
     def get_head_cluster_observation_records(self):
         return list(self._head_cluster_observation_records)
+
+    def _clear_pending_head_cluster_observation(self):
+        """Clear method-specific observation data without affecting normal compression."""
+
+    def _consume_head_cluster_pca_observation(self):
+        raise RuntimeError(
+            "head_cluster_pca observation requires a compression method with head clusters."
+        )
+
+    def _observes_head_budget_attention(self):
+        return (
+            self._head_cluster_observation_enabled
+            and self._head_cluster_observation_submode == "head_budget_attention"
+        )
 
     def update_kv(
         self,
@@ -203,7 +222,7 @@ class SnapKV:
             valid_mask,
         )
         observation_raw_attention = None
-        if self._head_cluster_observation_enabled:
+        if self._observes_head_budget_attention():
             observation_raw_attention = self._compute_head_cluster_observation_attention(
                 key_states,
                 query_cache,
@@ -417,10 +436,32 @@ class SnapKV:
     ):
         if not self._head_cluster_observation_enabled:
             raise RuntimeError("Head-cluster observation record was requested while disabled.")
-        if raw_attention is None:
-            raise RuntimeError("Head-cluster observation requires raw attention before packing.")
         if selected_hist_mask.shape[0] != 1:
             raise ValueError("Head-cluster observation currently supports batch size 1 only.")
+
+        if self._head_cluster_observation_submode == "head_cluster_pca":
+            method_record = self._consume_head_cluster_pca_observation()
+            if int(method_record["history_len"]) != int(hist_len):
+                raise ValueError(
+                    "Observed head-cluster PCA history length must match compression history."
+                )
+            self._head_cluster_observation_records.append(
+                {
+                    "layer_idx": int(getattr(attention, "layer_idx", self.layer_idx)),
+                    "method": str(getattr(self.model_config, "method", type(self).__name__)),
+                    "pre_compression_kv_cache_len": int(kv_cache_len),
+                    **method_record,
+                }
+            )
+            return
+
+        if self._head_cluster_observation_submode != "head_budget_attention":
+            raise ValueError(
+                "Unsupported head-cluster observation submode "
+                f"{self._head_cluster_observation_submode!r}."
+            )
+        if raw_attention is None:
+            raise RuntimeError("Head-cluster observation requires raw attention before packing.")
         if raw_attention.shape[-1] != int(kv_cache_len):
             raise ValueError("Observed raw attention length must match the pre-compression KV cache.")
 
