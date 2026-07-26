@@ -123,25 +123,35 @@ class TridentKV(TridentKVHeadCluster):
         query_cache = getattr(layer_cache, "query_cache", None)
         if query_cache is None or query_cache.shape[-2] == 0:
             query_cache = query_states[:, :, -self.window_size :, :]
+        observation_raw_attention = None
+        if self._head_cluster_observation_enabled:
+            observation_raw_attention = self._compute_head_cluster_observation_attention(
+                key_states,
+                query_cache,
+                valid_mask,
+            )
         attn_cache = self._compute_attn_cache(key_states, query_cache, valid_mask)
         hist_len = key_states.shape[-2] - self.window_size
         result = self._tridentkv_head_cluster_result
         layer_vector = self._layer_attention_distribution(attn_cache, valid_mask, hist_len)
+        entry = {
+            "layer_idx": self.layer_idx,
+            "skip": False,
+            "attention": attention,
+            "key_states": key_states,
+            "value_states": value_states,
+            "scores": attn_cache,
+            "valid_mask": valid_mask,
+            "hist_len": hist_len,
+            "layer_cache": layer_cache,
+            "tridentkv_head_cluster_result": result,
+            "layer_vector": layer_vector,
+        }
+        if self._head_cluster_observation_enabled:
+            entry["observation_raw_attention"] = observation_raw_attention
         self._store_prefill_layer_budget_entry(
             layer_idx=self.layer_idx,
-            entry={
-                "layer_idx": self.layer_idx,
-                "skip": False,
-                "attention": attention,
-                "key_states": key_states,
-                "value_states": value_states,
-                "scores": attn_cache,
-                "valid_mask": valid_mask,
-                "hist_len": hist_len,
-                "layer_cache": layer_cache,
-                "tridentkv_head_cluster_result": result,
-                "layer_vector": layer_vector,
-            },
+            entry=entry,
         )
         self._try_compress_prefill_layer_budget_group(layer_indices)
         return key_states, value_states
@@ -265,6 +275,7 @@ class TridentKV(TridentKVHeadCluster):
                     hist_len=hist_len,
                     scores=entry["scores"],
                     layer_cache=entry["layer_cache"],
+                    observation_raw_attention=entry.get("observation_raw_attention"),
                 )
         finally:
             state["layers"] = {}

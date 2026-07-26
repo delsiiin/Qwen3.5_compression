@@ -25,6 +25,11 @@ from hidden_state_pca_observation import (
     PCA_SUBMODE_KEY_VALUE_STATES,
     SUPPORTED_HIDDEN_STATE_PCA_SUBMODES,
 )
+from head_cluster_observation_longbench import (
+    add_head_cluster_observation_args,
+    build_head_cluster_observation_run_writer,
+    validate_head_cluster_observation_args,
+)
 from misc import (
     build_output_path,
     load_json,
@@ -354,6 +359,7 @@ def query_llm(
     snapkv_observation_sample_writer=None,
     snapkv_topk_overlap_sample_writer=None,
     hidden_state_pca_sample_writer=None,
+    head_cluster_observation_sample_writer=None,
     prefill_label="response",
 ):
     max_input_len = get_max_input_len(model_maxlen, max_new_tokens)
@@ -413,6 +419,14 @@ def query_llm(
         )
     if hidden_state_pca_sample_writer is not None:
         hidden_state_pca_sample_writer.capture_prefill(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt,
+            inputs=inputs,
+            label=prefill_label,
+        )
+    if head_cluster_observation_sample_writer is not None:
+        head_cluster_observation_sample_writer.capture_prefill(
             model=model,
             tokenizer=tokenizer,
             prompt_text=prompt,
@@ -590,6 +604,7 @@ def validate_args(args):
     if args.hidden_state_pca_mode and args.n_proc != 1:
         raise ValueError("--hidden_state_pca_mode currently requires --n_proc 1.")
     validate_snapkv_observation_args(args)
+    validate_head_cluster_observation_args(args)
 
 def get_pred(data, args, fout, out_file):
     model_name = args.model
@@ -611,6 +626,7 @@ def get_pred(data, args, fout, out_file):
     snapkv_observation_run_writer = build_snapkv_observation_run_writer(args, out_file)
     snapkv_topk_overlap_run_writer = build_snapkv_topk_overlap_run_writer(args, out_file)
     hidden_state_pca_run_writer = build_hidden_state_pca_run_writer(args, out_file)
+    head_cluster_observation_run_writer = build_head_cluster_observation_run_writer(args, out_file)
     for sample_index, item in enumerate(tqdm(data)):
         item = dict(item)
         attn_sample_writer = attn_run_writer.new_sample(item) if attn_run_writer is not None else None
@@ -644,6 +660,11 @@ def get_pred(data, args, fout, out_file):
             if hidden_state_pca_run_writer is not None
             else None
         )
+        head_cluster_observation_sample_writer = (
+            head_cluster_observation_run_writer.new_sample(item)
+            if head_cluster_observation_run_writer is not None
+            else None
+        )
         try:
             context = item['context']
             if args.rag > 0:
@@ -675,6 +696,7 @@ def get_pred(data, args, fout, out_file):
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
+                    head_cluster_observation_sample_writer=head_cluster_observation_sample_writer,
                     prefill_label="cot_reasoning",
                 )
             else:
@@ -694,6 +716,7 @@ def get_pred(data, args, fout, out_file):
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
+                    head_cluster_observation_sample_writer=head_cluster_observation_sample_writer,
                     prefill_label="response",
                 )
             if output == '':
@@ -718,6 +741,7 @@ def get_pred(data, args, fout, out_file):
                     snapkv_observation_sample_writer=snapkv_observation_sample_writer,
                     snapkv_topk_overlap_sample_writer=snapkv_topk_overlap_sample_writer,
                     hidden_state_pca_sample_writer=hidden_state_pca_sample_writer,
+                    head_cluster_observation_sample_writer=head_cluster_observation_sample_writer,
                     prefill_label="cot_answer_extraction",
                 )
                 if output == '':
@@ -766,6 +790,14 @@ def get_pred(data, args, fout, out_file):
                     hidden_state_pca_sample_writer.sample_dir,
                     start=args.hidden_state_pca_dir,
                 )
+            if head_cluster_observation_sample_writer is not None:
+                item["head_cluster_observation_status"] = (
+                    head_cluster_observation_sample_writer.build_capture_status()
+                )
+                item["head_cluster_observation_artifact"] = os.path.relpath(
+                    head_cluster_observation_sample_writer.sample_dir,
+                    start=args.head_cluster_observation_dir,
+                )
             if attn_sample_writer is not None:
                 attn_sample_writer.finalize(item)
             if attn_layer_similarity_sample_writer is not None:
@@ -780,6 +812,8 @@ def get_pred(data, args, fout, out_file):
                 snapkv_topk_overlap_sample_writer.finalize(item)
             if hidden_state_pca_sample_writer is not None:
                 hidden_state_pca_sample_writer.finalize(item)
+            if head_cluster_observation_sample_writer is not None:
+                head_cluster_observation_sample_writer.finalize(item)
             fout.write(json.dumps(item, ensure_ascii=False) + '\n')
             fout.flush()
         except Exception as exc:
@@ -839,6 +873,16 @@ def get_pred(data, args, fout, out_file):
                     start=args.hidden_state_pca_dir,
                 )
                 hidden_state_pca_sample_writer.finalize(item)
+            if head_cluster_observation_sample_writer is not None:
+                item["error"] = str(exc)
+                item["head_cluster_observation_status"] = (
+                    head_cluster_observation_sample_writer.build_capture_status()
+                )
+                item["head_cluster_observation_artifact"] = os.path.relpath(
+                    head_cluster_observation_sample_writer.sample_dir,
+                    start=args.head_cluster_observation_dir,
+                )
+                head_cluster_observation_sample_writer.finalize(item)
             continue
 
 
@@ -941,5 +985,6 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_state_pca_token_end", type=int, default=None, help="Exclusive end token index for hidden-state PCA span. Defaults to the prompt end; negative values count from the prompt end.")
     parser.add_argument("--hidden_state_pca_max_prefill_tokens", type=int, default=None, help="Skip hidden-state PCA capture when the prefill token count exceeds this cap.")
     add_snapkv_observation_args(parser)
+    add_head_cluster_observation_args(parser)
     args = parser.parse_args()
     main(args)

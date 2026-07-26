@@ -40,6 +40,24 @@ class SnapKV:
             self.kept_token_indices = []
             self.kept_attention_scores = []
 
+        # Observation is strictly opt-in. Outside an observation capture these
+        # fields stay disabled/empty and no additional attention is computed.
+        self._head_cluster_observation_enabled = False
+        self._head_cluster_observation_records = []
+
+    def enable_head_cluster_observation(self):
+        self._head_cluster_observation_enabled = True
+        self._head_cluster_observation_records = []
+
+    def disable_head_cluster_observation(self):
+        self._head_cluster_observation_enabled = False
+
+    def clear_head_cluster_observation_records(self):
+        self._head_cluster_observation_records = []
+
+    def get_head_cluster_observation_records(self):
+        return list(self._head_cluster_observation_records)
+
     def update_kv(
         self,
         key_states,
@@ -173,16 +191,24 @@ class SnapKV:
         query_cache = getattr(layer_cache, "query_cache", None)
         if query_cache is None or query_cache.shape[-2] == 0:
             query_cache = query_states[:, :, -self.window_size :, :]
+        valid_mask = self._current_valid_mask(layer_cache, key_states)
         attn_cache = self._compute_attn_cache(
             key_states,
             query_cache,
-            self._current_valid_mask(layer_cache, key_states),
+            valid_mask,
         )
         selected_hist_mask, hist_len = self._select_layer_head_topk(
             key_states,
             attn_cache,
-            self._current_valid_mask(layer_cache, key_states),
+            valid_mask,
         )
+        observation_raw_attention = None
+        if self._head_cluster_observation_enabled:
+            observation_raw_attention = self._compute_head_cluster_observation_attention(
+                key_states,
+                query_cache,
+                valid_mask,
+            )
         self._pack_layer(
             attention=attention,
             key_states=key_states,
@@ -191,6 +217,7 @@ class SnapKV:
             hist_len=hist_len,
             scores=attn_cache,
             layer_cache=layer_cache,
+            observation_raw_attention=observation_raw_attention,
         )
         return key_states, value_states
 
@@ -275,6 +302,46 @@ class SnapKV:
             selected_flat.scatter_(dim=-1, index=topk_indices, value=True)
         return selected_flat.view(batch_size, num_heads, hist_len).to(device=key_states.device), hist_len
 
+    def _compute_head_cluster_observation_attention(self, key_states, query_states, valid_mask):
+        """Compute raw, full-cache attention only for an enabled observation."""
+        if not self._head_cluster_observation_enabled:
+            raise RuntimeError("Head-cluster observation attention was requested while disabled.")
+
+        bsz, num_key_value_heads, kv_cache_len, _ = key_states.shape
+        if query_states.shape[1] % num_key_value_heads != 0:
+            raise ValueError("Observation requires query heads divisible by key/value heads.")
+        num_key_value_groups = query_states.shape[1] // num_key_value_heads
+        query_window = min(self.window_size, query_states.shape[-2])
+        query_states = query_states[:, :, -query_window:, :]
+
+        attn_weights = compute_attention_scores(query_states, key_states)
+        attention_mask = torch.ones_like(attn_weights) * float("-inf")
+        attention_mask = torch.triu(
+            attention_mask,
+            diagonal=kv_cache_len - query_window + 1,
+        )
+        attn_weights = attn_weights + attention_mask
+        if valid_mask is not None:
+            full_valid = valid_mask[:, :, None, :].expand(
+                bsz,
+                num_key_value_heads,
+                num_key_value_groups,
+                kv_cache_len,
+            )
+            full_valid = full_valid.reshape(bsz, query_states.shape[1], kv_cache_len)
+            attn_weights = attn_weights.masked_fill(
+                ~full_valid[:, :, None, :],
+                torch.finfo(attn_weights.dtype).min,
+            )
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        return attn_weights.view(
+            bsz,
+            num_key_value_heads,
+            num_key_value_groups,
+            query_window,
+            kv_cache_len,
+        ).mean(dim=2).mean(dim=-2)
+
     def _pack_layer(
         self,
         attention,
@@ -284,6 +351,7 @@ class SnapKV:
         hist_len,
         scores,
         layer_cache,
+        observation_raw_attention=None,
     ):
         valid_mask = self._current_valid_mask(layer_cache, key_states)
         batch_size, num_heads, _, head_dim = key_states.shape
@@ -299,6 +367,18 @@ class SnapKV:
                 per_batch.append(cur_indices)
                 lengths[batch_idx, head_idx] = cur_indices.numel()
             keep_indices.append(per_batch)
+
+        if self._head_cluster_observation_enabled:
+            target_cluster = getattr(attention, "kv_cluster", self)
+            target_cluster._record_head_cluster_observation(
+                attention=attention,
+                selected_hist_mask=selected_hist_mask,
+                hist_len=hist_len,
+                valid_mask=valid_mask,
+                lengths=lengths,
+                kv_cache_len=key_states.shape[-2],
+                raw_attention=observation_raw_attention,
+            )
 
         if self.record_kept_token_indices:
             self._record_kept_indices(selected_hist_mask, scores, hist_len, key_states.shape[-2], lengths)
@@ -324,6 +404,54 @@ class SnapKV:
         self._set_layer_cache(layer_cache, packed_keys, packed_values)
         layer_cache.kv_valid_mask = packed_mask
         layer_cache.kv_lengths = lengths
+
+    def _record_head_cluster_observation(
+        self,
+        attention,
+        selected_hist_mask,
+        hist_len,
+        valid_mask,
+        lengths,
+        kv_cache_len,
+        raw_attention,
+    ):
+        if not self._head_cluster_observation_enabled:
+            raise RuntimeError("Head-cluster observation record was requested while disabled.")
+        if raw_attention is None:
+            raise RuntimeError("Head-cluster observation requires raw attention before packing.")
+        if selected_hist_mask.shape[0] != 1:
+            raise ValueError("Head-cluster observation currently supports batch size 1 only.")
+        if raw_attention.shape[-1] != int(kv_cache_len):
+            raise ValueError("Observed raw attention length must match the pre-compression KV cache.")
+
+        history_selected = selected_hist_mask.sum(dim=-1).detach().to(
+            device="cpu",
+            dtype=torch.int32,
+        )
+        recent_retained = valid_mask[:, :, hist_len:].sum(dim=-1).detach().to(
+            device="cpu",
+            dtype=torch.int32,
+        )
+        post_compression = lengths.detach().to(device="cpu", dtype=torch.int32)
+        self._head_cluster_observation_records.append(
+            {
+                "layer_idx": int(getattr(attention, "layer_idx", self.layer_idx)),
+                "method": str(getattr(self.model_config, "method", type(self).__name__)),
+                "pre_compression_kv_cache_len": int(kv_cache_len),
+                "history_len": int(hist_len),
+                "raw_attention": raw_attention.detach()
+                .to(device="cpu", dtype=torch.float32)
+                .squeeze(0)
+                .clone(),
+                "selected_hist_mask": selected_hist_mask.detach()
+                .to(device="cpu", dtype=torch.bool)
+                .squeeze(0)
+                .clone(),
+                "history_selected_token_counts": history_selected.squeeze(0).clone(),
+                "recent_retained_token_counts": recent_retained.squeeze(0).clone(),
+                "post_compression_token_counts": post_compression.squeeze(0).clone(),
+            }
+        )
 
     def _record_kept_indices(self, selected_hist_mask, scores, hist_len, kv_cache_len, lengths):
         batch_size, num_heads = selected_hist_mask.shape[:2]
