@@ -14,6 +14,8 @@ from models.compression.experiments.head_cluster_observation import (
     HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES,
+    TOKEN_SPATIAL_TEMPORAL_HEATMAP_METHODS,
+    TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE,
     HeadClusterObservationConfig,
     compute_head_cluster_observation,
     save_head_cluster_observation,
@@ -64,6 +66,7 @@ class HeadClusterObservationRunWriter:
             "head_cluster_observation_config": {
                 "submode": self.config.submode,
                 "max_prefill_tokens": self.config.max_prefill_tokens,
+                "token_count": self.config.token_count,
             },
             "sample_count": len(self.samples),
             "samples": self.samples,
@@ -99,6 +102,8 @@ class HeadClusterObservationSampleWriter:
             "status": "pending",
             "prompt_text": prompt_text,
             "token_count": len(input_ids),
+            "observation_submode": self.run_writer.config.submode,
+            "observation_token_count": self.run_writer.config.token_count,
             "token_ids": input_ids,
             "tokens": build_token_entries(tokenizer, input_ids),
             "summary_file": None,
@@ -120,6 +125,7 @@ class HeadClusterObservationSampleWriter:
                 result=result,
                 output_dir=self.sample_dir,
                 prefix=artifact_prefix,
+                token_entries=record["tokens"],
             )
             record["status"] = result.summary.get("status", "saved")
             record["summary_file"] = os.path.basename(paths["summary"])
@@ -150,6 +156,8 @@ class HeadClusterObservationSampleWriter:
             "label",
             "status",
             "token_count",
+            "observation_submode",
+            "observation_token_count",
             "compression_method",
             "compression_config",
             "valid_layer_count",
@@ -183,6 +191,7 @@ def build_head_cluster_observation_run_writer(args, out_file):
         config=HeadClusterObservationConfig(
             submode=args.head_cluster_observation_submode,
             max_prefill_tokens=args.head_cluster_observation_max_prefill_tokens,
+            token_count=args.head_cluster_observation_token_count,
         ),
     )
 
@@ -200,15 +209,23 @@ def validate_head_cluster_observation_args(args):
         raise ValueError(
             "--head_cluster_observation_max_prefill_tokens must be at least 1 when provided."
         )
+    if args.head_cluster_observation_token_count < 1:
+        raise ValueError(
+            "--head_cluster_observation_token_count must be at least 1."
+        )
     if not args.head_cluster_observation_mode:
         return
     if not args.compression:
         raise ValueError("--head_cluster_observation_mode requires --compression.")
-    supported_methods = (
-        HEAD_CLUSTER_PCA_METHODS
-        if args.head_cluster_observation_submode == HEAD_CLUSTER_PCA_SUBMODE
-        else SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS
-    )
+    if args.head_cluster_observation_submode == HEAD_CLUSTER_PCA_SUBMODE:
+        supported_methods = HEAD_CLUSTER_PCA_METHODS
+    elif (
+        args.head_cluster_observation_submode
+        == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE
+    ):
+        supported_methods = TOKEN_SPATIAL_TEMPORAL_HEATMAP_METHODS
+    else:
+        supported_methods = SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS
     if args.compression_mode not in supported_methods:
         raise ValueError(
             f"--head_cluster_observation_submode {args.head_cluster_observation_submode!r} "
@@ -239,7 +256,9 @@ def add_head_cluster_observation_args(parser):
             "and attention plots; head_cluster_pca saves cluster partitions and per-KV-head "
             "raw-attention PCA plots; "
             f"{HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE} saves each layer's share of selected "
-            "historical (KV head, token) slots by raw-attention head cluster."
+            "historical (KV head, token) slots by raw-attention head cluster; "
+            f"{TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE} saves per-token query-window "
+            "heatmaps with individual KV/GQA heads grouped by TridentKV cluster."
         ),
     )
     parser.add_argument(
@@ -252,4 +271,13 @@ def add_head_cluster_observation_args(parser):
         type=int,
         default=None,
         help="Skip head-cluster observation capture when the prefill token count exceeds this cap.",
+    )
+    parser.add_argument(
+        "--head_cluster_observation_token_count",
+        type=int,
+        default=8,
+        help=(
+            "Number of diverse historical tokens selected per layer by the "
+            "token_spatial_temporal_heatmap submode."
+        ),
     )

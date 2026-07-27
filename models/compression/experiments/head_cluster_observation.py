@@ -17,14 +17,24 @@ SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS = {
 HEAD_BUDGET_ATTENTION_SUBMODE = "head_budget_attention"
 HEAD_CLUSTER_PCA_SUBMODE = "head_cluster_pca"
 HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE = "head_cluster_token_distribution"
+TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE = "token_spatial_temporal_heatmap"
 HEAD_CLUSTER_PCA_METHODS = {
     "tridentkv_head_cluster",
     "tridentkv",
 }
+TOKEN_SPATIAL_TEMPORAL_HEATMAP_METHODS = {"tridentkv"}
+TOKEN_HEATMAP_SELECTION_REASONS = (
+    "global_sustained_response",
+    "temporal_local_response",
+    "cluster_specific_response",
+    "spatial_temporal_local_response",
+    "isolated_peak_response",
+)
 SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES = {
     HEAD_BUDGET_ATTENTION_SUBMODE,
     HEAD_CLUSTER_PCA_SUBMODE,
     HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE,
+    TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE,
 }
 
 
@@ -32,6 +42,7 @@ SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES = {
 class HeadClusterObservationConfig:
     submode: str = HEAD_BUDGET_ATTENTION_SUBMODE
     max_prefill_tokens: int | None = None
+    token_count: int = 8
 
     def __post_init__(self):
         if self.submode not in SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES:
@@ -40,6 +51,8 @@ class HeadClusterObservationConfig:
             )
         if self.max_prefill_tokens is not None and self.max_prefill_tokens < 1:
             raise ValueError("max_prefill_tokens must be at least 1 when provided.")
+        if self.token_count < 1:
+            raise ValueError("token_count must be at least 1.")
 
 
 @dataclass
@@ -61,6 +74,14 @@ class HeadClusterObservationResult:
     cluster_counts: np.ndarray | None = None
     cluster_selected_token_counts: np.ndarray | None = None
     cluster_selected_token_ratios: np.ndarray | None = None
+    selected_token_indices: np.ndarray | None = None
+    selected_token_ids: np.ndarray | None = None
+    selected_token_reason_ids: np.ndarray | None = None
+    selected_token_metric_scores: np.ndarray | None = None
+    token_heatmaps: np.ndarray | None = None
+    heatmap_row_cluster_ids: np.ndarray | None = None
+    heatmap_row_kv_head_indices: np.ndarray | None = None
+    heatmap_row_gqa_group_indices: np.ndarray | None = None
 
 
 def compute_head_cluster_observation(
@@ -120,6 +141,16 @@ def compute_head_cluster_observation(
             f"{sorted(HEAD_CLUSTER_PCA_METHODS)}, got {method!r}."
         )
         return _empty_result(summary)
+    if (
+        config.submode == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE
+        and method not in TOKEN_SPATIAL_TEMPORAL_HEATMAP_METHODS
+    ):
+        summary["status"] = "error"
+        summary["reason"] = (
+            f"Submode {TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE!r} requires one of "
+            f"{sorted(TOKEN_SPATIAL_TEMPORAL_HEATMAP_METHODS)}, got {method!r}."
+        )
+        return _empty_result(summary)
 
     first_cluster = attentions[0][1].kv_cluster
     summary["compression_config"] = {
@@ -146,7 +177,10 @@ def compute_head_cluster_observation(
         )
     for _, attention in attentions:
         cluster = attention.kv_cluster
-        cluster.enable_head_cluster_observation(config.submode)
+        cluster.enable_head_cluster_observation(
+            config.submode,
+            token_count=config.token_count,
+        )
     try:
         _run_cached_observation_forward(model, inputs)
     except Exception as exc:
@@ -188,7 +222,55 @@ def compute_head_cluster_observation(
         if record is None:
             layer_summary["status"] = "skipped_no_compression"
         else:
-            if config.submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
+            if config.submode == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE:
+                cluster_ids = record["kv_head_cluster_ids"]
+                selected_indices = record["selected_token_indices"]
+                selected_ids = input_ids[0].detach().to(device="cpu").index_select(
+                    0,
+                    selected_indices.to(dtype=torch.long),
+                )
+                selected_tokens = []
+                for selected_pos, token_idx in enumerate(selected_indices.tolist()):
+                    reason_id = int(
+                        record["selected_token_reason_ids"][selected_pos].item()
+                    )
+                    metric_values = record["selected_token_metric_scores"][
+                        selected_pos
+                    ]
+                    selected_tokens.append(
+                        {
+                            "index": int(token_idx),
+                            "id": int(selected_ids[selected_pos].item()),
+                            "selection_reason": TOKEN_HEATMAP_SELECTION_REASONS[
+                                reason_id
+                            ],
+                            "selection_scores": {
+                                metric_name: float(metric_values[metric_idx].item())
+                                for metric_idx, metric_name in enumerate(
+                                    TOKEN_HEATMAP_SELECTION_REASONS
+                                )
+                            },
+                        }
+                    )
+                layer_summary.update(
+                    {
+                        "status": "saved",
+                        "pre_compression_kv_cache_len": record[
+                            "pre_compression_kv_cache_len"
+                        ],
+                        "history_len": record["history_len"],
+                        "query_window_len": record["query_window_len"],
+                        "kv_head_count": int(cluster_ids.numel()),
+                        "gqa_group_count": int(
+                            record["token_heatmaps"].shape[1]
+                            // cluster_ids.numel()
+                        ),
+                        "cluster_count": int(record["cluster_count"]),
+                        "selected_token_count": int(selected_indices.numel()),
+                        "selected_tokens": selected_tokens,
+                    }
+                )
+            elif config.submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
                 cluster_ids = record["kv_head_cluster_ids"]
                 history_counts = record["history_selected_token_counts"]
                 cluster_count = int(record["cluster_count"])
@@ -275,6 +357,12 @@ def compute_head_cluster_observation(
         return _build_head_cluster_pca_result(summary, collected)
     if config.submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
         return _build_head_cluster_token_distribution_result(summary, collected)
+    if config.submode == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE:
+        return _build_token_spatial_temporal_heatmap_result(
+            summary,
+            collected,
+            input_ids[0],
+        )
 
     try:
         layer_indices = np.asarray(
@@ -330,6 +418,133 @@ def compute_head_cluster_observation(
         post_compression_token_counts=post_counts,
         pre_compression_kv_cache_lengths=pre_lengths,
         history_lengths=history_lengths,
+    )
+
+
+def _build_token_spatial_temporal_heatmap_result(
+    summary,
+    collected,
+    input_ids,
+):
+    try:
+        layer_indices = np.asarray(
+            [int(record["layer_idx"]) for record in collected],
+            dtype=np.int16,
+        )
+        group_similarity = _stack_records(
+            collected,
+            "group_similarity",
+            np.float32,
+        )
+        cluster_ids = _stack_records(
+            collected,
+            "kv_head_cluster_ids",
+            np.int16,
+        )
+        selected_indices = _stack_records(
+            collected,
+            "selected_token_indices",
+            np.int32,
+        )
+        selected_reason_ids = _stack_records(
+            collected,
+            "selected_token_reason_ids",
+            np.int16,
+        )
+        selected_metric_scores = _stack_records(
+            collected,
+            "selected_token_metric_scores",
+            np.float32,
+        )
+        token_heatmaps = _stack_records(
+            collected,
+            "token_heatmaps",
+            np.float32,
+        )
+        row_cluster_ids = _stack_records(
+            collected,
+            "heatmap_row_cluster_ids",
+            np.int16,
+        )
+        row_kv_head_indices = _stack_records(
+            collected,
+            "heatmap_row_kv_head_indices",
+            np.int16,
+        )
+        row_gqa_group_indices = _stack_records(
+            collected,
+            "heatmap_row_gqa_group_indices",
+            np.int16,
+        )
+    except ValueError as exc:
+        summary["status"] = "error"
+        summary["reason"] = f"Incompatible observation shapes across layers: {exc}"
+        return _empty_result(summary)
+
+    input_token_ids = input_ids.detach().to(device="cpu", dtype=torch.long).numpy()
+    selected_ids = np.take(input_token_ids, selected_indices).astype(
+        np.int64,
+        copy=False,
+    )
+    cluster_counts = np.asarray(
+        [int(record["cluster_count"]) for record in collected],
+        dtype=np.int16,
+    )
+    pre_lengths = np.asarray(
+        [int(record["pre_compression_kv_cache_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    history_lengths = np.asarray(
+        [int(record["history_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    query_window_lengths = np.asarray(
+        [int(record["query_window_len"]) for record in collected],
+        dtype=np.int16,
+    )
+    summary.update(
+        {
+            "status": "saved",
+            "valid_layer_indices": layer_indices.astype(int).tolist(),
+            "selection_metric_names": list(TOKEN_HEATMAP_SELECTION_REASONS),
+            "selected_token_indices_shape": list(selected_indices.shape),
+            "selected_token_metric_scores_shape": list(
+                selected_metric_scores.shape
+            ),
+            "token_heatmaps_shape": list(token_heatmaps.shape),
+            "heatmap_layout": (
+                "Rows preserve individual KV-head/GQA-group responses and are "
+                "ordered by layer-local head cluster, KV head, then GQA group."
+            ),
+            "heatmap_color_scale": (
+                "Each selected token is saved as a separate image whose color "
+                "range is set independently to that token's finite minimum "
+                "and maximum raw attention values."
+            ),
+        }
+    )
+    return HeadClusterObservationResult(
+        summary=summary,
+        layer_indices=layer_indices,
+        raw_attention=np.asarray([], dtype=np.float32),
+        selected_hist_mask=np.asarray([], dtype=np.bool_),
+        history_selected_token_counts=np.asarray([], dtype=np.int32),
+        recent_retained_token_counts=np.asarray([], dtype=np.int32),
+        post_compression_token_counts=np.asarray([], dtype=np.int32),
+        pre_compression_kv_cache_lengths=pre_lengths,
+        history_lengths=history_lengths,
+        group_similarity=group_similarity,
+        kv_head_cluster_ids=cluster_ids,
+        query_window_lengths=query_window_lengths,
+        cluster_counts=cluster_counts,
+        selected_token_indices=selected_indices,
+        selected_token_ids=selected_ids,
+        selected_token_reason_ids=selected_reason_ids,
+        selected_token_metric_scores=selected_metric_scores,
+        token_heatmaps=token_heatmaps,
+        heatmap_row_cluster_ids=row_cluster_ids,
+        heatmap_row_kv_head_indices=row_kv_head_indices,
+        heatmap_row_gqa_group_indices=row_gqa_group_indices,
     )
 
 
@@ -485,10 +700,12 @@ def save_head_cluster_observation(
     result: HeadClusterObservationResult,
     output_dir: str,
     prefix: str = "head_cluster_observation",
+    token_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, f"{prefix}_summary.json")
     npz_path = os.path.join(output_dir, f"{prefix}.npz")
+    _annotate_selected_tokens(result, token_entries)
     image_paths = plot_head_cluster_observation(result, output_dir, prefix)
     result.summary["image_files"] = {
         name: os.path.basename(path) for name, path in image_paths.items()
@@ -497,7 +714,26 @@ def save_head_cluster_observation(
     with open(summary_path, "w", encoding="utf-8") as fout:
         json.dump(result.summary, fout, ensure_ascii=False, indent=2)
     submode = _result_submode(result)
-    if submode == HEAD_CLUSTER_PCA_SUBMODE:
+    if submode == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE:
+        np.savez_compressed(
+            npz_path,
+            layer_indices=result.layer_indices,
+            group_similarity=result.group_similarity,
+            kv_head_cluster_ids=result.kv_head_cluster_ids,
+            cluster_counts=result.cluster_counts,
+            selected_token_indices=result.selected_token_indices,
+            selected_token_ids=result.selected_token_ids,
+            selected_token_reason_ids=result.selected_token_reason_ids,
+            selected_token_metric_scores=result.selected_token_metric_scores,
+            token_heatmaps=result.token_heatmaps,
+            heatmap_row_cluster_ids=result.heatmap_row_cluster_ids,
+            heatmap_row_kv_head_indices=result.heatmap_row_kv_head_indices,
+            heatmap_row_gqa_group_indices=result.heatmap_row_gqa_group_indices,
+            pre_compression_kv_cache_lengths=result.pre_compression_kv_cache_lengths,
+            history_lengths=result.history_lengths,
+            query_window_lengths=result.query_window_lengths,
+        )
+    elif submode == HEAD_CLUSTER_PCA_SUBMODE:
         np.savez_compressed(
             npz_path,
             layer_indices=result.layer_indices,
@@ -537,6 +773,26 @@ def save_head_cluster_observation(
     return {"summary": summary_path, "npz": npz_path, "images": image_paths}
 
 
+def _annotate_selected_tokens(result, token_entries):
+    if (
+        _result_submode(result) != TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE
+        or not token_entries
+    ):
+        return
+    entries_by_index = {
+        int(entry["index"]): entry
+        for entry in token_entries
+        if entry.get("index") is not None
+    }
+    for layer in result.summary.get("layers", []):
+        for selected in layer.get("selected_tokens", []):
+            entry = entries_by_index.get(int(selected["index"]))
+            if entry is None:
+                continue
+            selected["piece"] = entry.get("piece")
+            selected["text"] = entry.get("text")
+
+
 def _result_submode(result):
     return result.summary.get("config", {}).get(
         "submode",
@@ -559,6 +815,13 @@ def plot_head_cluster_observation(
     import matplotlib.pyplot as plt
 
     submode = _result_submode(result)
+    if submode == TOKEN_SPATIAL_TEMPORAL_HEATMAP_SUBMODE:
+        return _plot_token_spatial_temporal_heatmaps(
+            result,
+            output_dir,
+            prefix,
+            plt,
+        )
     if submode == HEAD_CLUSTER_PCA_SUBMODE:
         return _plot_head_cluster_pca_observation(result, output_dir, prefix, plt)
     if submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
@@ -594,6 +857,190 @@ def plot_head_cluster_observation(
             plt,
         )
         image_paths[attention_key] = attention_path
+    return image_paths
+
+
+def _plot_token_spatial_temporal_heatmaps(
+    result,
+    output_dir,
+    prefix,
+    plt,
+):
+    required = {
+        "selected_token_indices": result.selected_token_indices,
+        "selected_token_ids": result.selected_token_ids,
+        "selected_token_reason_ids": result.selected_token_reason_ids,
+        "token_heatmaps": result.token_heatmaps,
+        "heatmap_row_cluster_ids": result.heatmap_row_cluster_ids,
+        "heatmap_row_kv_head_indices": result.heatmap_row_kv_head_indices,
+        "heatmap_row_gqa_group_indices": result.heatmap_row_gqa_group_indices,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "token_spatial_temporal_heatmap result is missing required arrays: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    heatmaps = np.asarray(result.token_heatmaps, dtype=np.float32)
+    layer_count = int(result.layer_indices.size)
+    if heatmaps.ndim != 4 or heatmaps.shape[0] != layer_count:
+        raise ValueError(
+            "token_heatmaps must have shape [layer, token, head row, query]."
+        )
+    image_paths = {}
+    layer_summaries = {
+        int(layer["layer_idx"]): layer
+        for layer in result.summary.get("layers", [])
+        if layer.get("status") == "saved"
+    }
+    for layer_pos, layer_idx_value in enumerate(result.layer_indices):
+        layer_idx = int(layer_idx_value)
+        layer_maps = heatmaps[layer_pos]
+        token_count, row_count, query_count = layer_maps.shape
+        if token_count < 1:
+            continue
+        row_clusters = np.asarray(
+            result.heatmap_row_cluster_ids[layer_pos],
+            dtype=np.int16,
+        )
+        row_kv_heads = np.asarray(
+            result.heatmap_row_kv_head_indices[layer_pos],
+            dtype=np.int16,
+        )
+        row_groups = np.asarray(
+            result.heatmap_row_gqa_group_indices[layer_pos],
+            dtype=np.int16,
+        )
+        if not (
+            row_clusters.shape
+            == row_kv_heads.shape
+            == row_groups.shape
+            == (row_count,)
+        ):
+            raise ValueError("Token heatmap row metadata must match its head rows.")
+
+        selected_summary = layer_summaries.get(layer_idx, {}).get(
+            "selected_tokens",
+            [],
+        )
+        boundaries = np.flatnonzero(np.diff(row_clusters)) + 0.5
+        starts = np.r_[0, np.flatnonzero(np.diff(row_clusters)) + 1]
+        ends = np.r_[starts[1:], row_count]
+        for token_pos in range(token_count):
+            token_map = layer_maps[token_pos]
+            vmin = float(np.nanmin(token_map))
+            vmax = float(np.nanmax(token_map))
+            if not np.isfinite(vmin):
+                vmin = 0.0
+            if not np.isfinite(vmax):
+                vmax = vmin + 1.0
+            if vmax <= vmin:
+                vmax = vmin + max(abs(vmin) * 1e-6, 1e-12)
+
+            fig_height = max(5.2, row_count * 0.16 + 2.8)
+            fig, ax = plt.subplots(
+                figsize=(8.2, fig_height),
+                dpi=180,
+            )
+            image = ax.imshow(
+                token_map,
+                cmap="magma",
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+                aspect="auto",
+            )
+            for boundary in boundaries:
+                ax.axhline(boundary, color="white", linewidth=1.0)
+            for start, end in zip(starts, ends):
+                midpoint = (float(start) + float(end) - 1.0) / 2.0
+                ax.text(
+                    -0.03,
+                    midpoint,
+                    f"C{int(row_clusters[start])}",
+                    transform=ax.get_yaxis_transform(),
+                    ha="right",
+                    va="center",
+                    fontsize=7,
+                    fontweight="bold",
+                    clip_on=False,
+                )
+
+            query_positions = np.arange(query_count)
+            ax.set_xticks(query_positions)
+            ax.set_xticklabels(
+                [str(value) for value in range(-query_count + 1, 1)],
+                fontsize=7,
+            )
+            ax.set_xlabel("Query-window relative position", fontsize=8)
+            ax.set_yticks(np.arange(row_count))
+            ax.set_yticklabels(
+                [
+                    f"KV{int(kv_head)}/G{int(group)}"
+                    for kv_head, group in zip(row_kv_heads, row_groups)
+                ],
+                fontsize=5.5,
+            )
+            ax.set_ylabel("Heads grouped by cluster", fontsize=8)
+
+            token_idx = int(result.selected_token_indices[layer_pos, token_pos])
+            token_id = int(result.selected_token_ids[layer_pos, token_pos])
+            reason_id = int(
+                result.selected_token_reason_ids[layer_pos, token_pos]
+            )
+            reason = TOKEN_HEATMAP_SELECTION_REASONS[reason_id]
+            token_text = None
+            if token_pos < len(selected_summary):
+                token_text = selected_summary[token_pos].get("text")
+                if token_text is None:
+                    token_text = selected_summary[token_pos].get("piece")
+            token_text = "" if token_text is None else str(token_text)
+            token_text = token_text.replace("\n", "\\n")
+            if len(token_text) > 32:
+                token_text = f"{token_text[:29]}..."
+            text_suffix = f" {token_text!r}" if token_text else ""
+            ax.set_title(
+                f"TridentKV token response — layer {layer_idx}\n"
+                f"token {token_idx} · id {token_id}{text_suffix} · {reason}",
+                fontsize=10,
+            )
+            colorbar = fig.colorbar(
+                image,
+                ax=ax,
+                fraction=0.046,
+                pad=0.04,
+            )
+            colorbar.set_label("Raw attention probability")
+            ax.text(
+                0.5,
+                -0.16,
+                (
+                    "Rows preserve individual KV/GQA heads; white lines "
+                    "delimit clusters"
+                ),
+                transform=ax.transAxes,
+                ha="center",
+                va="top",
+                fontsize=8,
+            )
+            fig.subplots_adjust(
+                left=0.19,
+                right=0.88,
+                top=0.88,
+                bottom=0.19,
+            )
+            image_key = (
+                f"token_spatial_temporal_heatmap_layer_{layer_idx:03d}"
+                f"_token_{token_idx:06d}"
+            )
+            image_path = os.path.join(
+                output_dir,
+                f"{prefix}_{image_key}.png",
+            )
+            fig.savefig(image_path)
+            plt.close(fig)
+            image_paths[image_key] = image_path
     return image_paths
 
 
@@ -1097,4 +1544,12 @@ def _empty_result(summary):
         cluster_counts=np.asarray([], dtype=np.int16),
         cluster_selected_token_counts=np.asarray([], dtype=np.int32),
         cluster_selected_token_ratios=np.asarray([], dtype=np.float32),
+        selected_token_indices=np.asarray([], dtype=np.int32),
+        selected_token_ids=np.asarray([], dtype=np.int64),
+        selected_token_reason_ids=np.asarray([], dtype=np.int16),
+        selected_token_metric_scores=np.asarray([], dtype=np.float32),
+        token_heatmaps=np.asarray([], dtype=np.float32),
+        heatmap_row_cluster_ids=np.asarray([], dtype=np.int16),
+        heatmap_row_kv_head_indices=np.asarray([], dtype=np.int16),
+        heatmap_row_gqa_group_indices=np.asarray([], dtype=np.int16),
     )

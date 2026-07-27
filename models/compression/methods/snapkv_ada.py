@@ -44,18 +44,25 @@ class SnapKV:
         # fields stay disabled/empty and no additional attention is computed.
         self._head_cluster_observation_enabled = False
         self._head_cluster_observation_submode = None
+        self._head_cluster_observation_token_count = None
         self._head_cluster_observation_records = []
         self._pending_head_cluster_token_distribution_observation = None
 
-    def enable_head_cluster_observation(self, submode="head_budget_attention"):
+    def enable_head_cluster_observation(
+        self,
+        submode="head_budget_attention",
+        token_count=8,
+    ):
         self._head_cluster_observation_enabled = True
         self._head_cluster_observation_submode = str(submode)
+        self._head_cluster_observation_token_count = int(token_count)
         self._head_cluster_observation_records = []
         self._clear_pending_head_cluster_observation()
 
     def disable_head_cluster_observation(self):
         self._head_cluster_observation_enabled = False
         self._head_cluster_observation_submode = None
+        self._head_cluster_observation_token_count = None
 
     def clear_head_cluster_observation_records(self):
         self._head_cluster_observation_records = []
@@ -71,6 +78,11 @@ class SnapKV:
     def _consume_head_cluster_pca_observation(self):
         raise RuntimeError(
             "head_cluster_pca observation requires a compression method with head clusters."
+        )
+
+    def _consume_token_spatial_temporal_heatmap_observation(self):
+        raise RuntimeError(
+            "token_spatial_temporal_heatmap observation requires the tridentkv method."
         )
 
     def _observes_head_budget_attention(self):
@@ -570,6 +582,36 @@ class SnapKV:
                     "cluster_selected_token_count_total": selected_total,
                     "cluster_selected_token_counts": cluster_selected,
                     "cluster_selected_token_ratios": cluster_ratios,
+                    **method_record,
+                }
+            )
+            return
+
+        if (
+            self._head_cluster_observation_submode
+            == "token_spatial_temporal_heatmap"
+        ):
+            method_record = (
+                self._consume_token_spatial_temporal_heatmap_observation()
+            )
+            if int(method_record["history_len"]) != int(hist_len):
+                raise ValueError(
+                    "Observed token heatmap history length must match "
+                    "compression history."
+                )
+            self._head_cluster_observation_records.append(
+                {
+                    "layer_idx": int(
+                        getattr(attention, "layer_idx", self.layer_idx)
+                    ),
+                    "method": str(
+                        getattr(
+                            self.model_config,
+                            "method",
+                            type(self).__name__,
+                        )
+                    ),
+                    "pre_compression_kv_cache_len": int(kv_cache_len),
                     **method_record,
                 }
             )

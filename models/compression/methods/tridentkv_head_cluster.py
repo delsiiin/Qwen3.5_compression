@@ -310,6 +310,7 @@ class TridentKVHeadCluster(SnapKVAda):
         self._tridentkv_head_clusterer = TridentKVHeadClusterer(self.window_size)
         self._tridentkv_head_cluster_result = None
         self._pending_head_cluster_pca_observation = None
+        self._pending_token_spatial_temporal_heatmap_observation = None
 
     def _compute_attn_cache(self, key_states, query_states, valid_mask=None):
         if (
@@ -381,9 +382,20 @@ class TridentKVHeadCluster(SnapKVAda):
             )
         return record
 
+    def _consume_token_spatial_temporal_heatmap_observation(self):
+        record = self._pending_token_spatial_temporal_heatmap_observation
+        self._pending_token_spatial_temporal_heatmap_observation = None
+        if record is None:
+            raise RuntimeError(
+                "token_spatial_temporal_heatmap observation requires data "
+                "from the real TridentKV scoring path."
+            )
+        return record
+
     def _clear_pending_head_cluster_observation(self):
         super()._clear_pending_head_cluster_observation()
         self._pending_head_cluster_pca_observation = None
+        self._pending_token_spatial_temporal_heatmap_observation = None
 
     def _select_layer_head_topk(self, key_states, scores, valid_mask):
         batch_size, num_heads = key_states.shape[:2]

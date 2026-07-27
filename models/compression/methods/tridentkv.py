@@ -1,7 +1,195 @@
 import torch
 import torch.nn.functional as F
 
-from .tridentkv_head_cluster import TridentKVHeadCluster
+from .tridentkv_head_cluster import (
+    TridentKVHeadCluster,
+    build_kv_head_cluster_ids,
+)
+
+
+TOKEN_HEATMAP_SELECTION_REASONS = (
+    "global_sustained_response",
+    "temporal_local_response",
+    "cluster_specific_response",
+    "spatial_temporal_local_response",
+    "isolated_peak_response",
+)
+
+
+def build_token_spatial_temporal_heatmap_observation(
+    raw_head_attention,
+    result,
+    token_count,
+    head_kernel,
+):
+    """Select diverse history tokens and retain their unaggregated head maps."""
+    if raw_head_attention.ndim != 4:
+        raise ValueError(
+            "Token heatmap attention must have shape "
+            "[KV head, GQA group, query window, history]."
+        )
+    kv_head_count, group_count, query_window_len, history_len = (
+        raw_head_attention.shape
+    )
+    if min(kv_head_count, group_count, query_window_len, history_len) < 1:
+        raise ValueError("Token heatmap observation requires non-empty dimensions.")
+    token_count = min(max(int(token_count), 1), int(history_len))
+
+    cluster_ids = build_kv_head_cluster_ids(
+        result.clusters,
+        kv_head_count,
+        device=raw_head_attention.device,
+    )
+    kv_indices = torch.arange(
+        kv_head_count,
+        dtype=torch.long,
+        device=raw_head_attention.device,
+    )
+    kv_order = torch.argsort(
+        cluster_ids.to(dtype=torch.long) * kv_head_count + kv_indices
+    )
+    ordered_attention = raw_head_attention.index_select(0, kv_order)
+    # One row remains one concrete KV-head/GQA-group pair. Only the row order
+    # changes so cluster boundaries can be shown without hiding head variance.
+    heatmaps = (
+        ordered_attention.permute(3, 0, 1, 2)
+        .reshape(history_len, kv_head_count * group_count, query_window_len)
+        .to(dtype=torch.float32)
+    )
+    ordered_cluster_ids = cluster_ids.index_select(0, kv_order)
+    row_cluster_ids = ordered_cluster_ids.repeat_interleave(group_count)
+    row_kv_head_indices = kv_order.repeat_interleave(group_count)
+    row_gqa_group_indices = torch.arange(
+        group_count,
+        dtype=torch.long,
+        device=raw_head_attention.device,
+    ).repeat(kv_head_count)
+
+    global_scores = heatmaps.mean(dim=(1, 2))
+    temporal_scores = heatmaps.mean(dim=1).amax(dim=1) - global_scores
+
+    cluster_scores = heatmaps.new_zeros(history_len)
+    for cluster_id in torch.unique(row_cluster_ids, sorted=True):
+        cluster_map = heatmaps[:, row_cluster_ids == cluster_id, :]
+        cluster_scores = torch.maximum(
+            cluster_scores,
+            cluster_map.mean(dim=(1, 2)),
+        )
+    cluster_scores = cluster_scores - global_scores
+
+    local_scores = heatmaps.new_zeros(history_len)
+    for cluster_id in torch.unique(row_cluster_ids, sorted=True):
+        cluster_map = heatmaps[:, row_cluster_ids == cluster_id, :]
+        local_kernel_rows = min(
+            max(int(head_kernel), 1),
+            cluster_map.shape[1],
+        )
+        local_kernel_query = min(
+            max(int(head_kernel), 1),
+            cluster_map.shape[2],
+        )
+        local_averages = F.avg_pool2d(
+            cluster_map.unsqueeze(1),
+            kernel_size=(local_kernel_rows, local_kernel_query),
+            stride=1,
+        )
+        local_scores = torch.maximum(
+            local_scores,
+            local_averages.flatten(1).amax(dim=1),
+        )
+    spatial_temporal_scores = local_scores - global_scores
+    isolated_peak_scores = heatmaps.flatten(1).amax(dim=1) - local_scores
+
+    metric_scores = torch.stack(
+        (
+            global_scores,
+            temporal_scores,
+            cluster_scores,
+            spatial_temporal_scores,
+            isolated_peak_scores,
+        ),
+        dim=1,
+    )
+    ranked_indices = [
+        torch.argsort(
+            metric_scores[:, metric_idx],
+            descending=True,
+            stable=True,
+        )
+        .detach()
+        .cpu()
+        .tolist()
+        for metric_idx in range(metric_scores.shape[1])
+    ]
+
+    selected_indices = []
+    selected_reason_ids = []
+    cursors = [0] * len(ranked_indices)
+    selected_set = set()
+    while len(selected_indices) < token_count:
+        made_progress = False
+        for reason_id, ranking in enumerate(ranked_indices):
+            while (
+                cursors[reason_id] < len(ranking)
+                and ranking[cursors[reason_id]] in selected_set
+            ):
+                cursors[reason_id] += 1
+            if cursors[reason_id] >= len(ranking):
+                continue
+            token_idx = int(ranking[cursors[reason_id]])
+            cursors[reason_id] += 1
+            selected_set.add(token_idx)
+            selected_indices.append(token_idx)
+            selected_reason_ids.append(reason_id)
+            made_progress = True
+            if len(selected_indices) >= token_count:
+                break
+        if not made_progress:
+            break
+
+    selected_index = torch.tensor(
+        selected_indices,
+        dtype=torch.long,
+        device=raw_head_attention.device,
+    )
+    selected_reason_ids_tensor = torch.tensor(
+        selected_reason_ids,
+        dtype=torch.int16,
+        device=raw_head_attention.device,
+    )
+    return {
+        "history_len": int(history_len),
+        "query_window_len": int(query_window_len),
+        "cluster_count": int(torch.unique(cluster_ids).numel()),
+        "group_similarity": result.group_similarity.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clone(),
+        "kv_head_cluster_ids": cluster_ids.detach().to(device="cpu").clone(),
+        "selected_token_indices": selected_index.detach().to(device="cpu").clone(),
+        "selected_token_reason_ids": selected_reason_ids_tensor.detach()
+        .to(device="cpu")
+        .clone(),
+        "selected_token_metric_scores": metric_scores.index_select(
+            0,
+            selected_index,
+        )
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clone(),
+        "token_heatmaps": heatmaps.index_select(0, selected_index)
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clone(),
+        "heatmap_row_cluster_ids": row_cluster_ids.detach()
+        .to(device="cpu")
+        .clone(),
+        "heatmap_row_kv_head_indices": row_kv_head_indices.detach()
+        .to(device="cpu", dtype=torch.int16)
+        .clone(),
+        "heatmap_row_gqa_group_indices": row_gqa_group_indices.detach()
+        .to(device="cpu", dtype=torch.int16)
+        .clone(),
+    }
 
 
 class TridentKV(TridentKVHeadCluster):
@@ -180,6 +368,19 @@ class TridentKV(TridentKVHeadCluster):
             and self._head_cluster_observation_submode == "head_cluster_pca"
         ):
             self._capture_head_cluster_pca_observation(raw_head_attention, result)
+        if (
+            self._head_cluster_observation_enabled
+            and self._head_cluster_observation_submode
+            == "token_spatial_temporal_heatmap"
+        ):
+            self._pending_token_spatial_temporal_heatmap_observation = (
+                build_token_spatial_temporal_heatmap_observation(
+                    raw_head_attention=raw_head_attention,
+                    result=result,
+                    token_count=self._head_cluster_observation_token_count,
+                    head_kernel=self.head_kernel,
+                )
+            )
 
         (
             num_key_value_heads,
