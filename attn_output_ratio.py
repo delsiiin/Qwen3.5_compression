@@ -395,7 +395,7 @@ def build_layer_stats(
 
 
 def setup_matplotlib_cache():
-    cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "qwen35_compression_matplotlib_cache")
+    cache_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "compression_matplotlib_cache")
     os.makedirs(cache_dir, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(cache_dir, "matplotlib"))
     os.environ.setdefault("XDG_CACHE_HOME", cache_dir)

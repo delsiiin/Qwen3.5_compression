@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-CACHE_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "qwen35_compression_matplotlib_cache"
+CACHE_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "compression_matplotlib_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(CACHE_DIR / "matplotlib"))
 os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_DIR))

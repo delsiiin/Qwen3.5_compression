@@ -11,7 +11,6 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 
-from attn_heatmap import is_qwen_attn_heatmap_model
 from misc import load_json, select_unprocessed
 from query_window_similarity import (
     SIMILARITY_STATE_HIDDEN,
@@ -388,8 +387,6 @@ def validate_args(args):
             f"{sorted(SUPPORTED_SIMILARITY_STATES)}."
         )
     if args.attn_heatmap_mode:
-        if not is_qwen_attn_heatmap_model(args.model):
-            raise ValueError("--attn_heatmap_mode currently supports only qwen3.5-* models in this repository.")
         if args.n_proc != 1:
             raise ValueError("--attn_heatmap_mode currently requires --n_proc 1.")
     if args.query_window_similarity_mode and args.n_proc != 1:

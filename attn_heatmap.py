@@ -8,10 +8,6 @@ import numpy as np
 import torch
 
 
-def is_qwen_attn_heatmap_model(model_name):
-    return "qwen3.5" in model_name.lower()
-
-
 def get_text_config(model):
     return getattr(model.config, "text_config", model.config)
 

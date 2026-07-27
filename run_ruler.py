@@ -43,7 +43,6 @@ model2maxlen = {
     "gemma": 7950,
     "qwen3": 127000,
     "qwen3moe": 127000,
-    "qwen3.5": 200000,
 }
 
 
@@ -53,7 +52,6 @@ SUPPORTED_COMPRESSION_MODEL_FAMILIES = {
     "qwen2.5",
     "qwen3",
     "qwen3moe",
-    "qwen3.5",
 }
 
 def set_seed(seed):
@@ -113,13 +111,11 @@ def build_compression_config(
 
 def get_model_family(model_path):
     model_path_lower = model_path.lower()
-    if "qwen3.5" in model_path_lower or "qwen3_5" in model_path_lower:
-        return "qwen3.5"
     if "qwen3moe" in model_path_lower or "qwen3-moe" in model_path_lower or "qwen3_moe" in model_path_lower:
         return "qwen3moe"
     if "qwen3" in model_path_lower and re.search(r"[-_]a\d+b", model_path_lower):
         return "qwen3moe"
-    if "qwen3" in model_path_lower:
+    if re.search(r"qwen3(?:[-_]|$)", model_path_lower):
         return "qwen3"
     if "llama" in model_path_lower:
         return "llama"
@@ -164,7 +160,7 @@ def apply_compression_setup(model, tokenizer, compression_mode):
 
 
 def apply_compression_monkeypatch(model_family, compression_config):
-    from models.compression.monkeypatch import replace_qwen3_5, replace_qwen3, replace_qwen3moe, replace_qwen2_5, replace_llama, replace_mistral
+    from models.compression.monkeypatch import replace_qwen3, replace_qwen3moe, replace_qwen2_5, replace_llama, replace_mistral
 
     if model_family == "llama":
         replace_llama(compression_config)
@@ -176,8 +172,6 @@ def apply_compression_monkeypatch(model_family, compression_config):
         replace_qwen3(compression_config)
     elif model_family == "qwen3moe":
         replace_qwen3moe(compression_config)
-    elif model_family == "qwen3.5":
-        replace_qwen3_5(compression_config)
     else:
         raise ValueError(
             f"Compression supports {sorted(SUPPORTED_COMPRESSION_MODEL_FAMILIES)}, got: {model_family}"
@@ -220,17 +214,6 @@ def load_local_model(model_family, model_path, model_kwargs):
         config = Qwen3MoeConfig.from_pretrained(model_path)
         return Qwen3MoeForCausalLM.from_pretrained(model_path, config=config, **model_kwargs)
 
-    if model_family == "qwen3.5":
-        from models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-        from models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
-
-        config = Qwen3_5Config.from_pretrained(model_path)
-        return Qwen3_5ForConditionalGeneration.from_pretrained(
-            model_path,
-            config=config,
-            **model_kwargs,
-        )
-
     return AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
 
 
@@ -261,7 +244,7 @@ def load_model_and_tokenizer(args):
             raise ValueError("Please provide --compression_mode when --compression is enabled.")
         if model_family not in SUPPORTED_COMPRESSION_MODEL_FAMILIES:
             raise ValueError(
-                "Compression currently supports llama, mistral, qwen2.5, qwen3, qwen3moe, and qwen3.5 "
+                "Compression currently supports llama, mistral, qwen2.5, qwen3, and qwen3moe "
                 f"models, got: {args.model_path}"
             )
 

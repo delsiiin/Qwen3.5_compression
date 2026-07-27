@@ -22,9 +22,4 @@ def replace_qwen3moe(*args, **kwargs):
     return _replace_qwen3moe(*args, **kwargs)
 
 
-def replace_qwen3_5(*args, **kwargs):
-    from .monkeypatch import replace_qwen3_5 as _replace_qwen3_5
-
-    return _replace_qwen3_5(*args, **kwargs)
-
-__all__ = ["replace_llama", "replace_qwen3", "replace_qwen3moe", "replace_qwen3_5"]
+__all__ = ["replace_llama", "replace_qwen3", "replace_qwen3moe"]
