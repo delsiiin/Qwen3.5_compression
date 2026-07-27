@@ -10,6 +10,7 @@ import torch
 
 SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS = {
     "snapkv_ada",
+    "tridentkv_spatial_temporal_ada",
     "tridentkv_head_cluster",
     "tridentkv",
 }
