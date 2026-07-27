@@ -5,6 +5,9 @@ from .snapkv_ada import SnapKV as SnapKVAda
 from .tridentkv import TridentKV
 from .tridentkv_head_cluster import TridentKVHeadCluster
 from .tridentkv_spatial_temporal import TridentKVSpatialTemporal
+from .tridentkv_spatial_temporal_ada import (
+    TridentKVSpatialTemporal as TridentKVSpatialTemporalAda,
+)
 from .streamingllm import StreamingLLM
 from .h2o import H2O
 from .criticalkv import CriticalKV
@@ -17,6 +20,7 @@ __all__ = [
     "TridentKV",
     "TridentKVHeadCluster",
     "TridentKVSpatialTemporal",
+    "TridentKVSpatialTemporalAda",
     "StreamingLLM",
     "H2O",
     "CriticalKV",
