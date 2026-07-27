@@ -382,6 +382,7 @@ class TridentKVHeadCluster(SnapKVAda):
         return record
 
     def _clear_pending_head_cluster_observation(self):
+        super()._clear_pending_head_cluster_observation()
         self._pending_head_cluster_pca_observation = None
 
     def _select_layer_head_topk(self, key_states, scores, valid_mask):

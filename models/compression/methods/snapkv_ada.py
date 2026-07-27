@@ -45,6 +45,7 @@ class SnapKV:
         self._head_cluster_observation_enabled = False
         self._head_cluster_observation_submode = None
         self._head_cluster_observation_records = []
+        self._pending_head_cluster_token_distribution_observation = None
 
     def enable_head_cluster_observation(self, submode="head_budget_attention"):
         self._head_cluster_observation_enabled = True
@@ -65,6 +66,7 @@ class SnapKV:
 
     def _clear_pending_head_cluster_observation(self):
         """Clear method-specific observation data without affecting normal compression."""
+        self._pending_head_cluster_token_distribution_observation = None
 
     def _consume_head_cluster_pca_observation(self):
         raise RuntimeError(
@@ -76,6 +78,63 @@ class SnapKV:
             self._head_cluster_observation_enabled
             and self._head_cluster_observation_submode == "head_budget_attention"
         )
+
+    def _observes_head_cluster_token_distribution(self):
+        return (
+            self._head_cluster_observation_enabled
+            and self._head_cluster_observation_submode
+            == "head_cluster_token_distribution"
+        )
+
+    def _capture_head_cluster_token_distribution_observation(
+        self,
+        key_states,
+        query_states,
+        valid_mask,
+        result=None,
+    ):
+        if not self._observes_head_cluster_token_distribution():
+            return
+
+        from .tridentkv_head_cluster import (
+            TridentKVHeadClusterer,
+            build_kv_head_cluster_ids,
+        )
+
+        query_window_len = min(self.window_size, query_states.shape[-2])
+        if result is None:
+            clusterer = TridentKVHeadClusterer(self.window_size)
+            raw_head_attention = clusterer._build_raw_head_attention(
+                key_states,
+                query_states,
+                valid_mask,
+            )
+            result = clusterer.build_from_raw_head_attention(raw_head_attention)
+            query_window_len = int(raw_head_attention.shape[-2])
+
+        cluster_ids = build_kv_head_cluster_ids(
+            result.clusters,
+            key_states.shape[1],
+            device=result.group_similarity.device,
+        )
+        self._pending_head_cluster_token_distribution_observation = {
+            "history_len": int(result.hist_len),
+            "query_window_len": int(query_window_len),
+            "group_similarity": result.group_similarity.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .clone(),
+            "kv_head_cluster_ids": cluster_ids.detach().to(device="cpu").clone(),
+        }
+
+    def _consume_head_cluster_token_distribution_observation(self):
+        record = self._pending_head_cluster_token_distribution_observation
+        self._pending_head_cluster_token_distribution_observation = None
+        if record is None:
+            raise RuntimeError(
+                "head_cluster_token_distribution observation requires a raw-attention "
+                "head-cluster result."
+            )
+        return record
 
     def update_kv(
         self,
@@ -216,6 +275,13 @@ class SnapKV:
             query_cache,
             valid_mask,
         )
+        if self._observes_head_cluster_token_distribution():
+            self._capture_head_cluster_token_distribution_observation(
+                key_states,
+                query_cache,
+                valid_mask,
+                result=getattr(self, "_tridentkv_head_cluster_result", None),
+            )
         selected_hist_mask, hist_len = self._select_layer_head_topk(
             key_states,
             attn_cache,
@@ -438,6 +504,76 @@ class SnapKV:
             raise RuntimeError("Head-cluster observation record was requested while disabled.")
         if selected_hist_mask.shape[0] != 1:
             raise ValueError("Head-cluster observation currently supports batch size 1 only.")
+
+        if (
+            self._head_cluster_observation_submode
+            == "head_cluster_token_distribution"
+        ):
+            method_record = (
+                self._consume_head_cluster_token_distribution_observation()
+            )
+            if int(method_record["history_len"]) != int(hist_len):
+                raise ValueError(
+                    "Observed head-cluster token-distribution history length must "
+                    "match compression history."
+                )
+
+            history_selected = selected_hist_mask.sum(dim=-1).detach().to(
+                device="cpu",
+                dtype=torch.int32,
+            ).squeeze(0)
+            cluster_ids = method_record["kv_head_cluster_ids"]
+            if cluster_ids.shape != history_selected.shape:
+                raise ValueError(
+                    "Observed KV-head cluster ids must match selected history counts."
+                )
+            unique_cluster_ids = torch.unique(cluster_ids, sorted=True)
+            expected_cluster_ids = torch.arange(
+                unique_cluster_ids.numel(),
+                dtype=unique_cluster_ids.dtype,
+            )
+            if not torch.equal(unique_cluster_ids, expected_cluster_ids):
+                raise ValueError(
+                    "Observed KV-head cluster ids must be contiguous and start at zero."
+                )
+
+            cluster_selected = torch.zeros(
+                history_selected.numel(),
+                dtype=torch.int32,
+            )
+            for cluster_id in unique_cluster_ids.tolist():
+                cluster_selected[int(cluster_id)] = history_selected[
+                    cluster_ids == int(cluster_id)
+                ].sum()
+            cluster_count = int(unique_cluster_ids.numel())
+            selected_total = int(cluster_selected[:cluster_count].sum().item())
+            cluster_ratios = torch.zeros(
+                history_selected.numel(),
+                dtype=torch.float32,
+            )
+            if selected_total > 0:
+                cluster_ratios[:cluster_count] = (
+                    cluster_selected[:cluster_count].to(dtype=torch.float32)
+                    / float(selected_total)
+                )
+
+            self._head_cluster_observation_records.append(
+                {
+                    "layer_idx": int(getattr(attention, "layer_idx", self.layer_idx)),
+                    "method": str(
+                        getattr(self.model_config, "method", type(self).__name__)
+                    ),
+                    "pre_compression_kv_cache_len": int(kv_cache_len),
+                    "history_len": int(hist_len),
+                    "history_selected_token_counts": history_selected.clone(),
+                    "cluster_count": cluster_count,
+                    "cluster_selected_token_count_total": selected_total,
+                    "cluster_selected_token_counts": cluster_selected,
+                    "cluster_selected_token_ratios": cluster_ratios,
+                    **method_record,
+                }
+            )
+            return
 
         if self._head_cluster_observation_submode == "head_cluster_pca":
             method_record = self._consume_head_cluster_pca_observation()

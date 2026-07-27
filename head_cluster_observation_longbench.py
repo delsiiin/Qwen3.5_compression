@@ -11,6 +11,7 @@ from models.compression.experiments.head_cluster_observation import (
     HEAD_BUDGET_ATTENTION_SUBMODE,
     HEAD_CLUSTER_PCA_METHODS,
     HEAD_CLUSTER_PCA_SUBMODE,
+    HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS,
     SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES,
     HeadClusterObservationConfig,
@@ -224,7 +225,8 @@ def add_head_cluster_observation_args(parser):
         action="store_true",
         help=(
             "Run an isolated cached prefill with the active compression method and save real "
-            "per-layer KV-head budget/raw-attention or head-cluster/PCA artifacts."
+            "per-layer KV-head budget/raw-attention, head-cluster/PCA, or cluster token-allocation "
+            "artifacts."
         ),
     )
     parser.add_argument(
@@ -235,7 +237,9 @@ def add_head_cluster_observation_args(parser):
         help=(
             "Head-cluster observation experiment: head_budget_attention saves existing budget "
             "and attention plots; head_cluster_pca saves cluster partitions and per-KV-head "
-            "raw-attention PCA plots."
+            "raw-attention PCA plots; "
+            f"{HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE} saves each layer's share of selected "
+            "historical (KV head, token) slots by raw-attention head cluster."
         ),
     )
     parser.add_argument(

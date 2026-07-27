@@ -16,6 +16,7 @@ SUPPORTED_HEAD_CLUSTER_OBSERVATION_METHODS = {
 }
 HEAD_BUDGET_ATTENTION_SUBMODE = "head_budget_attention"
 HEAD_CLUSTER_PCA_SUBMODE = "head_cluster_pca"
+HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE = "head_cluster_token_distribution"
 HEAD_CLUSTER_PCA_METHODS = {
     "tridentkv_head_cluster",
     "tridentkv",
@@ -23,6 +24,7 @@ HEAD_CLUSTER_PCA_METHODS = {
 SUPPORTED_HEAD_CLUSTER_OBSERVATION_SUBMODES = {
     HEAD_BUDGET_ATTENTION_SUBMODE,
     HEAD_CLUSTER_PCA_SUBMODE,
+    HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE,
 }
 
 
@@ -56,6 +58,9 @@ class HeadClusterObservationResult:
     kv_head_pca_points: np.ndarray | None = None
     pca_explained_variance_ratio: np.ndarray | None = None
     query_window_lengths: np.ndarray | None = None
+    cluster_counts: np.ndarray | None = None
+    cluster_selected_token_counts: np.ndarray | None = None
+    cluster_selected_token_ratios: np.ndarray | None = None
 
 
 def compute_head_cluster_observation(
@@ -183,7 +188,54 @@ def compute_head_cluster_observation(
         if record is None:
             layer_summary["status"] = "skipped_no_compression"
         else:
-            if config.submode == HEAD_CLUSTER_PCA_SUBMODE:
+            if config.submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
+                cluster_ids = record["kv_head_cluster_ids"]
+                history_counts = record["history_selected_token_counts"]
+                cluster_count = int(record["cluster_count"])
+                clusters = []
+                for cluster_id in range(cluster_count):
+                    heads = torch.where(cluster_ids == cluster_id)[0]
+                    clusters.append(
+                        {
+                            "cluster_id": cluster_id,
+                            "heads": heads.to(dtype=torch.int64).tolist(),
+                            "selected_history_token_slots": int(
+                                record["cluster_selected_token_counts"][
+                                    cluster_id
+                                ].item()
+                            ),
+                            "ratio": float(
+                                record["cluster_selected_token_ratios"][
+                                    cluster_id
+                                ].item()
+                            ),
+                        }
+                    )
+                layer_summary.update(
+                    {
+                        "status": "saved",
+                        "pre_compression_kv_cache_len": record[
+                            "pre_compression_kv_cache_len"
+                        ],
+                        "history_len": record["history_len"],
+                        "query_window_len": record["query_window_len"],
+                        "kv_head_count": int(history_counts.numel()),
+                        "cluster_count": cluster_count,
+                        "selected_history_token_slot_total": int(
+                            record[
+                                "cluster_selected_token_count_total"
+                            ]
+                        ),
+                        "has_selected_history_token_slots": bool(
+                            record[
+                                "cluster_selected_token_count_total"
+                            ]
+                            > 0
+                        ),
+                        "clusters": clusters,
+                    }
+                )
+            elif config.submode == HEAD_CLUSTER_PCA_SUBMODE:
                 kv_head_count = int(record["group_similarity"].shape[0])
                 layer_summary.update(
                     {
@@ -221,6 +273,8 @@ def compute_head_cluster_observation(
 
     if config.submode == HEAD_CLUSTER_PCA_SUBMODE:
         return _build_head_cluster_pca_result(summary, collected)
+    if config.submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
+        return _build_head_cluster_token_distribution_result(summary, collected)
 
     try:
         layer_indices = np.asarray(
@@ -276,6 +330,93 @@ def compute_head_cluster_observation(
         post_compression_token_counts=post_counts,
         pre_compression_kv_cache_lengths=pre_lengths,
         history_lengths=history_lengths,
+    )
+
+
+def _build_head_cluster_token_distribution_result(summary, collected):
+    try:
+        layer_indices = np.asarray(
+            [int(record["layer_idx"]) for record in collected],
+            dtype=np.int16,
+        )
+        group_similarity = _stack_records(collected, "group_similarity", np.float32)
+        cluster_ids = _stack_records(
+            collected,
+            "kv_head_cluster_ids",
+            np.int16,
+        )
+        history_counts = _stack_records(
+            collected,
+            "history_selected_token_counts",
+            np.int32,
+        )
+        cluster_selected_counts = _stack_records(
+            collected,
+            "cluster_selected_token_counts",
+            np.int32,
+        )
+        cluster_selected_ratios = _stack_records(
+            collected,
+            "cluster_selected_token_ratios",
+            np.float32,
+        )
+    except ValueError as exc:
+        summary["status"] = "error"
+        summary["reason"] = f"Incompatible observation shapes across layers: {exc}"
+        return _empty_result(summary)
+
+    cluster_counts = np.asarray(
+        [int(record["cluster_count"]) for record in collected],
+        dtype=np.int16,
+    )
+    pre_lengths = np.asarray(
+        [int(record["pre_compression_kv_cache_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    history_lengths = np.asarray(
+        [int(record["history_len"]) for record in collected],
+        dtype=np.int32,
+    )
+    query_window_lengths = np.asarray(
+        [int(record["query_window_len"]) for record in collected],
+        dtype=np.int16,
+    )
+    summary.update(
+        {
+            "status": "saved",
+            "valid_layer_indices": layer_indices.astype(int).tolist(),
+            "group_similarity_shape": list(group_similarity.shape),
+            "kv_head_cluster_ids_shape": list(cluster_ids.shape),
+            "history_selected_token_counts_shape": list(history_counts.shape),
+            "cluster_counts_shape": list(cluster_counts.shape),
+            "cluster_selected_token_counts_shape": list(
+                cluster_selected_counts.shape
+            ),
+            "cluster_selected_token_ratios_shape": list(
+                cluster_selected_ratios.shape
+            ),
+            "cluster_padding": (
+                "Cluster arrays use KV-head-count width; positions at or above "
+                "cluster_counts[layer] are zero padding."
+            ),
+        }
+    )
+    return HeadClusterObservationResult(
+        summary=summary,
+        layer_indices=layer_indices,
+        raw_attention=np.asarray([], dtype=np.float32),
+        selected_hist_mask=np.asarray([], dtype=np.bool_),
+        history_selected_token_counts=history_counts,
+        recent_retained_token_counts=np.asarray([], dtype=np.int32),
+        post_compression_token_counts=np.asarray([], dtype=np.int32),
+        pre_compression_kv_cache_lengths=pre_lengths,
+        history_lengths=history_lengths,
+        group_similarity=group_similarity,
+        kv_head_cluster_ids=cluster_ids,
+        query_window_lengths=query_window_lengths,
+        cluster_counts=cluster_counts,
+        cluster_selected_token_counts=cluster_selected_counts,
+        cluster_selected_token_ratios=cluster_selected_ratios,
     )
 
 
@@ -355,7 +496,8 @@ def save_head_cluster_observation(
 
     with open(summary_path, "w", encoding="utf-8") as fout:
         json.dump(result.summary, fout, ensure_ascii=False, indent=2)
-    if _result_submode(result) == HEAD_CLUSTER_PCA_SUBMODE:
+    submode = _result_submode(result)
+    if submode == HEAD_CLUSTER_PCA_SUBMODE:
         np.savez_compressed(
             npz_path,
             layer_indices=result.layer_indices,
@@ -365,6 +507,20 @@ def save_head_cluster_observation(
             pca_explained_variance_ratio=result.pca_explained_variance_ratio,
             query_window_lengths=result.query_window_lengths,
             history_lengths=result.history_lengths,
+        )
+    elif submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
+        np.savez_compressed(
+            npz_path,
+            layer_indices=result.layer_indices,
+            group_similarity=result.group_similarity,
+            kv_head_cluster_ids=result.kv_head_cluster_ids,
+            history_selected_token_counts=result.history_selected_token_counts,
+            cluster_counts=result.cluster_counts,
+            cluster_selected_token_counts=result.cluster_selected_token_counts,
+            cluster_selected_token_ratios=result.cluster_selected_token_ratios,
+            pre_compression_kv_cache_lengths=result.pre_compression_kv_cache_lengths,
+            history_lengths=result.history_lengths,
+            query_window_lengths=result.query_window_lengths,
         )
     else:
         np.savez_compressed(
@@ -402,8 +558,16 @@ def plot_head_cluster_observation(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if _result_submode(result) == HEAD_CLUSTER_PCA_SUBMODE:
+    submode = _result_submode(result)
+    if submode == HEAD_CLUSTER_PCA_SUBMODE:
         return _plot_head_cluster_pca_observation(result, output_dir, prefix, plt)
+    if submode == HEAD_CLUSTER_TOKEN_DISTRIBUTION_SUBMODE:
+        return _plot_head_cluster_token_distribution(
+            result,
+            output_dir,
+            prefix,
+            plt,
+        )
 
     image_paths = {}
     for layer_pos, layer_idx_value in enumerate(result.layer_indices):
@@ -431,6 +595,124 @@ def plot_head_cluster_observation(
         )
         image_paths[attention_key] = attention_path
     return image_paths
+
+
+def _plot_head_cluster_token_distribution(result, output_dir, prefix, plt):
+    required = {
+        "cluster_counts": result.cluster_counts,
+        "cluster_selected_token_ratios": result.cluster_selected_token_ratios,
+        "kv_head_cluster_ids": result.kv_head_cluster_ids,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "head_cluster_token_distribution result is missing required arrays: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    ratios = np.asarray(result.cluster_selected_token_ratios, dtype=np.float32)
+    cluster_counts = np.asarray(result.cluster_counts, dtype=np.int16)
+    cluster_ids = np.asarray(result.kv_head_cluster_ids, dtype=np.int16)
+    layer_count = int(result.layer_indices.size)
+    if ratios.ndim != 2 or ratios.shape[0] != layer_count:
+        raise ValueError(
+            "cluster_selected_token_ratios must have shape [layer, max_cluster]."
+        )
+    if cluster_counts.shape != (layer_count,):
+        raise ValueError("cluster_counts must have shape [layer].")
+    if cluster_ids.ndim != 2 or cluster_ids.shape[0] != layer_count:
+        raise ValueError("kv_head_cluster_ids must have shape [layer, KV head].")
+
+    cluster_head_counts = np.zeros_like(ratios, dtype=np.int16)
+    for layer_pos, cluster_count in enumerate(cluster_counts):
+        for cluster_id in range(int(cluster_count)):
+            cluster_head_counts[layer_pos, cluster_id] = np.count_nonzero(
+                cluster_ids[layer_pos] == cluster_id
+            )
+
+    image_key = "head_cluster_token_distribution_overview"
+    image_path = os.path.join(output_dir, f"{prefix}_{image_key}.png")
+    fig_height = max(4.8, min(24.0, 0.42 * layer_count + 2.8))
+    fig, ax = plt.subplots(figsize=(11.0, fig_height), dpi=180)
+    positions = np.arange(layer_count)
+    left = np.zeros(layer_count, dtype=np.float32)
+    max_cluster_count = int(cluster_counts.max(initial=0))
+    cmap = plt.get_cmap("tab20")
+    for cluster_id in range(max_cluster_count):
+        valid = cluster_id < cluster_counts
+        widths = np.where(valid, ratios[:, cluster_id], 0.0)
+        bars = ax.barh(
+            positions,
+            widths * 100.0,
+            left=left * 100.0,
+            color=cmap(cluster_id % 20),
+            edgecolor="white",
+            linewidth=0.5,
+            label=f"C{cluster_id}",
+        )
+        for layer_pos, (bar, width) in enumerate(zip(bars, widths)):
+            if not valid[layer_pos] or float(width) < 0.045:
+                continue
+            ax.text(
+                (left[layer_pos] + width * 0.5) * 100.0,
+                bar.get_y() + bar.get_height() * 0.5,
+                (
+                    f"C{cluster_id} ({int(cluster_head_counts[layer_pos, cluster_id])}H)\n"
+                    f"{100.0 * float(width):.1f}%"
+                ),
+                ha="center",
+                va="center",
+                fontsize=7,
+            )
+        left += widths
+
+    zero_rows = np.flatnonzero(np.isclose(left, 0.0))
+    for layer_pos in zero_rows:
+        ax.text(
+            50.0,
+            layer_pos,
+            "no selected history slots",
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="#555555",
+        )
+
+    ax.set_yticks(positions)
+    ax.set_yticklabels(
+        [
+            (
+                f"Layer {int(layer_idx)}\n"
+                + ", ".join(
+                    f"C{cluster_id}={int(cluster_head_counts[layer_pos, cluster_id])}H"
+                    for cluster_id in range(int(cluster_counts[layer_pos]))
+                )
+            )
+            for layer_pos, layer_idx in enumerate(result.layer_indices)
+        ]
+    )
+    ax.invert_yaxis()
+    ax.set_xlim(0.0, 100.0)
+    ax.set_xlabel("Share of selected historical (KV head, token) slots (%)")
+    ax.set_ylabel("Decoder layer")
+    ax.set_title(
+        "Head-cluster token allocation by layer\n"
+        "Ck (nH) means cluster k contains n KV heads; "
+        "cluster ids are layer-local; fixed recent window is excluded"
+    )
+    ax.grid(axis="x", alpha=0.2, linewidth=0.6)
+    if max_cluster_count > 0:
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.08),
+            ncol=min(max_cluster_count, 10),
+            frameon=False,
+            fontsize=8,
+        )
+    fig.tight_layout()
+    fig.savefig(image_path)
+    plt.close(fig)
+    return {image_key: image_path}
 
 
 def _plot_head_cluster_pca_observation(result, output_dir, prefix, plt):
@@ -812,4 +1094,7 @@ def _empty_result(summary):
         kv_head_pca_points=np.asarray([], dtype=np.float32),
         pca_explained_variance_ratio=np.asarray([], dtype=np.float32),
         query_window_lengths=np.asarray([], dtype=np.int16),
+        cluster_counts=np.asarray([], dtype=np.int16),
+        cluster_selected_token_counts=np.asarray([], dtype=np.int32),
+        cluster_selected_token_ratios=np.asarray([], dtype=np.float32),
     )

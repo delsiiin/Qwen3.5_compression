@@ -135,6 +135,13 @@ class TridentKV(TridentKVHeadCluster):
                 valid_mask,
             )
         attn_cache = self._compute_attn_cache(key_states, query_cache, valid_mask)
+        if self._observes_head_cluster_token_distribution():
+            self._capture_head_cluster_token_distribution_observation(
+                key_states,
+                query_cache,
+                valid_mask,
+                result=self._tridentkv_head_cluster_result,
+            )
         hist_len = key_states.shape[-2] - self.window_size
         result = self._tridentkv_head_cluster_result
         layer_vector = self._layer_attention_distribution(attn_cache, valid_mask, hist_len)
