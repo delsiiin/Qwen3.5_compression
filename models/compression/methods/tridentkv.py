@@ -12,6 +12,7 @@ class TridentKV(TridentKVHeadCluster):
     def __init__(
         self,
         *args,
+        head_kernel=3,
         prefill_layer_budget="dissimilarity",
         prefill_layer_budget_reduction="nearest",
         prefill_layer_budget_layers=None,
@@ -20,6 +21,8 @@ class TridentKV(TridentKVHeadCluster):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        if int(head_kernel) < 1 or int(head_kernel) % 2 == 0:
+            raise ValueError("head_kernel must be a positive odd integer.")
         if prefill_layer_budget not in (None, False, "none", "dissimilarity"):
             raise ValueError(
                 "prefill_layer_budget must be one of None, False, 'none', or 'dissimilarity'."
@@ -31,6 +34,7 @@ class TridentKV(TridentKVHeadCluster):
         if float(prefill_layer_budget_temperature) <= 0.0:
             raise ValueError("prefill_layer_budget_temperature must be positive.")
 
+        self.head_kernel = int(head_kernel)
         self.prefill_layer_budget = prefill_layer_budget
         self.prefill_layer_budget_reduction = prefill_layer_budget_reduction
         self.prefill_layer_budget_layers = (
@@ -191,15 +195,11 @@ class TridentKV(TridentKVHeadCluster):
                 cluster_head_count * num_key_value_groups,
                 query_window,
             )
-            if cluster_head_count * num_key_value_groups % 2 ==0:
-                head_kernel = cluster_head_count * num_key_value_groups - 1
-            else:
-                head_kernel = cluster_head_count * num_key_value_groups
             cluster_scores = F.max_pool2d(
                 cluster_scores,
-                kernel_size=(head_kernel, 4),
+                kernel_size=self.head_kernel,
                 stride=1,
-                padding=(head_kernel // 2, 2),
+                padding=self.head_kernel // 2,
             )
             pooled_head_count = cluster_head_count
             pooled_query_window = cluster_scores.shape[-1]
