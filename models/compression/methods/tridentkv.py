@@ -322,7 +322,11 @@ class TridentKV(TridentKVHeadCluster):
                 query_cache,
                 valid_mask,
             )
-        attn_cache = self._compute_attn_cache(key_states, query_cache, valid_mask)
+        attn_cache, layer_vector = self._compute_attn_cache_with_layer_attention(
+            key_states,
+            query_cache,
+            valid_mask,
+        )
         if self._observes_head_cluster_token_distribution():
             self._capture_head_cluster_token_distribution_observation(
                 key_states,
@@ -332,7 +336,6 @@ class TridentKV(TridentKVHeadCluster):
             )
         hist_len = key_states.shape[-2] - self.window_size
         result = self._tridentkv_head_cluster_result
-        layer_vector = self._layer_attention_distribution(attn_cache, valid_mask, hist_len)
         entry = {
             "layer_idx": self.layer_idx,
             "skip": False,
@@ -361,6 +364,37 @@ class TridentKV(TridentKVHeadCluster):
             query_states,
             valid_mask,
         )
+        return self._compute_attn_cache_from_raw_attention(
+            raw_head_attention,
+            key_states,
+            valid_mask,
+        )
+
+    def _compute_attn_cache_with_layer_attention(
+        self,
+        key_states,
+        query_states,
+        valid_mask=None,
+    ):
+        raw_head_attention = self._tridentkv_head_clusterer._build_raw_head_attention(
+            key_states,
+            query_states,
+            valid_mask,
+        )
+        layer_vector = self._layer_attention_distribution(raw_head_attention)
+        attn_cache = self._compute_attn_cache_from_raw_attention(
+            raw_head_attention,
+            key_states,
+            valid_mask,
+        )
+        return attn_cache, layer_vector
+
+    def _compute_attn_cache_from_raw_attention(
+        self,
+        raw_head_attention,
+        key_states,
+        valid_mask=None,
+    ):
         result = self._tridentkv_head_clusterer.build_from_raw_head_attention(raw_head_attention)
         self._tridentkv_head_cluster_result = result
         if (
@@ -493,16 +527,15 @@ class TridentKV(TridentKVHeadCluster):
         finally:
             state["layers"] = {}
 
-    def _layer_attention_distribution(self, scores, valid_mask, hist_len):
-        hist_scores = scores[..., :hist_len].detach().to(dtype=torch.float32)
-        if valid_mask is not None:
-            hist_valid = valid_mask[:, :, :hist_len].to(device=hist_scores.device, dtype=torch.bool)
-            hist_scores = hist_scores.masked_fill(~hist_valid, 0.0)
-        vector = hist_scores.reshape(-1).clamp_min(0.0)
-        total = vector.sum()
-        if total <= torch.finfo(vector.dtype).eps:
-            return torch.full_like(vector, 1.0 / max(vector.numel(), 1))
-        return vector / total
+    def _layer_attention_distribution(self, raw_head_attention):
+        # Preserve every GQA-group attention map for layer-level comparison;
+        # unlike head clustering, no group averaging is applied here.
+        if raw_head_attention.ndim != 4:
+            raise ValueError(
+                "tridentkv layer-budget raw attention must have shape "
+                "[key_value_heads, groups, query_window, history]."
+            )
+        return raw_head_attention.detach().to(dtype=torch.float32).reshape(-1)
 
     def _allocate_layer_historical_budgets(self, entries):
         if not entries:

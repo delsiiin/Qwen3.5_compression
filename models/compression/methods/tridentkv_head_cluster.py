@@ -179,6 +179,17 @@ class TridentKVHeadClusterer:
         raw_head_attention = self._build_raw_head_attention(key_states, query_states, valid_mask)
         return self.build_from_raw_head_attention(raw_head_attention)
 
+    def build_group_attention_vectors(self, raw_head_attention):
+        """Build the per-KV-head attention vectors used for head clustering."""
+        if raw_head_attention.ndim != 4:
+            raise ValueError(
+                "Online attention head clustering raw attention must be rank 4 "
+                "[key_value_heads, groups, query_window, history]."
+            )
+        num_key_value_heads = raw_head_attention.shape[0]
+        group_attention = raw_head_attention.mean(dim=1)
+        return group_attention.reshape(num_key_value_heads, -1)
+
     def build_from_raw_head_attention(self, raw_head_attention):
         """Build online clusters from precomputed raw GQA attention."""
         if raw_head_attention.ndim != 4:
@@ -191,8 +202,7 @@ class TridentKVHeadClusterer:
             raise ValueError("Online attention head clustering requires at least one historical KV token.")
         raw_head_scores = raw_head_attention.mean(dim=-2).unsqueeze(0)
 
-        group_attention = raw_head_attention.mean(dim=1)
-        group_vectors = group_attention.reshape(num_key_value_heads, -1)
+        group_vectors = self.build_group_attention_vectors(raw_head_attention)
         normalized_groups = F.normalize(group_vectors, p=2, dim=-1, eps=self.eps)
         group_similarity = (normalized_groups @ normalized_groups.transpose(0, 1)).clamp(min=-1.0, max=1.0)
 
